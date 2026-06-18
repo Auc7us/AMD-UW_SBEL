@@ -1,0 +1,43 @@
+{
+  "Name": "Polaris",
+  "Type": "Vehicle",
+  "Template": "WheeledVehicle",
+
+  "Chassis": {
+    "Input File": "LRV/Polaris_Chassis.json"
+  },
+
+  "Axles": [
+    {
+      "Suspension Input File": "LRV/Polaris_Front_DoubleWishbone.json",
+      "Suspension Location": [ 1.45, 0.0, 0.085 ],
+      "Steering Index": 0,
+      "Left Wheel Input File": "LRV/Polaris_Wheel.json",
+      "Right Wheel Input File": "LRV/Polaris_Wheel.json",
+      "Left Brake Input File": "LRV/Polaris_BrakeShafts.json",
+      "Right Brake Input File": "LRV/Polaris_BrakeShafts.json"
+    },
+
+    {
+      "Suspension Input File": "LRV/Polaris_Rear_DoubleWishbone.json",
+      "Suspension Location": [ -0.75, 0.0, 0.0 ],
+      "Left Wheel Input File": "LRV/Polaris_Wheel.json",
+      "Right Wheel Input File": "LRV/Polaris_Wheel.json",
+      "Left Brake Input File": "LRV/Polaris_BrakeShafts.json",
+      "Right Brake Input File": "LRV/Polaris_BrakeShafts.json"
+    }
+  ],
+
+  "Steering Subsystems": [
+    {
+      "Input File": "LRV/Polaris_RackPinion.json",
+      "Location": [ 1.3, 0.0, -0.0 ],
+      "Orientation": [ 1, 0, 0, 0 ]
+    }
+  ],
+
+  "Driveline": {
+    "Input File": "LRV/Polaris_4WD.json",
+    "Suspension Indexes": [ 0, 1 ]
+  }
+}

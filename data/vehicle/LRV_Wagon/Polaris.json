@@ -1,0 +1,24 @@
+{
+  "Name": "Polaris",
+    "Type": "Trailer",
+    "Template": "WheeledTrailer",
+
+    "Chassis": {
+        "Input File": "LRV_Wagon/UT_Chassis.json"
+    },
+
+    "Connector": {
+        "Input File": "LRV_Wagon/UT_Hitch.json"
+    },
+
+
+    "Axles": [
+        {
+            "Suspension Input File": "LRV_Wagon/UT_LeafspringAxle.json",
+            "Suspension Location": [ 0, 0, -0.25 ],
+            "Left Wheel Input File": "LRV_Wagon/UT_Wheel.json",
+            "Right Wheel Input File": "LRV_Wagon/UT_Wheel.json"
+        }
+    ]
+
+}
