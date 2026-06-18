@@ -8,8 +8,11 @@ set(CHRONO_ROOT
 set(CHRONO_BUILD_DIR
     "${CHRONO_ROOT}/build"
     CACHE PATH "Chrono build tree in the container")
+set(UW_AMD_DATA_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/data"
+    CACHE PATH "AMD-UW data directory")
 set(UW_AMD_VEHICLE_DATA_DIR
-    "${CMAKE_CURRENT_SOURCE_DIR}/data/vehicle/"
+    "${UW_AMD_DATA_DIR}/vehicle"
     CACHE PATH "AMD-UW Chrono::Vehicle data directory")
 
 set(CMAKE_CXX_STANDARD 17)
@@ -30,6 +33,7 @@ target_compile_definitions(demo_SYN_polaris_flat
         USE_SENSOR_GLFW
         _ENABLE_EXTENDED_ALIGNED_STORAGE
         "CHRONO_VEHICLE_DATA_DIR=\"${CHRONO_BUILD_DIR}/bin/data/vehicle/\""
+        "UW_AMD_DATA_DIR=\"${UW_AMD_DATA_DIR}\""
         "UW_AMD_VEHICLE_DATA_DIR=\"${UW_AMD_VEHICLE_DATA_DIR}\"")
 
 target_include_directories(demo_SYN_polaris_flat

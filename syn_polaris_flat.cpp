@@ -9,6 +9,7 @@
 #include "chrono/core/ChRealtimeStep.h"
 #include "chrono/core/ChDataPath.h"
 #include "chrono/core/ChTypes.h"
+#include "chrono/physics/ChContactMaterial.h"
 
 #include "chrono_vehicle/ChVehicleDataPath.h"
 #include "chrono_vehicle/driver/ChInteractiveDriver.h"
@@ -31,7 +32,7 @@ using namespace chrono::vehicle;
 namespace {
 
 // Simulation defaults shared by all MPI ranks.
-const ChContactMethod contact_method = ChContactMethod::SMC;
+const ChContactMethod contact_method = ChContactMethod::NSC;
 
 double step_size = 3e-3;
 double tire_step_size = 1e-3;
@@ -39,6 +40,13 @@ double end_time = 1000.0;
 double heartbeat = 1e-2;
 double render_step_size = 1.0 / 50.0;
 double settle_time = 1.0;
+
+const double terrain_resolution_scale = 10.0;
+const double terrain_pixels_x = 133.0;
+const double terrain_pixels_y = 33.0;
+const double terrain_height_offset = 0.0;
+const double terrain_min_height = 0.0;
+const double terrain_max_height = 100.0;
 
 ChVector3d track_point(0.0, 0.0, 1.0);
 
@@ -107,7 +115,7 @@ class DriverWrapper : public ChDriver {
     bool m_hold_brake;
 };
 
-// Command-line options used by this standalone AMD-UW demo.
+// Command-line options used by the demo.
 void AddCommandLineOptions(ChCLI& cli) {
     cli.AddOption<double>("Simulation", "s,step_size", "Step size", std::to_string(step_size));
     cli.AddOption<double>("Simulation", "e,end_time", "End time", std::to_string(end_time));
@@ -138,7 +146,11 @@ int main(int argc, char* argv[]) {
     settle_time = cli.GetAsType<double>("settle_time");
     syn_manager.SetHeartbeat(heartbeat);
 
-    // Vehicle-relative paths point at AMD-UW data while vehicle JSON and meshes are created.
+    // Use AMD-UW data as the Chrono data root and its vehicle subfolder for vehicle JSON assets.
+    std::string amd_uw_data_path = UW_AMD_DATA_DIR;
+    if (!amd_uw_data_path.empty() && amd_uw_data_path.back() != '/')
+        amd_uw_data_path += "/";
+
     std::string vehicle_data_path = UW_AMD_VEHICLE_DATA_DIR;
     if (!vehicle_data_path.empty() && vehicle_data_path.back() != '/')
         vehicle_data_path += "/";
@@ -151,7 +163,10 @@ int main(int argc, char* argv[]) {
         SynLog() << "Vehicle data: " << GetVehicleDataPath() << "\n\n";
     }
 
-    const ChVector3d init_loc(0.0, rank * 4.0, 0.55);
+    const double terrain_length = terrain_pixels_x * terrain_resolution_scale;
+    const double terrain_width = terrain_pixels_y * terrain_resolution_scale;
+
+    const ChVector3d init_loc(0.0, rank * 4.0, terrain_height_offset + terrain_max_height + 1.0);
     const ChQuaternion<> init_rot(1, 0, 0, 0);
 
     // Local dynamic vehicle for this rank.
@@ -178,14 +193,15 @@ int main(int argc, char* argv[]) {
 
     vehicle.GetSystem()->SetCollisionSystemType(ChCollisionSystem::Type::BULLET);
 
-    // Explicit 300 m x 300 m flat rigid ground plane.
+    // Apollo-site height-map terrain. Each BMP pixel maps to an integer-sized terrain cell.
     RigidTerrain terrain(vehicle.GetSystem());
-    auto ground_mat = chrono_types::make_shared<ChContactMaterialSMC>();
+    auto ground_mat = ChContactMaterial::DefaultMaterial(contact_method);
     ground_mat->SetFriction(0.9f);
     ground_mat->SetRestitution(0.01f);
-    auto ground = terrain.AddPatch(ground_mat, CSYSNORM, 300.0, 300.0, 1.0);
-    ground->SetColor(ChColor(0.45f, 0.48f, 0.52f));
-    ground->SetTexture(GetVehicleDataFile("terrain/textures/tile4.jpg"), 300.0f, 300.0f);
+    const ChCoordsys<> terrain_csys(ChVector3d(0.0, 0.0, terrain_height_offset), QUNIT);
+    auto ground = terrain.AddPatch(ground_mat, terrain_csys, amd_uw_data_path + "terrain/nasa_apollo_site.bmp",
+                                   terrain_length, terrain_width, terrain_min_height, terrain_max_height);
+    ground->SetColor(ChColor(0.55f, 0.55f, 0.52f));
     terrain.Initialize();
 
     DriverWrapper driver(vehicle);
@@ -224,18 +240,18 @@ int main(int argc, char* argv[]) {
     syn_manager.AddAgent(vehicle_agent);
     syn_manager.Initialize(vehicle.GetSystem());
 
-    // Optional VSG visualization for selected ranks. VSG runtime assets live in Chrono's data tree,
-    // so switch the generic Chrono data path only after AMD-UW vehicle assets are loaded.
+    // Optional VSG visualization for selected ranks.
     if (cli.HasValueInVector<int>("vsg", rank)) {
-        SetChronoDataPath("/home/chrono-user/mountdir/chrono/build/data/");
+        SetChronoDataPath(amd_uw_data_path);
         auto vsg_app = chrono_types::make_shared<ChWheeledVehicleVisualSystemVSG>();
-        vsg_app->SetWindowTitle("AMD-UW SynChrono Polaris Flat Demo");
+        vsg_app->SetWindowTitle("AMD-UW SynChrono Polaris Apollo Terrain Demo");
         vsg_app->SetWindowSize(1280, 800);
         vsg_app->SetWindowPosition(100, 100);
         vsg_app->SetChaseCamera(track_point, 8.0, 0.75);
         vsg_app->SetChaseCameraPosition(ChVector3d(-7.0, 4.0, 2.0));
-        vsg_app->SetLightDirection(1.5 * CH_PI_2, CH_PI_4);
+        vsg_app->SetSkyDomeTexture(GetChronoDataFile("skybox/lunar_stars_dome.png"), CH_PI);
         vsg_app->SetLightIntensity(1.0f);
+        vsg_app->SetLightDirection(CH_PI, 1.37);
         vsg_app->EnableSkyTexture(SkyMode::DOME);
         vsg_app->EnableShadows();
         vsg_app->AttachVehicle(&vehicle);

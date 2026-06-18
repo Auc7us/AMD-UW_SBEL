@@ -26,12 +26,12 @@
   },
 
   "Contact Mesh": {
-    "Mesh Filename": "Polaris/meshes/Polaris_tire_collision.obj",
+    "Mesh Filename": "LRV/meshes/Polaris_tire_collision.obj",
     "Sweep Sphere Radius": 0.005
   },
 
   "Visualization": {
-    "Mesh Filename Left": "Polaris/meshes/Polaris_tire.obj",
-    "Mesh Filename Right": "Polaris/meshes/Polaris_tire.obj"
+    "Mesh Filename Left": "LRV/meshes/Polaris_tire.obj",
+    "Mesh Filename Right": "LRV/meshes/Polaris_tire.obj"
   }
 }
