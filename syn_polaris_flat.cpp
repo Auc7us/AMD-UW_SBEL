@@ -24,6 +24,8 @@
 
 #include "chrono_synchrono/SynChronoManager.h"
 #include "chrono_synchrono/agent/SynWheeledVehicleAgent.h"
+#include "chrono_synchrono/flatbuffer/message/SynWheeledVehicleMessage.h"
+#include "chrono_synchrono/flatbuffer/message/SynMessageUtils.h"
 #include "chrono_synchrono/communication/mpi/SynMPICommunicator.h"
 #include "chrono_synchrono/utils/SynLog.h"
 
@@ -128,6 +130,50 @@ class DriverWrapper : public ChDriver {
   private:
     std::shared_ptr<ChInteractiveDriver> m_driver;
     bool m_hold_brake;
+};
+
+// SynChrono agent that broadcasts a WheeledTrailer so it shows up on remote
+// ranks. A WheeledTrailer is not a ChWheeledVehicle, so it cannot be handed to
+// a stock SynWheeledVehicleAgent. Instead we reuse that agent's zombie
+// machinery (a chassis mesh + N wheel meshes driven by a state message) and
+// override only how the *local* state is sampled, reading the trailer's
+// chassis body and spindles exactly the way the base class reads a vehicle's.
+class SynTrailerAgent : public SynWheeledVehicleAgent {
+  public:
+    explicit SynTrailerAgent(std::shared_ptr<WheeledTrailer> trailer = nullptr)
+        : SynWheeledVehicleAgent(nullptr), m_trailer(trailer) {}
+
+    void Update() override {
+        if (!m_trailer)
+            return;  // zombie instance on a remote rank: nothing local to sample
+
+        auto chassis_abs = m_trailer->GetChassis()->GetBody()->GetFrameRefToAbs();
+        SynPose chassis(chassis_abs.GetPos(), chassis_abs.GetRot());
+        chassis.GetFrame().SetPosDt(chassis_abs.GetPosDt());
+        chassis.GetFrame().SetPosDt2(chassis_abs.GetPosDt2());
+        chassis.GetFrame().SetRotDt(chassis_abs.GetRotDt());
+        chassis.GetFrame().SetRotDt2(chassis_abs.GetRotDt2());
+
+        std::vector<SynPose> wheels;
+        for (auto& axle : m_trailer->GetAxles()) {
+            for (auto& wheel : axle->GetWheels()) {
+                auto state = wheel->GetState();
+                auto wheel_abs = wheel->GetSpindle()->GetFrameRefToAbs();
+                SynPose frame(state.pos, state.rot);
+                frame.GetFrame().SetPosDt(wheel_abs.GetPosDt());
+                frame.GetFrame().SetPosDt2(wheel_abs.GetPosDt2());
+                frame.GetFrame().SetRotDt(wheel_abs.GetRotDt());
+                frame.GetFrame().SetRotDt2(wheel_abs.GetRotDt2());
+                wheels.emplace_back(frame);
+            }
+        }
+
+        const double time = m_trailer->GetChassis()->GetBody()->GetSystem()->GetChTime();
+        m_state->SetState(time, chassis, wheels);
+    }
+
+  private:
+    std::shared_ptr<WheeledTrailer> m_trailer;
 };
 
 // Command-line options used by the demo.
@@ -361,6 +407,20 @@ int main(int argc, char* argv[]) {
                                                "LRV/meshes/Polaris_tire.obj");
     vehicle_agent->SetNumWheels(4);
     syn_manager.AddAgent(vehicle_agent);
+
+    // Synchrono agent for this vehicle's trailer, so the other rank's trailer is
+    // drawn as a zombie too (not just the tractor). The trailer chassis JSON
+    // only defines primitives, so we point the zombie at the trailer mesh and
+    // reuse the Polaris wheel/tire meshes (the trailer rolls on Polaris tires).
+    // NOTE: every rank must add agents in the same order -- vehicle then trailer
+    // -- so the (node, agent) keys line up across ranks for zombie matching.
+    auto trailer_agent = chrono_types::make_shared<SynTrailerAgent>(trailer);
+    trailer_agent->SetZombieVisualizationFiles("LRV_Wagon/trailer_chassis.obj",
+                                               "LRV/meshes/Polaris_wheel.obj",
+                                               "LRV/meshes/Polaris_tire.obj");
+    trailer_agent->SetNumWheels(2);
+    syn_manager.AddAgent(trailer_agent);
+
     syn_manager.Initialize(vehicle.GetSystem());
 
     // Optional VSG visualization for selected ranks.
