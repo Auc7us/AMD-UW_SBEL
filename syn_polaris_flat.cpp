@@ -52,7 +52,7 @@ const double terrain_max_height = 100.0;
 const double terrain_height_probe_clearance = 10.0;
 // Small lift of the chassis reference above the probed terrain surface so the
 // wheels start just above the ground and settle under the pre-run brake hold.
-const double vehicle_start_clearance = 0.5;
+const double vehicle_start_clearance = 1.50;
 
 ChVector3d track_point(0.0, 0.0, 1.0);
 
