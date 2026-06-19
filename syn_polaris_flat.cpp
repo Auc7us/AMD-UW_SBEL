@@ -11,12 +11,19 @@
 #include "chrono/core/ChRealtimeStep.h"
 #include "chrono/core/ChDataPath.h"
 #include "chrono/core/ChTypes.h"
+#include "chrono/physics/ChBodyAuxRef.h"
 #include "chrono/physics/ChBodyEasy.h"
 #include "chrono/physics/ChContactMaterial.h"
+#include "chrono/physics/ChMassProperties.h"
+#include "chrono/geometry/ChTriangleMeshConnected.h"
+#include "chrono/collision/ChCollisionShapeTriangleMesh.h"
+#include "chrono/assets/ChVisualMaterial.h"
+#include "chrono/assets/ChVisualShapeTriangleMesh.h"
+#include "chrono/core/ChRotation.h"
 
 #include "chrono_vehicle/ChVehicleDataPath.h"
 #include "chrono_vehicle/driver/ChInteractiveDriver.h"
-#include "chrono_vehicle/terrain/RigidTerrain.h"
+#include "chrono_vehicle/terrain/SCMTerrain.h"
 #include "chrono_vehicle/utils/ChVehicleUtilsJSON.h"
 #include "chrono_vehicle/wheeled_vehicle/vehicle/WheeledVehicle.h"
 #include "chrono_vehicle/wheeled_vehicle/vehicle/WheeledTrailer.h"
@@ -47,7 +54,7 @@ double heartbeat = 1e-2;
 double render_step_size = 1.0 / 50.0;
 double settle_time = 1.0;
 
-const double terrain_resolution_scale = 10.0;
+const double terrain_resolution_scale = 3.0;
 const double terrain_pixels_x = 133.0;
 const double terrain_pixels_y = 33.0;
 const double terrain_height_offset = 0.0;
@@ -231,26 +238,113 @@ int main(int argc, char* argv[]) {
     WheeledVehicle vehicle(GetVehicleDataFile("LRV/Polaris.json"), contact_method);
     vehicle.GetSystem()->SetCollisionSystemType(ChCollisionSystem::Type::BULLET);
 
-    // Apollo-site height-map terrain. Each BMP pixel maps to an integer-sized terrain cell.
-    RigidTerrain terrain(vehicle.GetSystem());
-    auto ground_mat = ChContactMaterial::DefaultMaterial(contact_method);
-    ground_mat->SetFriction(0.9f);
-    ground_mat->SetRestitution(0.01f);
-    const ChCoordsys<> terrain_csys(ChVector3d(0.0, 0.0, terrain_height_offset), QUNIT);
-    auto ground = terrain.AddPatch(ground_mat, terrain_csys, amd_uw_data_path + "terrain/nasa_apollo_site.bmp",
-                                   terrain_length, terrain_width, terrain_min_height, terrain_max_height);
-    ground->SetColor(ChColor(0.55f, 0.55f, 0.52f));
-    terrain.Initialize();
+    // Apollo-site height-map terrain with Bekker-Wong SCM soil contact model.
+    SCMTerrain terrain(vehicle.GetSystem());
+    terrain.SetSoilParameters(
+        2.8e6,    // Bekker Kphi, frictional modulus [Pa/m^n]
+        14e3,     // Bekker Kc, cohesive modulus [Pa/m^(n-1)]
+        1.0,      // Bekker n, sinkage exponent
+        1000.0,   // Mohr cohesion c [Pa]
+        35.0,     // Mohr friction phi [deg]
+        0.02,     // Janosi-Hanamoto shear parameter K [m]
+        2e8,      // elastic stiffness [Pa/m] (must exceed Kphi)
+        3e4       // damping R [Pa.s/m]
+    );
+    terrain.SetPlotType(SCMTerrain::PLOT_SINKAGE, 0, 0.1);
+    terrain.Initialize(amd_uw_data_path + "terrain/nasa_apollo_site.bmp",
+                       terrain_length, terrain_width, terrain_min_height, terrain_max_height,
+                       0.1);   // SCM grid resolution [m] — must be ≤ half the tire width (0.114 m)
 
-    // RigidTerrain::GetHeight() works by casting a vertical ray into the patch
-    // collision model. That model is only inserted into the Bullet collision
-    // world when the system is initialized on the first DoStepDynamics(), so a
-    // probe issued here (before any step) would always miss and return 0 -- which
-    // is the bug that forced the large manual spawn offset. Bind the collision
-    // models now so the height probe below hits the real terrain surface. The
-    // call is idempotent: already-bound models are skipped, and the vehicle/
-    // trailer models added later are still bound on the first step.
-    vehicle.GetSystem()->GetCollisionSystem()->BindAll();
+    // SCMTerrain::GetHeight() queries the terrain grid directly (no ray cast),
+    // so it is valid immediately after Initialize() — no BindAll() needed here.
+
+    // Scatter rocks across the terrain. Added before the preexisting_bodies
+    // snapshot so the re-seating step below correctly skips them (rocks are
+    // positioned relative to the terrain, not to the vehicle chassis).
+    // XY positions spread around the spawn origin; Z is sampled from terrain
+    // and the rock is lifted slightly (rock_clearance) so it rests on top.
+    std::vector<std::shared_ptr<ChBody>> rock_bodies;
+    {
+        const std::vector<ChVector3d> rock_xy = {
+            { 5.0, -1.5, 0}, { 8.0,  1.0, 0}, {12.0,  0.5, 0}, {15.0, -2.0, 0}, {20.0,  1.5, 0},
+            {-3.0,  2.0, 0}, {-6.0, -1.0, 0}, { 3.0,  3.0, 0}, {10.0,  2.5, 0}, {18.0, -1.0, 0},
+            { 7.0, -3.0, 0}, {13.0,  3.0, 0}, {-4.0, -3.0, 0}, { 2.0, -2.5, 0}, {22.0,  0.0, 0},
+            { 9.0,  0.0, 0}, {16.0,  2.0, 0}, {-8.0,  1.5, 0}, { 6.0,  2.0, 0}, {11.0, -1.5, 0},
+        };
+
+        // Scale and rotation seeds — vary per rock for visual variety.
+        const double rock_scales[] = {0.20, 0.13, 0.18, 0.10, 0.22,
+                                      0.15, 0.25, 0.12, 0.17, 0.21,
+                                      0.14, 0.19, 0.11, 0.23, 0.16,
+                                      0.24, 0.13, 0.20, 0.15, 0.18};
+        // Z-rotation angles (radians) to avoid all rocks looking identical.
+        const double rock_angles_z[] = {0.0,  0.8,  1.6,  2.4,  3.1,
+                                        0.4,  1.2,  2.0,  2.8,  0.6,
+                                        1.4,  2.2,  3.0,  0.2,  1.0,
+                                        1.8,  2.6,  0.9,  1.7,  2.5};
+        const double rock_clearance = 0.05;
+        const std::string rock_mesh_path = GetVehicleDataFile("terrain/obstacles/rock.obj");
+
+        auto rock_surf_mat = ChContactMaterial::DefaultMaterial(contact_method);
+        rock_surf_mat->SetFriction(0.8f);
+        rock_surf_mat->SetRestitution(0.05f);
+
+        auto rock_vis_mat = chrono_types::make_shared<ChVisualMaterial>();
+        rock_vis_mat->SetAmbientColor({1, 1, 1});
+        rock_vis_mat->SetDiffuseColor({1, 1, 1});
+        rock_vis_mat->SetSpecularColor({1, 1, 1});
+        rock_vis_mat->SetUseSpecularWorkflow(true);
+        rock_vis_mat->SetRoughness(1.0f);
+        rock_vis_mat->SetHapkeParameters(0.32357f, 0.23955f, 0.30452f, 1.80238f, 0.07145f, 0.3f,
+                                         23.4f * (CH_PI / 180));
+
+        for (int i = 0; i < static_cast<int>(rock_xy.size()); i++) {
+            auto rock_mesh = ChTriangleMeshConnected::CreateFromWavefrontFile(rock_mesh_path, false, true);
+            rock_mesh->Transform(ChVector3d(0, 0, 0), ChMatrix33<>(rock_scales[i]));
+            rock_mesh->RepairDuplicateVertices(1e-9);
+
+            double mmass;
+            ChVector3d mcog;
+            ChMatrix33<> minertia;
+            const double rock_density = 2500.0;
+            rock_mesh->ComputeMassProperties(true, mmass, mcog, minertia);
+            ChMatrix33<> principal_rot;
+            ChVector3d principal_I;
+            ChInertiaUtils::PrincipalInertia(minertia, principal_I, principal_rot);
+
+            const double rock_probe_z = terrain_height_offset + terrain_max_height + terrain_height_probe_clearance;
+            const double surface_z = terrain.GetHeight(ChVector3d(rock_xy[i].x(), rock_xy[i].y(), rock_probe_z));
+            const ChVector3d rock_pos(rock_xy[i].x(), rock_xy[i].y(), surface_z + rock_clearance);
+            const ChQuaternion<> rock_rot = QuatFromAngleX(CH_PI / 2) * QuatFromAngleZ(rock_angles_z[i]);
+
+            auto rock_body = chrono_types::make_shared<ChBodyAuxRef>();
+            rock_body->SetFrameCOMToRef(ChFrame<>(mcog, principal_rot));
+            rock_body->SetMass(mmass * rock_density);
+            rock_body->SetInertiaXX(rock_density * principal_I);
+            rock_body->SetFrameRefToAbs(ChFrame<>(rock_pos, rock_rot));
+            rock_body->SetFixed(false);
+
+            auto rock_col = chrono_types::make_shared<ChCollisionShapeTriangleMesh>(
+                rock_surf_mat, rock_mesh, false, false, 0.005);
+            rock_body->AddCollisionShape(rock_col);
+            rock_body->EnableCollision(true);
+
+            auto rock_vis_mesh = chrono_types::make_shared<ChVisualShapeTriangleMesh>();
+            rock_vis_mesh->SetMesh(rock_mesh);
+            rock_vis_mesh->SetBackfaceCull(true);
+            if (rock_vis_mesh->GetNumMaterials() == 0)
+                rock_vis_mesh->AddMaterial(rock_vis_mat);
+            else
+                rock_vis_mesh->GetMaterials()[0] = rock_vis_mat;
+            rock_body->AddVisualShape(rock_vis_mesh);
+
+            vehicle.GetSystem()->Add(rock_body);
+            rock_bodies.push_back(rock_body);
+        }
+
+        if (rank == 0)
+            SynLog() << "Placed " << rock_xy.size() << " rocks on terrain.\n";
+    }
 
     const double start_x = 0.0;
     const double start_y = rank * 4.0;
@@ -304,6 +398,23 @@ int main(int argc, char* argv[]) {
             trailer->InitializeTire(tire, wheel, VisualizationType::MESH);
             tire->SetStepsize(tire_step_size);
         }
+    }
+
+    // Register active domains with SCM so it computes Bekker-Wong forces on each
+    // wheel and rock. Without these, SCM has no contact geometry to push against
+    // and everything sinks through the deformable mesh.
+    {
+        const double wr = 0.55;  // half-extent slightly larger than Polaris tire radius (0.41 m)
+        for (auto& axle : vehicle.GetAxles())
+            for (auto& wheel : axle->GetWheels())
+                terrain.AddActiveDomain(wheel->GetSpindle(), ChVector3d(0, 0, 0),
+                                        ChVector3d(wr, 2 * wr, 2 * wr));
+        for (auto& axle : trailer->GetAxles())
+            for (auto& wheel : axle->GetWheels())
+                terrain.AddActiveDomain(wheel->GetSpindle(), ChVector3d(0, 0, 0),
+                                        ChVector3d(wr, 2 * wr, 2 * wr));
+        for (auto& rock : rock_bodies)
+            terrain.AddActiveDomain(rock, ChVector3d(0, 0, 0), ChVector3d(0.4, 0.4, 0.4));
     }
 
     // Re-seat the whole rig on the terrain. The provisional pose above dropped
@@ -381,6 +492,12 @@ int main(int argc, char* argv[]) {
     irr_driver->SetBrakingDelta(render_step_size / 0.3);
     irr_driver->Initialize();
     driver.Set(irr_driver);
+
+    // Register ALL collision shapes (spindles, rocks, trailer bed, etc.) with Bullet now
+    // that every body has been added to the system. SCM's ray casting needs to find the
+    // tire cylinders; SyncCollisionModels() only moves already-bound shapes, so bodies
+    // added since the last BindAll() are invisible to ray tests until this call.
+    vehicle.GetSystem()->GetCollisionSystem()->BindAll();
 
     // Optional pre-run settling under full brake before Synchrono state exchange begins.
     if (settle_time > 0) {
