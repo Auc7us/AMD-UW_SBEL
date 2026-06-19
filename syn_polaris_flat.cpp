@@ -4,6 +4,8 @@
 #include <chrono>
 #include <cmath>
 #include <iostream>
+#include <limits>
+#include <set>
 #include <string>
 
 #include "chrono/core/ChRealtimeStep.h"
@@ -50,9 +52,16 @@ const double terrain_height_offset = 0.0;
 const double terrain_min_height = 0.0;
 const double terrain_max_height = 100.0;
 const double terrain_height_probe_clearance = 10.0;
-// Small lift of the chassis reference above the probed terrain surface so the
-// wheels start just above the ground and settle under the pre-run brake hold.
+// Provisional lift of the chassis reference above the probed terrain surface.
+// This only needs to be large enough that no wheel of the tractor or trailer
+// starts buried in the terrain; the rig is then re-seated precisely (see
+// seat_clearance) so the actual drop height no longer matters.
 const double vehicle_start_clearance = 1.50;
+// Final gap left between the LOWEST wheel of the whole rig (a trailer wheel)
+// and the terrain after re-seating. Small enough that the touchdown is an
+// effectively zero-velocity settle -- no impact, so even rigid tires on the
+// light trailer don't bounce.
+const double seat_clearance = 0.025;
 
 ChVector3d track_point(0.0, 0.0, 1.0);
 
@@ -205,6 +214,12 @@ int main(int argc, char* argv[]) {
     const ChVector3d init_loc(start_x, start_y, start_z);
     const ChQuaternion<> init_rot(1, 0, 0, 0);
 
+    // Snapshot the bodies that exist before the rig is built (the terrain patch
+    // and anything else). These must stay put when we re-seat the rig below.
+    std::set<ChBody*> preexisting_bodies;
+    for (const auto& body : vehicle.GetSystem()->GetBodies())
+        preexisting_bodies.insert(body.get());
+
     vehicle.Initialize(ChCoordsys<>(init_loc, init_rot));
     vehicle.GetChassis()->SetFixed(false);
     vehicle.SetChassisVisualizationType(VisualizationType::MESH);
@@ -242,6 +257,56 @@ int main(int argc, char* argv[]) {
             auto tire = ReadTireJSON(GetVehicleDataFile("LRV/Polaris_RigidTire.json"));
             trailer->InitializeTire(tire, wheel, VisualizationType::MESH);
             tire->SetStepsize(tire_step_size);
+        }
+    }
+
+    // Re-seat the whole rig on the terrain. The provisional pose above dropped
+    // everything from vehicle_start_clearance, which is fragile: too small and
+    // the (lower-riding) trailer wheels start buried and tunnel through; too
+    // large and the light trailer hits hard and bounces on its rigid tires.
+    // Instead, find the lowest wheel contact point across BOTH tractor and
+    // trailer and translate the entire assembly down as one rigid body so that
+    // lowest wheel rests seat_clearance above the surface. A uniform z-shift
+    // preserves every relative joint/spring frame (including the hitch) and
+    // leaves all velocities at zero, so there is no constraint violation and
+    // the touchdown carries essentially no impact energy.
+    {
+        double lowest_bottom = std::numeric_limits<double>::infinity();
+        double lowest_x = start_x, lowest_y = start_y;
+        auto consider_wheel = [&](const auto& wheel) {
+            if (!wheel)
+                return;
+            const auto& tire = wheel->GetTire();
+            const double radius = tire ? tire->GetRadius() : 0.0;
+            const ChVector3d p = wheel->GetPos();
+            const double bottom = p.z() - radius;
+            if (bottom < lowest_bottom) {
+                lowest_bottom = bottom;
+                lowest_x = p.x();
+                lowest_y = p.y();
+            }
+        };
+        for (auto& axle : vehicle.GetAxles())
+            for (auto& wheel : axle->GetWheels())
+                consider_wheel(wheel);
+        for (auto& axle : trailer->GetAxles())
+            for (auto& wheel : axle->GetWheels())
+                consider_wheel(wheel);
+
+        const double terrain_under_lowest =
+            terrain.GetHeight(ChVector3d(lowest_x, lowest_y, height_probe_z));
+        const double drop = lowest_bottom - (terrain_under_lowest + seat_clearance);
+
+        for (const auto& body : vehicle.GetSystem()->GetBodies()) {
+            if (preexisting_bodies.count(body.get()))
+                continue;  // terrain etc.: leave in place
+            const ChVector3d p = body->GetPos();
+            body->SetPos(ChVector3d(p.x(), p.y(), p.z() - drop));
+        }
+
+        if (rank == 0) {
+            SynLog() << "Re-seated rig: lowered by " << drop << " m so lowest wheel sits "
+                     << seat_clearance << " m above terrain.\n";
         }
     }
 
