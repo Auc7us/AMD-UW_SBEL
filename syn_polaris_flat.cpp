@@ -9,6 +9,7 @@
 #include "chrono/core/ChRealtimeStep.h"
 #include "chrono/core/ChDataPath.h"
 #include "chrono/core/ChTypes.h"
+#include "chrono/physics/ChBodyEasy.h"
 #include "chrono/physics/ChContactMaterial.h"
 
 #include "chrono_vehicle/ChVehicleDataPath.h"
@@ -16,6 +17,7 @@
 #include "chrono_vehicle/terrain/RigidTerrain.h"
 #include "chrono_vehicle/utils/ChVehicleUtilsJSON.h"
 #include "chrono_vehicle/wheeled_vehicle/vehicle/WheeledVehicle.h"
+#include "chrono_vehicle/wheeled_vehicle/vehicle/WheeledTrailer.h"
 #include "chrono_vehicle/wheeled_vehicle/ChWheeledVehicleVisualSystemVSG.h"
 
 #include "chrono_synchrono/SynChronoManager.h"
@@ -47,6 +49,10 @@ const double terrain_pixels_y = 33.0;
 const double terrain_height_offset = 0.0;
 const double terrain_min_height = 0.0;
 const double terrain_max_height = 100.0;
+const double terrain_height_probe_clearance = 10.0;
+// Small lift of the chassis reference above the probed terrain surface so the
+// wheels start just above the ground and settle under the pre-run brake hold.
+const double vehicle_start_clearance = 0.5;
 
 ChVector3d track_point(0.0, 0.0, 1.0);
 
@@ -166,11 +172,39 @@ int main(int argc, char* argv[]) {
     const double terrain_length = terrain_pixels_x * terrain_resolution_scale;
     const double terrain_width = terrain_pixels_y * terrain_resolution_scale;
 
-    const ChVector3d init_loc(0.0, rank * 4.0, terrain_height_offset + terrain_max_height + 1.0);
-    const ChQuaternion<> init_rot(1, 0, 0, 0);
-
     // Local dynamic vehicle for this rank.
     WheeledVehicle vehicle(GetVehicleDataFile("LRV/Polaris.json"), contact_method);
+    vehicle.GetSystem()->SetCollisionSystemType(ChCollisionSystem::Type::BULLET);
+
+    // Apollo-site height-map terrain. Each BMP pixel maps to an integer-sized terrain cell.
+    RigidTerrain terrain(vehicle.GetSystem());
+    auto ground_mat = ChContactMaterial::DefaultMaterial(contact_method);
+    ground_mat->SetFriction(0.9f);
+    ground_mat->SetRestitution(0.01f);
+    const ChCoordsys<> terrain_csys(ChVector3d(0.0, 0.0, terrain_height_offset), QUNIT);
+    auto ground = terrain.AddPatch(ground_mat, terrain_csys, amd_uw_data_path + "terrain/nasa_apollo_site.bmp",
+                                   terrain_length, terrain_width, terrain_min_height, terrain_max_height);
+    ground->SetColor(ChColor(0.55f, 0.55f, 0.52f));
+    terrain.Initialize();
+
+    // RigidTerrain::GetHeight() works by casting a vertical ray into the patch
+    // collision model. That model is only inserted into the Bullet collision
+    // world when the system is initialized on the first DoStepDynamics(), so a
+    // probe issued here (before any step) would always miss and return 0 -- which
+    // is the bug that forced the large manual spawn offset. Bind the collision
+    // models now so the height probe below hits the real terrain surface. The
+    // call is idempotent: already-bound models are skipped, and the vehicle/
+    // trailer models added later are still bound on the first step.
+    vehicle.GetSystem()->GetCollisionSystem()->BindAll();
+
+    const double start_x = 0.0;
+    const double start_y = rank * 4.0;
+    // Probe from above the tallest possible terrain so the downward ray cast hits.
+    const double height_probe_z = terrain_height_offset + terrain_max_height + terrain_height_probe_clearance;
+    const double start_z = terrain.GetHeight(ChVector3d(start_x, start_y, height_probe_z)) + vehicle_start_clearance;
+    const ChVector3d init_loc(start_x, start_y, start_z);
+    const ChQuaternion<> init_rot(1, 0, 0, 0);
+
     vehicle.Initialize(ChCoordsys<>(init_loc, init_rot));
     vehicle.GetChassis()->SetFixed(false);
     vehicle.SetChassisVisualizationType(VisualizationType::MESH);
@@ -191,19 +225,41 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    vehicle.GetSystem()->SetCollisionSystemType(ChCollisionSystem::Type::BULLET);
+    // Local trailer attached to this rank's Polaris chassis.
+    auto trailer = chrono_types::make_shared<WheeledTrailer>(vehicle.GetSystem(),
+                                                             GetVehicleDataFile("LRV_Wagon/Polaris.json"));
+    trailer->Initialize(vehicle.GetChassis());
+    trailer->SetChassisVisualizationType(VisualizationType::PRIMITIVES);
+    trailer->SetSuspensionVisualizationType(VisualizationType::PRIMITIVES);
+    trailer->SetWheelVisualizationType(VisualizationType::PRIMITIVES);
 
-    // Apollo-site height-map terrain. Each BMP pixel maps to an integer-sized terrain cell.
-    RigidTerrain terrain(vehicle.GetSystem());
-    auto ground_mat = ChContactMaterial::DefaultMaterial(contact_method);
-    ground_mat->SetFriction(0.9f);
-    ground_mat->SetRestitution(0.01f);
-    const ChCoordsys<> terrain_csys(ChVector3d(0.0, 0.0, terrain_height_offset), QUNIT);
-    auto ground = terrain.AddPatch(ground_mat, terrain_csys, amd_uw_data_path + "terrain/nasa_apollo_site.bmp",
-                                   terrain_length, terrain_width, terrain_min_height, terrain_max_height);
-    ground->SetColor(ChColor(0.55f, 0.55f, 0.52f));
-    terrain.Initialize();
+    for (auto& axle : trailer->GetAxles()) {
+        for (auto& wheel : axle->GetWheels()) {
+            // Use the same Polaris tire as the tractor (radius 0.4089). The
+            // utility-trailer tire (LRV_Wagon/UT_RigidTire.json, radius 0.16) is
+            // far too small for the Polaris ride height, leaving the trailer
+            // wheels floating above the ground so the trailer swings/bounces.
+            auto tire = ReadTireJSON(GetVehicleDataFile("LRV/Polaris_RigidTire.json"));
+            trailer->InitializeTire(tire, wheel, VisualizationType::MESH);
+            tire->SetStepsize(tire_step_size);
+        }
+    }
 
+    // The trailer chassis JSON defines only visualization primitives and has no
+    // collision geometry, so cargo would fall through the bed. Add a thin,
+    // collidable slab pinned to the trailer chassis to act as that bed surface.
+    // It is kept fixed (no dynamics) and repositioned to follow the chassis each
+    // step in the simulation loop below.
+    auto trailer_bed_mat = ChContactMaterial::DefaultMaterial(contact_method);
+    trailer_bed_mat->SetFriction(0.9f);
+    auto trailer_bed = chrono_types::make_shared<ChBodyEasyBox>(1.0, 1.2, 0.02, 1000.0,
+                                                                /*visualize=*/false,
+                                                                /*collide=*/true, trailer_bed_mat);
+    trailer_bed->SetFixed(true);
+    trailer_bed->EnableCollision(true);
+    trailer_bed->SetPos(trailer->GetChassis()->GetPos() + ChVector3d(0, 0, 0.01));
+    trailer_bed->SetRot(trailer->GetChassis()->GetRot());
+    vehicle.GetSystem()->AddBody(trailer_bed);
     DriverWrapper driver(vehicle);
     VsgAppWrapper app;
 
@@ -224,8 +280,10 @@ int main(int argc, char* argv[]) {
             const double time = vehicle.GetSystem()->GetChTime();
             terrain.Synchronize(time);
             vehicle.Synchronize(time, brake_inputs, terrain);
+            trailer->Synchronize(time, brake_inputs, terrain);
             terrain.Advance(step_size);
             vehicle.Advance(step_size);
+            trailer->Advance(step_size);
         }
 
         vehicle.GetSystem()->SetChTime(0.0);
@@ -275,18 +333,23 @@ int main(int argc, char* argv[]) {
         if (step_number % render_steps == 0)
             app.Render();
 
-        const DriverInputs driver_inputs = driver.GetInputs();
-
         syn_manager.Synchronize(time);
         driver.Synchronize(time);
+        const DriverInputs driver_inputs = driver.GetInputs();
         terrain.Synchronize(time);
         vehicle.Synchronize(time, driver_inputs, terrain);
+        trailer->Synchronize(time, driver_inputs, terrain);
         app.Synchronize(time, driver_inputs);
 
         driver.Advance(step_size);
         terrain.Advance(step_size);
         vehicle.Advance(step_size);
+        trailer->Advance(step_size);
         app.Advance(step_size);
+
+        // Keep the (fixed) cargo-bed slab glued to the trailer chassis.
+        trailer_bed->SetPos(trailer->GetChassis()->GetPos() + ChVector3d(0, 0, 0.01));
+        trailer_bed->SetRot(trailer->GetChassis()->GetRot());
 
         if (rank == 0 && step_number % 1000 == 0 && step_number > 0) {
             const auto wall_now = std::chrono::high_resolution_clock::now();
