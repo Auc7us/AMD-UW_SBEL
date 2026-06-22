@@ -27,7 +27,7 @@ set(OPTIX_INCLUDE_DIR
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-add_executable(demo_SYN_polaris_flat syn_polaris_flat.cpp)
+add_executable(demo_SYN_polaris_flat main.cpp)
 
 target_compile_definitions(demo_SYN_polaris_flat
     PRIVATE
