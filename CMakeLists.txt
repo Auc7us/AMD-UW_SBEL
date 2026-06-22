@@ -14,6 +14,15 @@ set(UW_AMD_DATA_DIR
 set(UW_AMD_VEHICLE_DATA_DIR
     "${UW_AMD_DATA_DIR}/vehicle"
     CACHE PATH "AMD-UW Chrono::Vehicle data directory")
+set(CHRONO_PACKAGE_DIR
+    "/home/chrono-user/mountdir/packages"
+    CACHE PATH "Chrono third-party package directory in the container")
+set(OPTIX_INSTALL_DIR
+    "${CHRONO_PACKAGE_DIR}/optix"
+    CACHE PATH "OptiX SDK install directory")
+set(OPTIX_INCLUDE_DIR
+    "${OPTIX_INSTALL_DIR}/include"
+    CACHE PATH "OptiX SDK include directory")
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -32,6 +41,7 @@ target_compile_definitions(demo_SYN_polaris_flat
         VSGIMGUI_SHARED_LIBRARY
         USE_SENSOR_GLFW
         _ENABLE_EXTENDED_ALIGNED_STORAGE
+        "CHRONO_DATA_DIR=\"${CHRONO_BUILD_DIR}/data/\""
         "CHRONO_VEHICLE_DATA_DIR=\"${CHRONO_BUILD_DIR}/bin/data/vehicle/\""
         "UW_AMD_DATA_DIR=\"${UW_AMD_DATA_DIR}\""
         "UW_AMD_VEHICLE_DATA_DIR=\"${UW_AMD_VEHICLE_DATA_DIR}\"")
@@ -44,7 +54,7 @@ target_include_directories(demo_SYN_polaris_flat
         "${CHRONO_ROOT}/src/chrono_thirdparty/HACDv2"
         "${CHRONO_ROOT}/src/chrono_thirdparty/yaml-cpp/include"
         "${CHRONO_ROOT}/src/chrono_thirdparty/flatbuffers/include"
-        "/opt/optix/include")
+        "${OPTIX_INCLUDE_DIR}")
 
 target_include_directories(demo_SYN_polaris_flat
     SYSTEM PRIVATE
