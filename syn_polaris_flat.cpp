@@ -23,6 +23,7 @@
 #include "chrono/geometry/ChTriangleMeshConnected.h"
 #include "chrono/physics/ChBody.h"
 #include "chrono/physics/ChBodyAuxRef.h"
+#include "chrono/physics/ChBodyEasy.h"
 #include "chrono/physics/ChContactMaterial.h"
 #include "chrono/physics/ChMassProperties.h"
 #include "chrono/physics/ChSystemNSC.h"
@@ -76,10 +77,10 @@ const double terrain_pixels_y = 256.0;
 const std::string terrain_heightmap_file = "terrain/terrain2_256.bmp";
 const double terrain_height_offset = 0.0;
 const double terrain_min_height = 0.0;
-const double terrain_max_height = 2.0;
+const double terrain_max_height = 25.0;
 const double terrain_height_probe_clearance = 10.0;
 const int rocks_per_rank = 15;
-const double rock_mesh_scale = 0.45;
+const double rock_mesh_scale = 0.3;
 const double rock_density = 2500.0;
 const double rock_first_distance = 15.0;
 const double rock_distance_step = 15.0;
@@ -87,10 +88,9 @@ const double rock_surface_clearance = 0.05;
 const float global_camera_update_rate = 30.0f;
 const unsigned int global_camera_width = 1280;
 const unsigned int global_camera_height = 720;
-const float global_camera_fov = static_cast<float>(CH_PI_2);
-const ChVector3d global_camera_position(0.0, 0.0, 120.0);
-const ChQuaternion<> global_camera_rotation =
-    QuatFromAngleAxis(90.0 * CH_DEG_TO_RAD, VECT_Y) >> QuatFromAngleAxis(180.0 * CH_DEG_TO_RAD, VECT_Z);
+const float global_camera_fov = static_cast<float>(CH_PI_3);
+const ChVector3d global_camera_position(-100.0, 30.0, 30.0);
+const ChVector3d global_camera_target(30.0, 0.0, 5.0);
 const char* sensor_star_map = "sensor/textures/starmap_2020_4k.hdr";
 // Provisional lift of the chassis reference above the probed terrain surface.
 // This only needs to be large enough that no wheel of the tractor or trailer
@@ -107,6 +107,13 @@ ChVector3d track_point(0.0, 0.0, 1.0);
 
 double VecNorm(const ChVector3d& v) {
     return std::sqrt(v.x() * v.x() + v.y() * v.y() + v.z() * v.z());
+}
+
+ChQuaternion<> SensorLookAtRotation(const ChVector3d& camera_pos, const ChVector3d& target_pos) {
+    const ChVector3d forward = (target_pos - camera_pos).GetNormalized();
+    ChMatrix33<> rot;
+    rot.SetFromAxisX(forward, VECT_Y);
+    return rot.GetQuaternion();
 }
 
 double InitialHeadingDegForRobot(int robot_index) {
@@ -574,6 +581,7 @@ int main(int argc, char* argv[]) {
     rock_mat->SetRestitution(0.0f);
     std::vector<std::shared_ptr<ChBodyAuxRef>> owned_rocks;
     std::shared_ptr<WheeledTrailer> trailer;
+    std::shared_ptr<ChBodyEasyBox> trailer_bed;
     std::unique_ptr<DriverWrapper> driver;
     std::shared_ptr<ChInteractiveDriver> irr_driver;
     VsgAppWrapper app;
@@ -661,6 +669,17 @@ int main(int argc, char* argv[]) {
             SynLog() << "Re-seated rank " << rank << " rig: lowered by " << drop << " m.\n";
         }
 
+        auto trailer_bed_mat = ChContactMaterial::DefaultMaterial(contact_method);
+        trailer_bed_mat->SetFriction(0.9f);
+        trailer_bed = chrono_types::make_shared<ChBodyEasyBox>(1.0, 1.2, 0.02, 1000.0,
+                                                               /*visualize=*/false,
+                                                               /*collide=*/true, trailer_bed_mat);
+        trailer_bed->SetFixed(true);
+        trailer_bed->EnableCollision(true);
+        trailer_bed->SetPos(trailer->GetChassis()->GetPos() + ChVector3d(0, 0, 0.01));
+        trailer_bed->SetRot(trailer->GetChassis()->GetRot());
+        system->AddBody(trailer_bed);
+
         driver = std::make_unique<DriverWrapper>(*vehicle);
         irr_driver = chrono_types::make_shared<ChInteractiveDriver>(*vehicle);
         irr_driver->SetSteeringDelta(render_step_size / 1.0);
@@ -744,7 +763,7 @@ int main(int argc, char* argv[]) {
         auto global_camera = chrono_types::make_shared<ChCameraSensor>(
             global_camera_body,
             global_camera_update_rate,
-            ChFrame<double>(global_camera_position, global_camera_rotation),
+            ChFrame<double>(global_camera_position, SensorLookAtRotation(global_camera_position, global_camera_target)),
             global_camera_width,
             global_camera_height,
             global_camera_fov);
@@ -806,6 +825,9 @@ int main(int argc, char* argv[]) {
             vehicle->Advance(step_size);
             trailer->Advance(step_size);
             app.Advance(step_size);
+
+            trailer_bed->SetPos(trailer->GetChassis()->GetPos() + ChVector3d(0, 0, 0.01));
+            trailer_bed->SetRot(trailer->GetChassis()->GetRot());
 
             if (motion_log_steps > 0 && step_number % motion_log_steps == 0) {
                 const auto chassis = vehicle->GetChassisBody();
