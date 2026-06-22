@@ -27,7 +27,11 @@ set(OPTIX_INCLUDE_DIR
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-add_executable(demo_SYN_polaris_flat main.cpp)
+add_executable(demo_SYN_polaris_flat
+    main.cpp
+    src/MaterialUtils.cpp
+    src/RockField.cpp
+    src/SynAgents.cpp)
 
 target_compile_definitions(demo_SYN_polaris_flat
     PRIVATE
@@ -48,6 +52,7 @@ target_compile_definitions(demo_SYN_polaris_flat
 
 target_include_directories(demo_SYN_polaris_flat
     PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
         "${CHRONO_ROOT}/src"
         "${CHRONO_BUILD_DIR}"
         "${CHRONO_ROOT}/src/chrono/collision/bullet"
@@ -61,7 +66,7 @@ target_include_directories(demo_SYN_polaris_flat
         /usr/include/eigen3
         /usr/local/cuda/include
         /usr/local/cuda/include/cccl
-        /home/chrono-user/mountdir/packages/vsg/include
+        "${CHRONO_PACKAGE_DIR}/vsg/include"
         /usr/include/irrlicht
         /usr/lib/x86_64-linux-gnu/openmpi/include
         /usr/lib/x86_64-linux-gnu/openmpi/include/openmpi)
@@ -82,8 +87,8 @@ target_compile_options(demo_SYN_polaris_flat
 target_link_options(demo_SYN_polaris_flat
     PRIVATE
         "-Wl,--disable-new-dtags"
-        "-Wl,-rpath,${CHRONO_BUILD_DIR}/lib:/home/chrono-user/mountdir/packages/vsg/lib:/usr/lib/x86_64-linux-gnu/openmpi/lib::::"
-        "-Wl,-rpath-link,/home/chrono-user/mountdir/packages/vsg/lib")
+        "-Wl,-rpath,${CHRONO_BUILD_DIR}/lib:${CHRONO_PACKAGE_DIR}/vsg/lib:/usr/lib/x86_64-linux-gnu/openmpi/lib::::"
+        "-Wl,-rpath-link,${CHRONO_PACKAGE_DIR}/vsg/lib")
 
 target_link_libraries(demo_SYN_polaris_flat
     PRIVATE
@@ -115,9 +120,9 @@ target_link_libraries(demo_SYN_polaris_flat
         /usr/lib/x86_64-linux-gnu/libpthread.a
         pthread
         "${CHRONO_BUILD_DIR}/lib/libyaml-cpp.so.0.8.0"
-        /home/chrono-user/mountdir/packages/vsg/lib/libvsgXchange.so.1.1.12
-        /home/chrono-user/mountdir/packages/vsg/lib/libvsgImGui.so.0.7.0
-        /home/chrono-user/mountdir/packages/vsg/lib/libvsg.so.1.1.15
+        "${CHRONO_PACKAGE_DIR}/vsg/lib/libvsgXchange.so.1.1.12"
+        "${CHRONO_PACKAGE_DIR}/vsg/lib/libvsgImGui.so.0.7.0"
+        "${CHRONO_PACKAGE_DIR}/vsg/lib/libvsg.so.1.1.15"
         /usr/lib/x86_64-linux-gnu/libvulkan.so
         /usr/lib/x86_64-linux-gnu/libIrrlicht.so
         /usr/lib/x86_64-linux-gnu/openmpi/lib/libmpi_cxx.so

@@ -53,10 +53,15 @@
 
 #include "chrono_thirdparty/cxxopts/ChCLI.h"
 
+#include "src/MaterialUtils.h"
+#include "src/RockField.h"
+#include "src/SynAgents.h"
+
 using namespace chrono;
 using namespace chrono::sensor;
 using namespace chrono::synchrono;
 using namespace chrono::vehicle;
+using namespace amd_uw;
 
 namespace {
 
@@ -79,12 +84,7 @@ const double terrain_height_offset = 0.0;
 const double terrain_min_height = -25.0;
 const double terrain_max_height = 25.0;
 const double terrain_height_probe_clearance = 10.0;
-const int rocks_per_rank = 15;
-const double rock_mesh_scale = 0.3;
-const double rock_density = 2500.0;
-const double rock_first_distance = 15.0;
-const double rock_distance_step = 15.0;
-const double rock_surface_clearance = 0.05;
+const RockFieldConfig rock_field_config;
 const float global_camera_update_rate = 30.0f;
 const unsigned int global_camera_width = 1280;
 const unsigned int global_camera_height = 720;
@@ -122,142 +122,6 @@ double InitialHeadingDegForRobot(int robot_index) {
 
 ChVector3d InitialGroundPositionForRobot(int robot_index, int num_robots, double start_spacing) {
     return ChVector3d(0.0, (robot_index - 0.5 * (num_robots - 1)) * start_spacing, 0.0);
-}
-
-std::shared_ptr<ChVisualMaterial> CreateLunarHapkeMaterial() {
-    auto material = chrono_types::make_shared<ChVisualMaterial>();
-    material->SetAmbientColor({0.0f, 0.0f, 0.0f});
-    material->SetDiffuseColor({0.7f, 0.7f, 0.7f});
-    material->SetSpecularColor({1.0f, 1.0f, 1.0f});
-    material->SetUseSpecularWorkflow(true);
-    material->SetRoughness(0.8f);
-    material->SetAnisotropy(1.0f);
-    material->SetBSDF(BSDFType::HAPKE);
-    material->SetHapkeParameters(0.32357f, 0.23955f, 0.30452f, 1.80238f, 0.07145f, 0.3f,
-                                 23.4f * static_cast<float>(CH_PI / 180.0));
-    material->SetClassID(30000);
-    material->SetInstanceID(20000);
-    return material;
-}
-
-void ApplyMaterialToVisualShapes(std::shared_ptr<ChBody> body, std::shared_ptr<ChVisualMaterial> material) {
-    if (!body || !body->GetVisualModel())
-        return;
-
-    for (const auto& shape_instance : body->GetVisualModel()->GetShapeInstances()) {
-        auto shape = shape_instance.shape;
-        if (!shape)
-            continue;
-
-        if (shape->GetNumMaterials() == 0) {
-            shape->AddMaterial(material);
-        } else {
-            shape->GetMaterials()[0] = material;
-        }
-    }
-}
-
-void NormalizeRockMeshOnGround(std::shared_ptr<ChTriangleMeshConnected> mesh) {
-    const ChAABB bbox = mesh->GetBoundingBox();
-    const double center_x = 0.5 * (bbox.min.x() + bbox.max.x());
-    const double center_y = 0.5 * (bbox.min.y() + bbox.max.y());
-    mesh->Transform(ChVector3d(-center_x, -center_y, -bbox.min.z()), ChMatrix33<>(1.0));
-}
-
-std::shared_ptr<ChTriangleMeshConnected> LoadRockMesh(const std::string& filename, bool load_uv) {
-    auto mesh = ChTriangleMeshConnected::CreateFromWavefrontFile(filename, false, load_uv);
-    if (!mesh)
-        throw std::runtime_error("Failed to load rock mesh: " + filename);
-
-    mesh->Transform(ChVector3d(0, 0, 0), ChMatrix33<>(rock_mesh_scale));
-    mesh->Transform(ChVector3d(0, 0, 0), ChMatrix33<>(QuatFromAngleX(CH_PI_2)));
-    mesh->RepairDuplicateVertices(1e-9);
-    NormalizeRockMeshOnGround(mesh);
-    return mesh;
-}
-
-std::vector<std::shared_ptr<ChBodyAuxRef>> AddRockFields(ChSystem* system,
-                                                         RigidTerrain& terrain,
-                                                         const std::shared_ptr<ChContactMaterial>& rock_mat,
-                                                         const std::string& chrono_data_path,
-                                                         const std::string& amd_uw_data_path,
-                                                         int robot_index,
-                                                         int num_robots,
-                                                         double start_spacing,
-                                                         double height_probe_z) {
-    const std::array<std::string, 3> rock_visual_obj_files = {
-        chrono_data_path + "robot/curiosity/rocks/rock1.obj",
-        chrono_data_path + "robot/curiosity/rocks/rock2.obj",
-        chrono_data_path + "robot/curiosity/rocks/rock3.obj",
-    };
-    const std::array<std::string, 3> rock_collision_obj_files = {
-        amd_uw_data_path + "rocks/curiosity_hulls/rock1_hull.obj",
-        amd_uw_data_path + "rocks/curiosity_hulls/rock2_hull.obj",
-        amd_uw_data_path + "rocks/curiosity_hulls/rock3_hull.obj",
-    };
-
-    auto rock_vis_mat = CreateLunarHapkeMaterial();
-    std::array<std::shared_ptr<ChTriangleMeshConnected>, 3> rock_visual_meshes;
-    std::array<std::shared_ptr<ChTriangleMeshConnected>, 3> rock_collision_meshes;
-    std::array<std::shared_ptr<ChCollisionShapeTriangleMesh>, 3> rock_ct_shapes;
-    std::array<std::shared_ptr<ChVisualShapeTriangleMesh>, 3> rock_vis_shapes;
-
-    for (size_t i = 0; i < rock_visual_obj_files.size(); i++) {
-        rock_visual_meshes[i] = LoadRockMesh(rock_visual_obj_files[i], true);
-        rock_collision_meshes[i] = LoadRockMesh(rock_collision_obj_files[i], false);
-        rock_ct_shapes[i] =
-            chrono_types::make_shared<ChCollisionShapeTriangleMesh>(rock_mat, rock_collision_meshes[i], false, true, 0.005);
-
-        rock_vis_shapes[i] = chrono_types::make_shared<ChVisualShapeTriangleMesh>();
-        rock_vis_shapes[i]->SetMesh(rock_visual_meshes[i]);
-        rock_vis_shapes[i]->SetBackfaceCull(true);
-        rock_vis_shapes[i]->AddMaterial(rock_vis_mat);
-    }
-
-    std::uniform_real_distribution<double> distance_jitter(0.0, 3.5);
-    std::uniform_real_distribution<double> lateral_offset(-15.0, 15.0);
-    std::uniform_real_distribution<double> yaw_offset(-CH_PI, CH_PI);
-
-    std::vector<std::shared_ptr<ChBodyAuxRef>> rocks;
-    std::mt19937 rng(20260621 + 4099 * robot_index);
-    const ChVector3d origin = InitialGroundPositionForRobot(robot_index, num_robots, start_spacing);
-    const double heading = InitialHeadingDegForRobot(robot_index) * CH_DEG_TO_RAD;
-    const ChVector3d forward(std::cos(heading), std::sin(heading), 0.0);
-    const ChVector3d left(-std::sin(heading), std::cos(heading), 0.0);
-
-    for (int i = 0; i < rocks_per_rank; i++) {
-        const double distance = rock_first_distance + i * rock_distance_step + distance_jitter(rng);
-        const ChVector3d xy = origin + forward * distance + left * lateral_offset(rng);
-        const double terrain_z = terrain.GetHeight(ChVector3d(xy.x(), xy.y(), height_probe_z));
-        const int shape_index = (robot_index * rocks_per_rank + i) % static_cast<int>(rock_visual_meshes.size());
-
-        double mass;
-        ChVector3d cog;
-        ChMatrix33<> inertia;
-        rock_collision_meshes[shape_index]->ComputeMassProperties(true, mass, cog, inertia);
-        ChMatrix33<> principal_inertia_rot;
-        ChVector3d principal_inertia;
-        ChInertiaUtils::PrincipalInertia(inertia, principal_inertia, principal_inertia_rot);
-
-        auto rock_body = chrono_types::make_shared<ChBodyAuxRef>();
-        rock_body->SetFixed(false);
-        rock_body->SetSleepingAllowed(true);
-        rock_body->SetSleepTime(0.15f);
-        rock_body->SetSleepMinLinVel(0.08f);
-        rock_body->SetSleepMinAngVel(0.08f);
-        rock_body->SetMass(rock_density * mass);
-        rock_body->SetInertiaXX(rock_density * principal_inertia);
-        rock_body->SetFrameCOMToRef(ChFrame<>(cog, principal_inertia_rot));
-        rock_body->SetFrameRefToAbs(ChFrame<>(ChVector3d(xy.x(), xy.y(), terrain_z + rock_surface_clearance),
-                                              QuatFromAngleZ(yaw_offset(rng))));
-        rock_body->AddCollisionShape(rock_ct_shapes[shape_index]);
-        rock_body->EnableCollision(true);
-        rock_body->AddVisualShape(rock_vis_shapes[shape_index]);
-        system->AddBody(rock_body);
-        rocks.push_back(rock_body);
-    }
-
-    return rocks;
 }
 
 // Small adapter so the simulation loop can stay headless unless this rank owns a VSG window.
@@ -323,158 +187,6 @@ class DriverWrapper : public ChDriver {
   private:
     std::shared_ptr<ChInteractiveDriver> m_driver;
     bool m_hold_brake;
-};
-
-// SynChrono agent that broadcasts a WheeledTrailer so it shows up on remote
-// ranks. A WheeledTrailer is not a ChWheeledVehicle, so it cannot be handed to
-// a stock SynWheeledVehicleAgent. Instead we reuse that agent's zombie
-// machinery (a chassis mesh + N wheel meshes driven by a state message) and
-// override only how the *local* state is sampled, reading the trailer's
-// chassis body and spindles exactly the way the base class reads a vehicle's.
-class SynTrailerAgent : public SynWheeledVehicleAgent {
-  public:
-    explicit SynTrailerAgent(std::shared_ptr<WheeledTrailer> trailer = nullptr)
-        : SynWheeledVehicleAgent(nullptr), m_trailer(trailer) {}
-
-    void Update() override {
-        if (!m_trailer)
-            return;  // zombie instance on a remote rank: nothing local to sample
-
-        auto chassis_abs = m_trailer->GetChassis()->GetBody()->GetFrameRefToAbs();
-        SynPose chassis(chassis_abs.GetPos(), chassis_abs.GetRot());
-        chassis.GetFrame().SetPosDt(chassis_abs.GetPosDt());
-        chassis.GetFrame().SetPosDt2(chassis_abs.GetPosDt2());
-        chassis.GetFrame().SetRotDt(chassis_abs.GetRotDt());
-        chassis.GetFrame().SetRotDt2(chassis_abs.GetRotDt2());
-
-        std::vector<SynPose> wheels;
-        for (auto& axle : m_trailer->GetAxles()) {
-            for (auto& wheel : axle->GetWheels()) {
-                auto state = wheel->GetState();
-                auto wheel_abs = wheel->GetSpindle()->GetFrameRefToAbs();
-                SynPose frame(state.pos, state.rot);
-                frame.GetFrame().SetPosDt(wheel_abs.GetPosDt());
-                frame.GetFrame().SetPosDt2(wheel_abs.GetPosDt2());
-                frame.GetFrame().SetRotDt(wheel_abs.GetRotDt());
-                frame.GetFrame().SetRotDt2(wheel_abs.GetRotDt2());
-                wheels.emplace_back(frame);
-            }
-        }
-
-        const double time = m_trailer->GetChassis()->GetBody()->GetSystem()->GetChTime();
-        m_state->SetState(time, chassis, wheels);
-    }
-
-  private:
-    std::shared_ptr<WheeledTrailer> m_trailer;
-};
-
-class SynRockAgent : public SynAgent {
-  public:
-    SynRockAgent(std::vector<std::shared_ptr<ChBodyAuxRef>> rocks,
-                 std::string chrono_data_path,
-                 bool visualize_zombies)
-        : SynAgent(),
-          m_rocks(std::move(rocks)),
-          m_chrono_data_path(std::move(chrono_data_path)),
-          m_visualize_zombies(visualize_zombies),
-          m_state(chrono_types::make_shared<SynMAPMessage>()) {}
-
-    void InitializeZombie(ChSystem* system) override {
-        if (!m_visualize_zombies || m_agent_key.GetNodeID() <= 0)
-            return;
-
-        const std::array<std::string, 3> rock_visual_obj_files = {
-            m_chrono_data_path + "robot/curiosity/rocks/rock1.obj",
-            m_chrono_data_path + "robot/curiosity/rocks/rock2.obj",
-            m_chrono_data_path + "robot/curiosity/rocks/rock3.obj",
-        };
-
-        auto rock_vis_mat = CreateLunarHapkeMaterial();
-        std::array<std::shared_ptr<ChVisualShapeTriangleMesh>, 3> rock_vis_shapes;
-        for (size_t i = 0; i < rock_visual_obj_files.size(); i++) {
-            auto mesh = LoadRockMesh(rock_visual_obj_files[i], true);
-            rock_vis_shapes[i] = chrono_types::make_shared<ChVisualShapeTriangleMesh>();
-            rock_vis_shapes[i]->SetMesh(mesh);
-            rock_vis_shapes[i]->SetBackfaceCull(true);
-            rock_vis_shapes[i]->AddMaterial(rock_vis_mat);
-        }
-
-        const int robot_index = m_agent_key.GetNodeID() - 1;
-        for (int i = 0; i < rocks_per_rank; i++) {
-            const int shape_index = (robot_index * rocks_per_rank + i) % static_cast<int>(rock_vis_shapes.size());
-            auto rock = chrono_types::make_shared<ChBodyAuxRef>();
-            rock->SetFixed(true);
-            rock->EnableCollision(false);
-            rock->AddVisualShape(rock_vis_shapes[shape_index]);
-            system->AddBody(rock);
-            m_zombie_rocks.push_back(rock);
-        }
-    }
-
-    void SynchronizeZombie(std::shared_ptr<SynMessage> message) override {
-        auto state = std::dynamic_pointer_cast<SynMAPMessage>(message);
-        if (!state || m_zombie_rocks.empty() || state->intersections.empty() ||
-            state->intersections[0].approaches.empty())
-            return;
-
-        const auto& lanes = state->intersections[0].approaches[0]->lanes;
-        for (size_t i = 0; i < lanes.size() && i < m_zombie_rocks.size(); i++) {
-            if (lanes[i].controlPoints.size() < 3)
-                continue;
-
-            const auto& p = lanes[i].controlPoints[0];
-            const auto& q0q1q2 = lanes[i].controlPoints[1];
-            const auto& q3 = lanes[i].controlPoints[2];
-            m_zombie_rocks[i]->SetFrameRefToAbs(
-                ChFrame<>(p, ChQuaternion<>(q0q1q2.x(), q0q1q2.y(), q0q1q2.z(), q3.x())));
-        }
-    }
-
-    void Update() override {
-        if (m_rocks.empty())
-            return;
-
-        m_state = chrono_types::make_shared<SynMAPMessage>(m_agent_key, AgentKey());
-        m_state->time = m_rocks[0]->GetSystem()->GetChTime();
-
-        Intersection rock_intersection;
-        auto rock_approach = chrono_types::make_shared<SynApproachMessage>(m_agent_key, AgentKey());
-        rock_approach->time = m_state->time;
-
-        for (const auto& rock : m_rocks) {
-            const auto frame = rock->GetFrameRefToAbs();
-            const auto p = frame.GetPos();
-            const auto q = frame.GetRot();
-            rock_approach->lanes.emplace_back(0.0, std::vector<ChVector3d>{
-                                                       ChVector3d(p.x(), p.y(), p.z()),
-                                                       ChVector3d(q.e0(), q.e1(), q.e2()),
-                                                       ChVector3d(q.e3(), 0.0, 0.0),
-                                                   });
-        }
-
-        rock_intersection.approaches.push_back(rock_approach);
-        m_state->intersections.push_back(rock_intersection);
-    }
-
-    void GatherMessages(SynMessageList& messages) override {
-        if (!m_rocks.empty())
-            messages.push_back(m_state);
-    }
-
-    void GatherDescriptionMessages(SynMessageList& messages) override {}
-
-    void SetKey(AgentKey agent_key) override {
-        m_agent_key = agent_key;
-        m_state->SetSourceKey(agent_key);
-    }
-
-  private:
-    std::vector<std::shared_ptr<ChBodyAuxRef>> m_rocks;
-    std::vector<std::shared_ptr<ChBodyAuxRef>> m_zombie_rocks;
-    std::string m_chrono_data_path;
-    bool m_visualize_zombies;
-    std::shared_ptr<SynMAPMessage> m_state;
 };
 
 // Command-line options used by the demo.
@@ -589,7 +301,7 @@ int main(int argc, char* argv[]) {
     if (owns_robot) {
         const int robot_index = rank - 1;
         owned_rocks = AddRockFields(system, terrain, rock_mat, chrono_data_path, amd_uw_data_path, robot_index,
-                                    num_robot_ranks, start_spacing, height_probe_z);
+                                    num_robot_ranks, start_spacing, height_probe_z, rock_field_config);
 
         const ChVector3d start_ground = InitialGroundPositionForRobot(robot_index, num_robot_ranks, start_spacing);
         const double start_x = start_ground.x();
@@ -726,7 +438,7 @@ int main(int argc, char* argv[]) {
         syn_manager.AddAgent(trailer_agent);
 
         syn_manager.AddAgent(chrono_types::make_shared<SynRockAgent>(owned_rocks, chrono_data_path,
-                                                                     /*visualize_zombies=*/false));
+                                                                     /*visualize_zombies=*/false, rock_field_config));
 
         SynLog() << "Rank " << rank << " owns robot index " << robot_index << " and " << owned_rocks.size()
                  << " dynamic rocks.\n";
@@ -740,7 +452,8 @@ int main(int argc, char* argv[]) {
             continue;
 
         syn_manager.AddZombie(chrono_types::make_shared<SynRockAgent>(
-                                  std::vector<std::shared_ptr<ChBodyAuxRef>>{}, chrono_data_path, is_sensor_rank),
+                                  std::vector<std::shared_ptr<ChBodyAuxRef>>{}, chrono_data_path, is_sensor_rank,
+                                  rock_field_config),
                               AgentKey(robot_rank, 3));
     }
 
