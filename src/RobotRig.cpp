@@ -13,6 +13,8 @@
 #include "chrono_vehicle/ChVehicleDataPath.h"
 #include "chrono_vehicle/utils/ChVehicleUtilsJSON.h"
 
+#include "RobotLayout.h"
+
 #ifdef AMD_UW_ENABLE_ROS2
 #include "RosControllerDriver.h"
 #endif
@@ -23,14 +25,6 @@ namespace {
 
 double VecNorm(const chrono::ChVector3d& v) {
     return std::sqrt(v.x() * v.x() + v.y() * v.y() + v.z() * v.z());
-}
-
-double InitialHeadingDegForRobot(int robot_index) {
-    return (robot_index == 0) ? 330.0 : 60.0;
-}
-
-chrono::ChVector3d InitialGroundPositionForRobot(int robot_index, int num_robots, double start_spacing) {
-    return chrono::ChVector3d(0.0, (robot_index - 0.5 * (num_robots - 1)) * start_spacing, 0.0);
 }
 
 }  // namespace

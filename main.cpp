@@ -2,14 +2,9 @@
 // Rank 0 is the global sensor/visualization rank. Robot physics starts on rank 1.
 
 #include <chrono>
-#include <array>
+#include <algorithm>
 #include <cmath>
-#include <iostream>
-#include <limits>
 #include <memory>
-#include <random>
-#include <set>
-#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -17,26 +12,14 @@
 #include "chrono/core/ChRealtimeStep.h"
 #include "chrono/core/ChDataPath.h"
 #include "chrono/core/ChTypes.h"
-#include "chrono/assets/ChVisualMaterial.h"
-#include "chrono/assets/ChVisualShapeTriangleMesh.h"
-#include "chrono/collision/ChCollisionShapeTriangleMesh.h"
-#include "chrono/geometry/ChTriangleMeshConnected.h"
 #include "chrono/physics/ChBody.h"
-#include "chrono/physics/ChBodyAuxRef.h"
-#include "chrono/physics/ChBodyEasy.h"
 #include "chrono/physics/ChContactMaterial.h"
-#include "chrono/physics/ChMassProperties.h"
 #include "chrono/physics/ChSystemNSC.h"
 
 #include "chrono_vehicle/ChVehicleDataPath.h"
-#include "chrono_vehicle/driver/ChInteractiveDriver.h"
 #include "chrono_vehicle/terrain/RigidTerrain.h"
-#include "chrono_vehicle/utils/ChVehicleUtilsJSON.h"
-#include "chrono_vehicle/wheeled_vehicle/vehicle/WheeledVehicle.h"
-#include "chrono_vehicle/wheeled_vehicle/vehicle/WheeledTrailer.h"
 #include "chrono_vehicle/wheeled_vehicle/ChWheeledVehicleVisualSystemVSG.h"
 
-#include "chrono_sensor/ChConfigSensor.h"
 #include "chrono_sensor/ChSensorManager.h"
 #include "chrono_sensor/filters/ChFilterVisualize.h"
 #include "chrono_sensor/sensors/ChCameraSensor.h"
@@ -44,10 +27,6 @@
 #include "chrono_synchrono/SynChronoManager.h"
 #include "chrono_synchrono/agent/SynEnvironmentAgent.h"
 #include "chrono_synchrono/agent/SynWheeledVehicleAgent.h"
-#include "chrono_synchrono/flatbuffer/message/SynApproachMessage.h"
-#include "chrono_synchrono/flatbuffer/message/SynMAPMessage.h"
-#include "chrono_synchrono/flatbuffer/message/SynWheeledVehicleMessage.h"
-#include "chrono_synchrono/flatbuffer/message/SynMessageUtils.h"
 #include "chrono_synchrono/communication/mpi/SynMPICommunicator.h"
 #include "chrono_synchrono/utils/SynLog.h"
 

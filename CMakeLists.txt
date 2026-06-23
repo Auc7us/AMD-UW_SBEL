@@ -41,14 +41,13 @@ if(AMD_UW_ENABLE_ROS2)
     find_package(rclcpp QUIET)
     find_package(std_msgs QUIET)
 
-    if(rclcpp_FOUND AND std_msgs_FOUND)
-        target_sources(demo_SYN_polaris_flat PRIVATE src/RosControllerDriver.cpp)
-        target_compile_definitions(demo_SYN_polaris_flat PRIVATE AMD_UW_ENABLE_ROS2)
-        message(STATUS "ROS2 bridge enabled")
-    else()
-        message(WARNING "ROS2 bridge requested but rclcpp/std_msgs were not found; building interactive-driver fallback")
-        set(AMD_UW_ENABLE_ROS2 OFF)
+    if(NOT rclcpp_FOUND OR NOT std_msgs_FOUND)
+        message(FATAL_ERROR "AMD_UW_ENABLE_ROS2=ON requires ROS2 rclcpp and std_msgs. Source ROS2 or configure with -DAMD_UW_ENABLE_ROS2=OFF.")
     endif()
+
+    target_sources(demo_SYN_polaris_flat PRIVATE src/RosControllerDriver.cpp)
+    target_compile_definitions(demo_SYN_polaris_flat PRIVATE AMD_UW_ENABLE_ROS2)
+    message(STATUS "ROS2 bridge enabled")
 endif()
 
 target_compile_definitions(demo_SYN_polaris_flat
