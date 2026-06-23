@@ -27,12 +27,29 @@ set(OPTIX_INCLUDE_DIR
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+option(AMD_UW_ENABLE_ROS2 "Enable ROS2 command/state bridge" ON)
+
 add_executable(demo_SYN_polaris_flat
     main.cpp
     src/MaterialUtils.cpp
     src/RobotRig.cpp
     src/RockField.cpp
     src/SynAgents.cpp)
+
+if(AMD_UW_ENABLE_ROS2)
+    find_package(ament_cmake QUIET)
+    find_package(rclcpp QUIET)
+    find_package(std_msgs QUIET)
+
+    if(rclcpp_FOUND AND std_msgs_FOUND)
+        target_sources(demo_SYN_polaris_flat PRIVATE src/RosControllerDriver.cpp)
+        target_compile_definitions(demo_SYN_polaris_flat PRIVATE AMD_UW_ENABLE_ROS2)
+        message(STATUS "ROS2 bridge enabled")
+    else()
+        message(WARNING "ROS2 bridge requested but rclcpp/std_msgs were not found; building interactive-driver fallback")
+        set(AMD_UW_ENABLE_ROS2 OFF)
+    endif()
+endif()
 
 target_compile_definitions(demo_SYN_polaris_flat
     PRIVATE
@@ -92,7 +109,6 @@ target_link_options(demo_SYN_polaris_flat
         "-Wl,-rpath-link,${CHRONO_PACKAGE_DIR}/vsg/lib")
 
 target_link_libraries(demo_SYN_polaris_flat
-    PRIVATE
         "${CHRONO_BUILD_DIR}/lib/libChrono_synchrono.so"
         "${CHRONO_BUILD_DIR}/lib/libChronoModels_vehicle.so"
         "${CHRONO_BUILD_DIR}/lib/libChronoModels_robot.so"
@@ -128,3 +144,11 @@ target_link_libraries(demo_SYN_polaris_flat
         /usr/lib/x86_64-linux-gnu/libIrrlicht.so
         /usr/lib/x86_64-linux-gnu/openmpi/lib/libmpi_cxx.so
         /usr/lib/x86_64-linux-gnu/openmpi/lib/libmpi.so)
+
+if(AMD_UW_ENABLE_ROS2)
+    if(ament_cmake_FOUND)
+        ament_target_dependencies(demo_SYN_polaris_flat rclcpp std_msgs)
+    else()
+        target_link_libraries(demo_SYN_polaris_flat rclcpp::rclcpp ${std_msgs_TARGETS})
+    endif()
+endif()

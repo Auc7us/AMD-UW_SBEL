@@ -18,6 +18,12 @@ Run one controller:
 ros2 run amd_uw_ros2 simple_goal_controller --ros-args -p robot_id:=1 -p target_x:=8.0 -p target_y:=0.0
 ```
 
+Run the speed-only controller:
+
+```bash
+ros2 run amd_uw_ros2 constant_speed_controller --ros-args -p robot_id:=1 -p target_speed_mps:=1.0
+```
+
 ## Temporary Topic Contract
 
 For robot rank `N`, the C++ sim should publish:
@@ -48,9 +54,19 @@ Optional target override:
 /robot_N/target_pose    geometry_msgs/Pose2D
 ```
 
+## Speed-Only POC
+
+`constant_speed_controller` ignores steering for now and publishes:
+
+```text
+data = [0.0, throttle, brake]
+```
+
+It ramps the target speed, throttle, and brake so commands change gradually. This is intended as the first closed-loop vehicle-control test before adding steering or terminal-pose planning.
+
 ## C++ Integration Target
 
-Add a future `RosControllerDriver` owned by `RobotRig`.
+`RosControllerDriver` is owned by `RobotRig` when CMake finds ROS2 `rclcpp` and `std_msgs`.
 
 Expected behavior:
 
@@ -60,7 +76,56 @@ Expected behavior:
 4. Return Chrono `DriverInputs` from that command.
 5. Publish `/robot_N/state` each simulation tick.
 
-`RobotRig::Synchronize()` should eventually ask this driver for inputs instead of the current interactive driver.
+`RobotRig::Synchronize()` asks this driver for inputs instead of the interactive driver when `AMD_UW_ENABLE_ROS2` is enabled.
+
+If ROS2 is not found at CMake configure time, the C++ sim falls back to the interactive driver.
+
+## Full POC Run Order
+
+Terminal 1, robot rank 1 controller:
+
+```bash
+source /opt/ros/humble/setup.bash
+cd ~/mountdir/amd-uw/ros2_ws
+colcon build --symlink-install
+source install/setup.bash
+ros2 run amd_uw_ros2 constant_speed_controller --ros-args -p robot_id:=1 -p target_speed_mps:=1.0
+```
+
+Terminal 2, robot rank 2 controller:
+
+```bash
+source /opt/ros/humble/setup.bash
+cd ~/mountdir/amd-uw/ros2_ws
+source install/setup.bash
+ros2 run amd_uw_ros2 constant_speed_controller --ros-args -p robot_id:=2 -p target_speed_mps:=1.0
+```
+
+Terminal 3, C++ sim:
+
+```bash
+source /opt/ros/humble/setup.bash
+cd ~/mountdir/amd-uw
+cmake -S . -B build -DAMD_UW_ENABLE_ROS2=ON
+cmake --build build -j2
+mpirun -np 3 ./build/demo_SYN_polaris_flat
+```
+
+Rank layout:
+
+```text
+rank 0 = global sensor/visualization rank
+rank 1 = robot 1
+rank 2 = robot 2
+```
+
+Terminal 4, optional:
+
+```bash
+source /opt/ros/humble/setup.bash
+ros2 topic echo /robot_1/state
+ros2 topic echo /robot_1/vehicle_cmd
+```
 
 ## Later Terminal-Pose Planner
 

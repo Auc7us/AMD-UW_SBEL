@@ -33,7 +33,7 @@ class RobotRig {
     chrono::ChSystem* GetSystem() const;
     chrono::vehicle::WheeledVehicle* GetVehicle() const;
     std::shared_ptr<chrono::vehicle::WheeledTrailer> GetTrailer() const;
-    chrono::vehicle::ChInteractiveDriver* GetInteractiveDriver() const;
+    chrono::vehicle::ChDriver* GetDriver() const;
     const std::vector<std::shared_ptr<chrono::ChBodyAuxRef>>& GetRocks() const;
 
     void InitializeOnTerrain(chrono::vehicle::RigidTerrain& terrain,
@@ -77,7 +77,7 @@ class RobotRig {
     std::unique_ptr<chrono::vehicle::WheeledVehicle> m_vehicle;
     std::shared_ptr<chrono::vehicle::WheeledTrailer> m_trailer;
     std::shared_ptr<chrono::ChBodyEasyBox> m_trailer_bed;
-    std::unique_ptr<DriverWrapper> m_driver;
+    std::unique_ptr<chrono::vehicle::ChDriver> m_driver;
     std::shared_ptr<chrono::vehicle::ChInteractiveDriver> m_irr_driver;
     std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> m_rocks;
 };

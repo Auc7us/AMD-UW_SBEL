@@ -1,5 +1,5 @@
 // Minimal MPI SynChrono demo for the AMD-UW Polaris JSON vehicle.
-// Run with two ranks to see two synchronized Polaris vehicles on one flat terrain.
+// Rank 0 is the global sensor/visualization rank. Robot physics starts on rank 1.
 
 #include <chrono>
 #include <array>
@@ -325,7 +325,7 @@ int main(int argc, char* argv[]) {
         vsg_app->EnableSkyTexture(SkyMode::DOME);
         vsg_app->EnableShadows();
         vsg_app->AttachVehicle(robot->GetVehicle());
-        vsg_app->AttachDriver(robot->GetInteractiveDriver());
+        vsg_app->AttachDriver(robot->GetDriver());
         vsg_app->AttachTerrain(&terrain);
         vsg_app->Initialize();
         app.Set(vsg_app);

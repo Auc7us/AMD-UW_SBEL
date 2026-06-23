@@ -19,6 +19,7 @@ setup(
     tests_require=["pytest"],
     entry_points={
         "console_scripts": [
+            "constant_speed_controller = amd_uw_ros2.constant_speed_controller:main",
             "simple_goal_controller = amd_uw_ros2.simple_goal_controller:main",
         ],
     },

@@ -13,6 +13,10 @@
 #include "chrono_vehicle/ChVehicleDataPath.h"
 #include "chrono_vehicle/utils/ChVehicleUtilsJSON.h"
 
+#ifdef AMD_UW_ENABLE_ROS2
+#include "RosControllerDriver.h"
+#endif
+
 namespace amd_uw {
 
 namespace {
@@ -97,8 +101,8 @@ std::shared_ptr<chrono::vehicle::WheeledTrailer> RobotRig::GetTrailer() const {
     return m_trailer;
 }
 
-chrono::vehicle::ChInteractiveDriver* RobotRig::GetInteractiveDriver() const {
-    return m_irr_driver.get();
+chrono::vehicle::ChDriver* RobotRig::GetDriver() const {
+    return m_driver.get();
 }
 
 const std::vector<std::shared_ptr<chrono::ChBodyAuxRef>>& RobotRig::GetRocks() const {
@@ -234,13 +238,18 @@ void RobotRig::InitializeTrailerBed() {
 }
 
 void RobotRig::InitializeDriver() {
-    m_driver = std::make_unique<DriverWrapper>(*m_vehicle);
+#ifdef AMD_UW_ENABLE_ROS2
+    m_driver = std::make_unique<RosControllerDriver>(*m_vehicle, m_rank);
+#else
+    auto interactive_driver = std::make_unique<DriverWrapper>(*m_vehicle);
     m_irr_driver = chrono_types::make_shared<chrono::vehicle::ChInteractiveDriver>(*m_vehicle);
     m_irr_driver->SetSteeringDelta(m_render_step_size / 1.0);
     m_irr_driver->SetThrottleDelta(m_render_step_size / 1.0);
     m_irr_driver->SetBrakingDelta(m_render_step_size / 0.3);
     m_irr_driver->Initialize();
-    m_driver->Set(m_irr_driver);
+    interactive_driver->Set(m_irr_driver);
+    m_driver = std::move(interactive_driver);
+#endif
 }
 
 void RobotRig::Settle(chrono::vehicle::RigidTerrain& terrain, double settle_time, double step_size) {
