@@ -55,6 +55,7 @@
 
 #include "src/MaterialUtils.h"
 #include "src/RockField.h"
+#include "src/RobotRig.h"
 #include "src/SynAgents.h"
 
 using namespace chrono;
@@ -105,23 +106,11 @@ const double seat_clearance = 0.025;
 
 ChVector3d track_point(0.0, 0.0, 1.0);
 
-double VecNorm(const ChVector3d& v) {
-    return std::sqrt(v.x() * v.x() + v.y() * v.y() + v.z() * v.z());
-}
-
 ChQuaternion<> SensorLookAtRotation(const ChVector3d& camera_pos, const ChVector3d& target_pos) {
     const ChVector3d forward = (target_pos - camera_pos).GetNormalized();
     ChMatrix33<> rot;
     rot.SetFromAxisX(forward, VECT_Y);
     return rot.GetQuaternion();
-}
-
-double InitialHeadingDegForRobot(int robot_index) {
-    return (robot_index == 0) ? 330.0 : 60.0;
-}
-
-ChVector3d InitialGroundPositionForRobot(int robot_index, int num_robots, double start_spacing) {
-    return ChVector3d(0.0, (robot_index - 0.5 * (num_robots - 1)) * start_spacing, 0.0);
 }
 
 // Small adapter so the simulation loop can stay headless unless this rank owns a VSG window.
@@ -150,43 +139,6 @@ class VsgAppWrapper {
 
   private:
     std::shared_ptr<ChWheeledVehicleVisualSystemVSG> m_app;
-};
-
-// Driver adapter that starts with a full brake hold. The hold is released once
-// the interactive driver receives a real throttle or steering command.
-class DriverWrapper : public ChDriver {
-  public:
-    explicit DriverWrapper(ChVehicle& vehicle) : ChDriver(vehicle), m_hold_brake(true) {
-        m_throttle = 0.0;
-        m_steering = 0.0;
-        m_braking = 1.0;
-    }
-
-    void Set(std::shared_ptr<ChInteractiveDriver> driver) { m_driver = driver; }
-
-    void Synchronize(double time) override {
-        if (!m_driver)
-            return;
-
-        m_driver->Synchronize(time);
-        m_throttle = m_driver->GetThrottle();
-        m_steering = m_driver->GetSteering();
-
-        if (m_hold_brake && (m_throttle > 1e-3 || std::abs(m_steering) > 1e-3)) {
-            m_hold_brake = false;
-        }
-
-        m_braking = m_hold_brake ? 1.0 : m_driver->GetBraking();
-    }
-
-    void Advance(double step) override {
-        if (m_driver)
-            m_driver->Advance(step);
-    }
-
-  private:
-    std::shared_ptr<ChInteractiveDriver> m_driver;
-    bool m_hold_brake;
 };
 
 // Command-line options used by the demo.
@@ -255,12 +207,13 @@ int main(int argc, char* argv[]) {
     ChSystemNSC sensor_system;
     sensor_system.SetCollisionSystemType(ChCollisionSystem::Type::BULLET);
 
-    std::unique_ptr<WheeledVehicle> vehicle;
+    std::unique_ptr<RobotRig> robot;
     ChSystem* system = &sensor_system;
     if (owns_robot) {
-        vehicle = std::make_unique<WheeledVehicle>(GetVehicleDataFile("LRV/Polaris.json"), contact_method);
-        system = vehicle->GetSystem();
-        system->SetCollisionSystemType(ChCollisionSystem::Type::BULLET);
+        const int robot_index = rank - 1;
+        robot = std::make_unique<RobotRig>(contact_method, rank, robot_index, num_robot_ranks, tire_step_size,
+                                           render_step_size);
+        system = robot->GetSystem();
     }
 
     // Apollo-site height-map terrain. Each BMP pixel maps to an integer-sized terrain cell.
@@ -291,157 +244,28 @@ int main(int argc, char* argv[]) {
     auto rock_mat = ChContactMaterial::DefaultMaterial(contact_method);
     rock_mat->SetFriction(0.9f);
     rock_mat->SetRestitution(0.0f);
-    std::vector<std::shared_ptr<ChBodyAuxRef>> owned_rocks;
-    std::shared_ptr<WheeledTrailer> trailer;
-    std::shared_ptr<ChBodyEasyBox> trailer_bed;
-    std::unique_ptr<DriverWrapper> driver;
-    std::shared_ptr<ChInteractiveDriver> irr_driver;
     VsgAppWrapper app;
 
     if (owns_robot) {
-        const int robot_index = rank - 1;
-        owned_rocks = AddRockFields(system, terrain, rock_mat, chrono_data_path, amd_uw_data_path, robot_index,
-                                    num_robot_ranks, start_spacing, height_probe_z, rock_field_config);
+        robot->InitializeOnTerrain(terrain, rock_mat, chrono_data_path, amd_uw_data_path, start_spacing, height_probe_z,
+                                   vehicle_start_clearance, seat_clearance, settle_time, step_size, rock_field_config);
 
-        const ChVector3d start_ground = InitialGroundPositionForRobot(robot_index, num_robot_ranks, start_spacing);
-        const double start_x = start_ground.x();
-        const double start_y = start_ground.y();
-        const double start_z =
-            terrain.GetHeight(ChVector3d(start_x, start_y, height_probe_z)) + vehicle_start_clearance;
-        const ChVector3d init_loc(start_x, start_y, start_z);
-        const double init_heading_deg = InitialHeadingDegForRobot(robot_index);
-        const ChQuaternion<> init_rot = QuatFromAngleZ(init_heading_deg * CH_DEG_TO_RAD);
-
-        std::set<ChBody*> preexisting_bodies;
-        for (const auto& body : system->GetBodies())
-            preexisting_bodies.insert(body.get());
-
-        vehicle->Initialize(ChCoordsys<>(init_loc, init_rot));
-        vehicle->GetChassis()->SetFixed(false);
-        vehicle->SetChassisVisualizationType(VisualizationType::MESH);
-        vehicle->SetSuspensionVisualizationType(VisualizationType::PRIMITIVES);
-        vehicle->SetSteeringVisualizationType(VisualizationType::PRIMITIVES);
-        vehicle->SetWheelVisualizationType(VisualizationType::MESH);
-
-        auto engine = ReadEngineJSON(GetVehicleDataFile("LRV/Polaris_EngineSimpleMap.json"));
-        auto transmission = ReadTransmissionJSON(GetVehicleDataFile("LRV/Polaris_AutomaticTransmissionSimpleMap.json"));
-        auto powertrain = chrono_types::make_shared<ChPowertrainAssembly>(engine, transmission);
-        vehicle->InitializePowertrain(powertrain);
-
-        for (auto& axle : vehicle->GetAxles()) {
-            for (auto& wheel : axle->GetWheels()) {
-                auto tire = ReadTireJSON(GetVehicleDataFile("LRV/Polaris_RigidTire.json"));
-                vehicle->InitializeTire(tire, wheel, VisualizationType::MESH);
-                tire->SetStepsize(tire_step_size);
-            }
-        }
-
-        trailer = chrono_types::make_shared<WheeledTrailer>(system, GetVehicleDataFile("LRV_Wagon/Polaris.json"));
-        trailer->Initialize(vehicle->GetChassis());
-        trailer->SetChassisVisualizationType(VisualizationType::PRIMITIVES);
-        trailer->SetSuspensionVisualizationType(VisualizationType::PRIMITIVES);
-        trailer->SetWheelVisualizationType(VisualizationType::PRIMITIVES);
-
-        for (auto& axle : trailer->GetAxles()) {
-            for (auto& wheel : axle->GetWheels()) {
-                auto tire = ReadTireJSON(GetVehicleDataFile("LRV/Polaris_RigidTire.json"));
-                trailer->InitializeTire(tire, wheel, VisualizationType::MESH);
-                tire->SetStepsize(tire_step_size);
-            }
-        }
-
-        {
-            double min_clearance = std::numeric_limits<double>::infinity();
-            auto consider_wheel = [&](const auto& wheel) {
-                if (!wheel)
-                    return;
-                const auto& tire = wheel->GetTire();
-                const double radius = tire ? tire->GetRadius() : 0.0;
-                const ChVector3d p = wheel->GetPos();
-                const double bottom = p.z() - radius;
-                const double terrain_under_wheel = terrain.GetHeight(ChVector3d(p.x(), p.y(), height_probe_z));
-                min_clearance = std::min(min_clearance, bottom - terrain_under_wheel);
-            };
-            for (auto& axle : vehicle->GetAxles())
-                for (auto& wheel : axle->GetWheels())
-                    consider_wheel(wheel);
-            for (auto& axle : trailer->GetAxles())
-                for (auto& wheel : axle->GetWheels())
-                    consider_wheel(wheel);
-
-            const double drop = min_clearance - seat_clearance;
-
-            for (const auto& body : system->GetBodies()) {
-                if (preexisting_bodies.count(body.get()))
-                    continue;
-                const ChVector3d p = body->GetPos();
-                body->SetPos(ChVector3d(p.x(), p.y(), p.z() - drop));
-            }
-
-            SynLog() << "Re-seated rank " << rank << " rig: lowered by " << drop << " m.\n";
-        }
-
-        auto trailer_bed_mat = ChContactMaterial::DefaultMaterial(contact_method);
-        trailer_bed_mat->SetFriction(0.9f);
-        trailer_bed = chrono_types::make_shared<ChBodyEasyBox>(1.0, 1.2, 0.02, 1000.0,
-                                                               /*visualize=*/false,
-                                                               /*collide=*/true, trailer_bed_mat);
-        trailer_bed->SetFixed(true);
-        trailer_bed->EnableCollision(true);
-        trailer_bed->SetPos(trailer->GetChassis()->GetPos() + ChVector3d(0, 0, 0.01));
-        trailer_bed->SetRot(trailer->GetChassis()->GetRot());
-        system->AddBody(trailer_bed);
-
-        driver = std::make_unique<DriverWrapper>(*vehicle);
-        irr_driver = chrono_types::make_shared<ChInteractiveDriver>(*vehicle);
-        irr_driver->SetSteeringDelta(render_step_size / 1.0);
-        irr_driver->SetThrottleDelta(render_step_size / 1.0);
-        irr_driver->SetBrakingDelta(render_step_size / 0.3);
-        irr_driver->Initialize();
-        driver->Set(irr_driver);
-
-        if (settle_time > 0) {
-            DriverInputs brake_inputs = {0.0, 0.0, 1.0, 0.0};
-            const int settle_steps = static_cast<int>(std::ceil(settle_time / step_size));
-
-            for (int i = 0; i < settle_steps; i++) {
-                const double time = system->GetChTime();
-                terrain.Synchronize(time);
-                vehicle->Synchronize(time, brake_inputs, terrain);
-                trailer->Synchronize(time, brake_inputs, terrain);
-                terrain.Advance(step_size);
-                vehicle->Advance(step_size);
-                trailer->Advance(step_size);
-            }
-
-            for (const auto& body : system->GetBodies()) {
-                body->SetPosDt(VNULL);
-                body->SetAngVelLocal(VNULL);
-                body->SetPosDt2(VNULL);
-            }
-
-            system->SetChTime(0.0);
-        }
-
-        auto vehicle_agent = chrono_types::make_shared<SynWheeledVehicleAgent>(vehicle.get());
+        auto vehicle_agent = chrono_types::make_shared<SynWheeledVehicleAgent>(robot->GetVehicle());
         vehicle_agent->SetZombieVisualizationFiles("LRV/meshes/Polaris_chassis.obj",
                                                    "LRV/meshes/Polaris_wheel.obj",
                                                    "LRV/meshes/Polaris_tire.obj");
         vehicle_agent->SetNumWheels(4);
         syn_manager.AddAgent(vehicle_agent);
 
-        auto trailer_agent = chrono_types::make_shared<SynTrailerAgent>(trailer);
+        auto trailer_agent = chrono_types::make_shared<SynTrailerAgent>(robot->GetTrailer());
         trailer_agent->SetZombieVisualizationFiles("LRV_Wagon/trailer_chassis.obj",
                                                    "LRV/meshes/Polaris_wheel.obj",
                                                    "LRV/meshes/Polaris_tire.obj");
         trailer_agent->SetNumWheels(2);
         syn_manager.AddAgent(trailer_agent);
 
-        syn_manager.AddAgent(chrono_types::make_shared<SynRockAgent>(owned_rocks, chrono_data_path,
+        syn_manager.AddAgent(chrono_types::make_shared<SynRockAgent>(robot->GetRocks(), chrono_data_path,
                                                                      /*visualize_zombies=*/false, rock_field_config));
-
-        SynLog() << "Rank " << rank << " owns robot index " << robot_index << " and " << owned_rocks.size()
-                 << " dynamic rocks.\n";
     } else {
         syn_manager.AddAgent(chrono_types::make_shared<SynEnvironmentAgent>(system));
         SynLog() << "Rank 0 is sensor/visualization only; robot physics starts on rank 1.\n";
@@ -500,8 +324,8 @@ int main(int argc, char* argv[]) {
         vsg_app->SetLightDirection(CH_PI, 1.37);
         vsg_app->EnableSkyTexture(SkyMode::DOME);
         vsg_app->EnableShadows();
-        vsg_app->AttachVehicle(vehicle.get());
-        vsg_app->AttachDriver(irr_driver.get());
+        vsg_app->AttachVehicle(robot->GetVehicle());
+        vsg_app->AttachDriver(robot->GetInteractiveDriver());
         vsg_app->AttachTerrain(&terrain);
         vsg_app->Initialize();
         app.Set(vsg_app);
@@ -526,48 +350,15 @@ int main(int argc, char* argv[]) {
         syn_manager.Synchronize(time);
 
         if (owns_robot) {
-            driver->Synchronize(time);
-            const DriverInputs driver_inputs = driver->GetInputs();
+            robot->Synchronize(time, terrain);
+            const DriverInputs driver_inputs = robot->GetDriverInputs();
             terrain.Synchronize(time);
-            vehicle->Synchronize(time, driver_inputs, terrain);
-            trailer->Synchronize(time, driver_inputs, terrain);
             app.Synchronize(time, driver_inputs);
 
-            driver->Advance(step_size);
             terrain.Advance(step_size);
-            vehicle->Advance(step_size);
-            trailer->Advance(step_size);
+            robot->Advance(step_size);
             app.Advance(step_size);
-
-            trailer_bed->SetPos(trailer->GetChassis()->GetPos() + ChVector3d(0, 0, 0.01));
-            trailer_bed->SetRot(trailer->GetChassis()->GetRot());
-
-            if (motion_log_steps > 0 && step_number % motion_log_steps == 0) {
-                const auto chassis = vehicle->GetChassisBody();
-                const ChVector3d p = chassis->GetPos();
-                const ChVector3d v = chassis->GetPosDt();
-                const ChVector3d a = chassis->GetPosDt2();
-                const ChVector3d w = chassis->GetAngVelParent();
-                const ChVector3d chassis_contact = chassis->GetContactForce();
-                double tire_force_sum = 0.0;
-                double tire_force_z = 0.0;
-
-                for (const auto& axle : vehicle->GetAxles()) {
-                    for (const auto& wheel : axle->GetWheels()) {
-                        const auto& tire = wheel->GetTire();
-                        if (!tire)
-                            continue;
-                        const auto force = tire->ReportTireForce(&terrain).force;
-                        tire_force_sum += VecNorm(force);
-                        tire_force_z += force.z();
-                    }
-                }
-
-                SynLog() << "motion rank=" << rank << " t=" << system->GetChTime() << " pos=(" << p.x() << ","
-                         << p.y() << "," << p.z() << ") speed=" << VecNorm(v) << " accel=" << VecNorm(a)
-                         << " ang_speed=" << VecNorm(w) << " chassis_contact=" << VecNorm(chassis_contact)
-                         << " tire_force_sum=" << tire_force_sum << " tire_force_z=" << tire_force_z << "\n";
-            }
+            robot->LogMotionIfNeeded(step_number, motion_log_steps, terrain);
         } else {
             terrain.Synchronize(time);
             terrain.Advance(step_size);

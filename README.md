@@ -12,9 +12,10 @@
 ## Refactoring Note
 
 - [x] Keep the current demo single-file while it remains one compact executable.
+- [x] Split robot rig setup and per-step robot updates into their own module.
 - [x] Split rock field generation into its own module.
 - [x] Split custom SynChrono agents into their own module.
-- [ ] Continue refactoring along domain boundaries when scale-up requires it: robot rig setup, terrain/world setup, and ROS controller drivers.
+- [ ] Continue refactoring along domain boundaries when scale-up requires it: terrain/world setup, ROS controller drivers, robot arm, and per-robot sensors.
 
 ## Side Quest
 

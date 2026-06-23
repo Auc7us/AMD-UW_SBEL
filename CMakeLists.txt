@@ -30,6 +30,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_executable(demo_SYN_polaris_flat
     main.cpp
     src/MaterialUtils.cpp
+    src/RobotRig.cpp
     src/RockField.cpp
     src/SynAgents.cpp)
 
