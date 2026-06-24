@@ -5,11 +5,9 @@
 Terminal 1:
 
 ```bash
-cd ~/mountdir/amd-uw/ros2_ws
+cd ~/mountdir/amd-uw/build
 source /opt/ros/humble/setup.bash
-colcon build --symlink-install
-source install/setup.bash
-ros2 run amd_uw_ros2 pure_pursuit_controller --ros-args -p robot_id:=1 -p target_speed_mps:=1.0 -p switch_radius_m:=3.0
+mpirun -np 3 ./demo_SYN_polaris_flat --vsg 1,2
 ```
 
 Terminal 2:
@@ -18,17 +16,16 @@ Terminal 2:
 cd ~/mountdir/amd-uw/ros2_ws
 source /opt/ros/humble/setup.bash
 source install/setup.bash
-ros2 run amd_uw_ros2 pure_pursuit_controller --ros-args -p robot_id:=2 -p target_speed_mps:=1.0 -p switch_radius_m:=3.0
+ros2 run amd_uw_ros2 pure_pursuit_controller --ros-args -p robot_id:=1 -p target_speed_mps:=10.0 -p switch_radius_m:=2.0
 ```
 
 Terminal 3:
 
 ```bash
-cd ~/mountdir/amd-uw
+cd ~/mountdir/amd-uw/ros2_ws
 source /opt/ros/humble/setup.bash
-cmake -S . -B build -DAMD_UW_ENABLE_ROS2=ON
-cmake --build build -j2
-mpirun -np 3 ./build/demo_SYN_polaris_flat --vsg 1,2
+source install/setup.bash
+ros2 run amd_uw_ros2 pure_pursuit_controller --ros-args -p robot_id:=2 -p target_speed_mps:=10.0 -p switch_radius_m:=2.0
 ```
 
 `targetPos` contains rock centers. The pure-pursuit controller picks the nearest unfinished rock, drives toward a lateral waypoint beside it (`rock_side_offset_m`, default `2.0 m`), and marks it finished when the tractor ego position is within `switch_radius_m` of that waypoint.
