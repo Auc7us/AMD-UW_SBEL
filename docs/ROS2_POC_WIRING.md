@@ -24,6 +24,12 @@ Run the speed-only controller:
 ros2 run amd_uw_ros2 constant_speed_controller --ros-args -p robot_id:=1 -p target_speed_mps:=1.0
 ```
 
+Run the target-position steering controller:
+
+```bash
+ros2 run amd_uw_ros2 pure_pursuit_controller --ros-args -p robot_id:=1 -p target_speed_mps:=1.0
+```
+
 ## Temporary Topic Contract
 
 For robot rank `N`, the C++ sim publishes once per simulation loop:
@@ -66,6 +72,18 @@ data = [0.0, throttle, brake]
 ```
 
 It ramps the target speed, throttle, and brake so commands change gradually. This is intended as the first closed-loop vehicle-control test before adding steering or terminal-pose planning.
+
+## Pure-Pursuit Target POC
+
+`pure_pursuit_controller` subscribes to `/robot_N/egoState` and `/robot_N/targetPos`.
+
+It tracks the current `[x, y]` rock target, switches to the next target when the robot is within `switch_radius_m` meters, and publishes:
+
+```text
+data = [steering, throttle, brake]
+```
+
+Steering is normalized from a pure-pursuit steering angle using `wheelbase_m` and `max_steering_angle_rad`. Speed uses the same ramped speed controller as the speed-only node.
 
 ## C++ Integration Target
 
