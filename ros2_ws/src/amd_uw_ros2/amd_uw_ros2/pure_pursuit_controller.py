@@ -58,7 +58,7 @@ class PurePursuitController(Node):
         self.declare_parameter("lookahead_min_m", 2.0)
         self.declare_parameter("wheelbase_m", 2.5)
         self.declare_parameter("max_steering_angle_rad", 0.6)
-        self.declare_parameter("rock_side_offset_m", 2.0)
+        self.declare_parameter("rock_side_offset_m", 1.5)
 
         self.robot_id = int(self.get_parameter("robot_id").value)
         self.ego_state_topic = f"/robot_{self.robot_id}/egoState"
