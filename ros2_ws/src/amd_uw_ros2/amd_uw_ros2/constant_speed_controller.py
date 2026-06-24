@@ -72,13 +72,17 @@ class ConstantSpeedController(Node):
 
     def on_timer(self) -> None:
         target_speed = max(0.0, float(self.get_parameter("target_speed_mps").value))
-        target_ramp = max(0.0, float(self.get_parameter("target_speed_ramp_mps2").value)) * self.dt
-        self.ramped_target_speed = approach(self.ramped_target_speed, target_speed, target_ramp)
 
         if self.state is None:
             self.command = self.ramp_command(VehicleCommand(steering=0.0, throttle=0.0, brake=1.0))
             self.publish_command(self.command)
             return
+
+        if target_speed >= self.state.speed and self.ramped_target_speed < self.state.speed:
+            self.ramped_target_speed = self.state.speed
+
+        target_ramp = max(0.0, float(self.get_parameter("target_speed_ramp_mps2").value)) * self.dt
+        self.ramped_target_speed = approach(self.ramped_target_speed, target_speed, target_ramp)
 
         speed_error = self.ramped_target_speed - self.state.speed
         tolerance = max(0.0, float(self.get_parameter("speed_tolerance_mps").value))
