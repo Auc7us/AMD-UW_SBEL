@@ -68,9 +68,9 @@ ros2 topic pub --once /robot_1/target_done std_msgs/msg/Bool "{data: true}"
 
 1. [x] Add ROS controller integration.
 2. [x] Stop at rock.
-3. [ ] Move to SCM terrain.
-4. [ ] Explore a PyChrono wrapper for SynChrono.
-5. [ ] Integrate with Harry.
+3. [ ] Integrate with Harry.
+4. [ ] Move to SCM terrain.
+5. [ ] Explore a PyChrono wrapper for SynChrono.
 6. [ ] Scale to many vehicles and rocks.
 
 ## Refactoring Note
