@@ -31,7 +31,7 @@ cmake --build build -j2
 mpirun -np 3 ./build/demo_SYN_polaris_flat --vsg 1,2
 ```
 
-`switch_radius_m` is measured from the tractor ego position to each rock center. Use `3.0 m` so the controller advances targets before the rig has to drive into the rock center.
+`targetPos` contains rock centers. The pure-pursuit controller picks the nearest unfinished rock, drives toward a lateral waypoint beside it (`rock_side_offset_m`, default `2.0 m`), and marks it finished when the tractor ego position is within `switch_radius_m` of that waypoint.
 
 ## TODO
 

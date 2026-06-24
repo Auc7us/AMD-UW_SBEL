@@ -27,7 +27,7 @@ ros2 run amd_uw_ros2 constant_speed_controller --ros-args -p robot_id:=1 -p targ
 Run the target-position steering controller:
 
 ```bash
-ros2 run amd_uw_ros2 pure_pursuit_controller --ros-args -p robot_id:=1 -p target_speed_mps:=1.0
+ros2 run amd_uw_ros2 pure_pursuit_controller --ros-args -p robot_id:=1 -p target_speed_mps:=1.0 -p switch_radius_m:=3.0
 ```
 
 ## Temporary Topic Contract
@@ -77,13 +77,13 @@ It ramps the target speed, throttle, and brake so commands change gradually. Thi
 
 `pure_pursuit_controller` subscribes to `/robot_N/egoState` and `/robot_N/targetPos`.
 
-It tracks the current `[x, y]` rock target, switches to the next target when the robot is within `switch_radius_m` meters, and publishes:
+It picks the nearest unfinished `[x, y]` rock target, offsets the drive waypoint to one side of that rock by `rock_side_offset_m`, marks the rock finished when the robot is within `switch_radius_m` meters of that drive waypoint, and then picks the nearest remaining rock. It publishes:
 
 ```text
 data = [steering, throttle, brake]
 ```
 
-Steering is normalized from a pure-pursuit steering angle using `wheelbase_m` and `max_steering_angle_rad`. Speed uses the same ramped speed controller as the speed-only node.
+The side is chosen once per rock from the two lateral waypoints perpendicular to the robot-to-rock approach line, preferring the side that needs the smaller heading change. Steering is normalized from a pure-pursuit steering angle using `wheelbase_m` and `max_steering_angle_rad`. Speed uses the same ramped speed controller as the speed-only node.
 
 ## C++ Integration Target
 

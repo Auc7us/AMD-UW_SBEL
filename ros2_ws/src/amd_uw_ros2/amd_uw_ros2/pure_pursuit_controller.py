@@ -1,6 +1,6 @@
 import math
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional, Set, Tuple
 
 import rclpy
 from rclpy.node import Node
@@ -58,6 +58,7 @@ class PurePursuitController(Node):
         self.declare_parameter("lookahead_min_m", 2.0)
         self.declare_parameter("wheelbase_m", 2.5)
         self.declare_parameter("max_steering_angle_rad", 0.6)
+        self.declare_parameter("rock_side_offset_m", 2.0)
 
         self.robot_id = int(self.get_parameter("robot_id").value)
         self.ego_state_topic = f"/robot_{self.robot_id}/egoState"
@@ -66,7 +67,10 @@ class PurePursuitController(Node):
 
         self.state: Optional[RobotState] = None
         self.targets: List[Tuple[float, float]] = []
-        self.target_index = 0
+        self.target_index = -1
+        self.completed_targets: Set[int] = set()
+        self.drive_target_index = -1
+        self.drive_target_offset = (0.0, 0.0)
         self.have_targets = False
         self.command = VehicleCommand()
         self.ramped_target_speed = 0.0
@@ -112,10 +116,11 @@ class PurePursuitController(Node):
         self.targets = targets
         if not self.have_targets:
             self.have_targets = True
-            self.target_index = 0
             self.get_logger().info(f"Received {len(self.targets)} targetPos points.")
-        elif self.target_index > len(self.targets):
-            self.target_index = len(self.targets)
+        self.completed_targets = {i for i in self.completed_targets if i < len(self.targets)}
+        if self.target_index >= len(self.targets):
+            self.target_index = -1
+            self.drive_target_index = -1
 
     def on_timer(self) -> None:
         if self.state is None or not self.targets:
@@ -124,19 +129,21 @@ class PurePursuitController(Node):
             return
 
         switch_radius = max(0.0, float(self.get_parameter("switch_radius_m").value))
-        while self.target_index < len(self.targets):
-            target_x, target_y = self.targets[self.target_index]
+        while True:
+            if not self.ensure_active_target():
+                self.command = self.ramp_command(VehicleCommand())
+                self.publish_command(self.command)
+                return
+
+            target_x, target_y = self.get_drive_target()
             if math.hypot(target_x - self.state.x, target_y - self.state.y) > switch_radius:
                 break
             self.get_logger().info(f"Reached targetPos[{self.target_index}], switching to next target.")
-            self.target_index += 1
+            self.completed_targets.add(self.target_index)
+            self.target_index = -1
+            self.drive_target_index = -1
 
-        if self.target_index >= len(self.targets):
-            self.command = self.ramp_command(VehicleCommand())
-            self.publish_command(self.command)
-            return
-
-        target = self.targets[self.target_index]
+        target = self.get_drive_target()
         steering = self.compute_steering(target)
         speed_command = self.compute_speed_command()
         speed_command.steering = steering
@@ -156,6 +163,67 @@ class PurePursuitController(Node):
         curvature = 2.0 * math.sin(alpha) / lookahead
         steering_angle = math.atan(wheelbase * curvature)
         return clamp(steering_angle / max_angle, -1.0, 1.0)
+
+    def ensure_active_target(self) -> bool:
+        if 0 <= self.target_index < len(self.targets) and self.target_index not in self.completed_targets:
+            return True
+
+        remaining = [i for i in range(len(self.targets)) if i not in self.completed_targets]
+        if not remaining:
+            return False
+
+        self.target_index = min(
+            remaining,
+            key=lambda i: math.hypot(self.targets[i][0] - self.state.x, self.targets[i][1] - self.state.y),
+        )
+        self.drive_target_index = -1
+        target_x, target_y = self.targets[self.target_index]
+        distance = math.hypot(target_x - self.state.x, target_y - self.state.y)
+        self.get_logger().info(
+            f"Selected nearest targetPos[{self.target_index}] at ({target_x:.2f}, {target_y:.2f}), "
+            f"distance={distance:.2f} m."
+        )
+        return True
+
+    def get_drive_target(self) -> Tuple[float, float]:
+        rock_x, rock_y = self.targets[self.target_index]
+        if self.drive_target_index != self.target_index:
+            self.drive_target_offset = self.compute_rock_side_offset(rock_x, rock_y)
+            self.drive_target_index = self.target_index
+            target_x = rock_x + self.drive_target_offset[0]
+            target_y = rock_y + self.drive_target_offset[1]
+            self.get_logger().info(
+                f"targetPos[{self.target_index}] rock=({rock_x:.2f}, {rock_y:.2f}) "
+                f"drive_target=({target_x:.2f}, {target_y:.2f})"
+            )
+
+        return rock_x + self.drive_target_offset[0], rock_y + self.drive_target_offset[1]
+
+    def compute_rock_side_offset(self, rock_x: float, rock_y: float) -> Tuple[float, float]:
+        offset = max(0.0, float(self.get_parameter("rock_side_offset_m").value))
+        to_rock_x = rock_x - self.state.x
+        to_rock_y = rock_y - self.state.y
+        distance = math.hypot(to_rock_x, to_rock_y)
+        if distance < 1e-6:
+            approach_x = math.cos(self.state.yaw)
+            approach_y = math.sin(self.state.yaw)
+        else:
+            approach_x = to_rock_x / distance
+            approach_y = to_rock_y / distance
+
+        left_x = -approach_y
+        left_y = approach_x
+        left_offset = (offset * left_x, offset * left_y)
+        right_offset = (-offset * left_x, -offset * left_y)
+
+        def heading_error_for(candidate_offset: Tuple[float, float]) -> float:
+            target_x = rock_x + candidate_offset[0]
+            target_y = rock_y + candidate_offset[1]
+            return abs(wrap_to_pi(math.atan2(target_y - self.state.y, target_x - self.state.x) - self.state.yaw))
+
+        if heading_error_for(left_offset) <= heading_error_for(right_offset):
+            return left_offset
+        return right_offset
 
     def compute_speed_command(self) -> VehicleCommand:
         target_speed = max(0.0, float(self.get_parameter("target_speed_mps").value))

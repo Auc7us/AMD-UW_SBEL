@@ -82,7 +82,7 @@ std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> AddRockFields(
     }
 
     std::uniform_real_distribution<double> distance_jitter(0.0, 3.5);
-    std::uniform_real_distribution<double> lateral_offset(-15.0, 15.0);
+    std::uniform_real_distribution<double> lateral_offset(-5.0, 5.0);
     std::uniform_real_distribution<double> yaw_offset(-chrono::CH_PI, chrono::CH_PI);
 
     std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> rocks;
