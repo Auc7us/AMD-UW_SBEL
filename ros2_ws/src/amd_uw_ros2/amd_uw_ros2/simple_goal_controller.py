@@ -53,7 +53,7 @@ class SimpleGoalController(Node):
         self.declare_parameter("max_target_speed_mps", 2.0)
 
         self.robot_id = int(self.get_parameter("robot_id").value)
-        self.state_topic = f"/robot_{self.robot_id}/state"
+        self.state_topic = f"/robot_{self.robot_id}/egoState"
         self.target_topic = f"/robot_{self.robot_id}/target_pose"
         self.command_topic = f"/robot_{self.robot_id}/vehicle_cmd"
 
@@ -76,7 +76,7 @@ class SimpleGoalController(Node):
 
     def on_state(self, msg: Float64MultiArray) -> None:
         if len(msg.data) < 4:
-            self.get_logger().warn("Ignoring state message; expected [x, y, yaw, speed].")
+            self.get_logger().warn("Ignoring egoState message; expected [x, y, yaw, speed].")
             return
 
         self.state = RobotState(

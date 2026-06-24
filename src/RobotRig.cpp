@@ -233,7 +233,7 @@ void RobotRig::InitializeTrailerBed() {
 
 void RobotRig::InitializeDriver() {
 #ifdef AMD_UW_ENABLE_ROS2
-    m_driver = std::make_unique<RosControllerDriver>(*m_vehicle, m_rank);
+    m_driver = std::make_unique<RosControllerDriver>(*m_vehicle, m_rank, m_rocks);
 #else
     auto interactive_driver = std::make_unique<DriverWrapper>(*m_vehicle);
     m_irr_driver = chrono_types::make_shared<chrono::vehicle::ChInteractiveDriver>(*m_vehicle);

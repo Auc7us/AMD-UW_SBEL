@@ -45,7 +45,7 @@ class ConstantSpeedController(Node):
         self.declare_parameter("coast_brake", 0.0)
 
         self.robot_id = int(self.get_parameter("robot_id").value)
-        self.state_topic = f"/robot_{self.robot_id}/state"
+        self.state_topic = f"/robot_{self.robot_id}/egoState"
         self.command_topic = f"/robot_{self.robot_id}/vehicle_cmd"
 
         self.state: Optional[RobotState] = None
@@ -65,7 +65,7 @@ class ConstantSpeedController(Node):
 
     def on_state(self, msg: Float64MultiArray) -> None:
         if len(msg.data) < 4:
-            self.get_logger().warn("Ignoring state message; expected [x, y, yaw, speed].")
+            self.get_logger().warn("Ignoring egoState message; expected [x, y, yaw, speed].")
             return
 
         self.state = RobotState(speed=float(msg.data[3]))

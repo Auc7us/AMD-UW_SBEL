@@ -26,11 +26,14 @@ ros2 run amd_uw_ros2 constant_speed_controller --ros-args -p robot_id:=1 -p targ
 
 ## Temporary Topic Contract
 
-For robot rank `N`, the C++ sim should publish:
+For robot rank `N`, the C++ sim publishes once per simulation loop:
 
 ```text
-/robot_N/state          std_msgs/Float64MultiArray
+/robot_N/egoState       std_msgs/Float64MultiArray
 data = [x, y, yaw, speed_mps]
+
+/robot_N/targetPos      std_msgs/Float64MultiArray
+data = [rock0_x, rock0_y, rock1_x, rock1_y, ...]
 ```
 
 The ROS node publishes:
@@ -74,7 +77,7 @@ Expected behavior:
 2. Clamp command values.
 3. Store the latest command.
 4. Return Chrono `DriverInputs` from that command.
-5. Publish `/robot_N/state` each simulation tick.
+5. Publish `/robot_N/egoState` and `/robot_N/targetPos` each simulation tick.
 
 `RobotRig::Synchronize()` asks this driver for inputs instead of the interactive driver when `AMD_UW_ENABLE_ROS2` is enabled.
 
@@ -123,7 +126,8 @@ Terminal 4, optional:
 
 ```bash
 source /opt/ros/humble/setup.bash
-ros2 topic echo /robot_1/state
+ros2 topic echo /robot_1/egoState
+ros2 topic echo /robot_1/targetPos
 ros2 topic echo /robot_1/vehicle_cmd
 ```
 

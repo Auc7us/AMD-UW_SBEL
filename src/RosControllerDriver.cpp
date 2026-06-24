@@ -26,11 +26,10 @@ std::string TopicForRobot(int robot_id, const std::string& suffix) {
 
 RosControllerDriver::RosControllerDriver(chrono::vehicle::ChVehicle& vehicle,
                                          int robot_id,
-                                         double state_publish_rate_hz)
+                                         const std::vector<std::shared_ptr<chrono::ChBodyAuxRef>>& rocks)
     : chrono::vehicle::ChDriver(vehicle),
       m_robot_id(robot_id),
-      m_state_publish_period(state_publish_rate_hz > 0 ? 1.0 / state_publish_rate_hz : 0.02),
-      m_last_state_publish_time(-1.0),
+      m_rocks(rocks),
       m_command_received(false) {
     EnsureRosInitialized();
 
@@ -41,8 +40,10 @@ RosControllerDriver::RosControllerDriver(chrono::vehicle::ChVehicle& vehicle,
 
     m_executor = std::make_unique<rclcpp::executors::SingleThreadedExecutor>();
     m_node = rclcpp::Node::make_shared("chrono_robot_" + std::to_string(m_robot_id) + "_driver");
-    m_state_pub =
-        m_node->create_publisher<std_msgs::msg::Float64MultiArray>(TopicForRobot(m_robot_id, "state"), 10);
+    m_ego_state_pub =
+        m_node->create_publisher<std_msgs::msg::Float64MultiArray>(TopicForRobot(m_robot_id, "egoState"), 10);
+    m_target_pos_pub =
+        m_node->create_publisher<std_msgs::msg::Float64MultiArray>(TopicForRobot(m_robot_id, "targetPos"), 10);
     m_command_sub = m_node->create_subscription<std_msgs::msg::Float64MultiArray>(
         TopicForRobot(m_robot_id, "vehicle_cmd"),
         10,
@@ -50,8 +51,9 @@ RosControllerDriver::RosControllerDriver(chrono::vehicle::ChVehicle& vehicle,
     m_executor->add_node(m_node);
 
     RCLCPP_INFO(m_node->get_logger(),
-                "ROS driver ready: publishing %s, subscribing %s",
-                TopicForRobot(m_robot_id, "state").c_str(),
+                "ROS driver ready: publishing %s and %s, subscribing %s",
+                TopicForRobot(m_robot_id, "egoState").c_str(),
+                TopicForRobot(m_robot_id, "targetPos").c_str(),
                 TopicForRobot(m_robot_id, "vehicle_cmd").c_str());
 }
 
@@ -92,27 +94,32 @@ void RosControllerDriver::Synchronize(double time) {
         }
     }
 
-    PublishState(time);
+    PublishTelemetry();
 }
 
-void RosControllerDriver::PublishState(double time) {
-    if (m_last_state_publish_time >= 0.0 && time - m_last_state_publish_time < m_state_publish_period)
-        return;
-
+void RosControllerDriver::PublishTelemetry() {
     const auto pos = m_vehicle.GetPos();
     const auto rot = m_vehicle.GetRot();
     const auto forward = rot.GetAxisX();
     const double yaw = std::atan2(forward.y(), forward.x());
 
-    std_msgs::msg::Float64MultiArray msg;
-    msg.data = {
+    std_msgs::msg::Float64MultiArray ego_state;
+    ego_state.data = {
         pos.x(),
         pos.y(),
         yaw,
         m_vehicle.GetSpeed(),
     };
-    m_state_pub->publish(msg);
-    m_last_state_publish_time = time;
+    m_ego_state_pub->publish(ego_state);
+
+    std_msgs::msg::Float64MultiArray target_pos;
+    target_pos.data.reserve(2 * m_rocks.size());
+    for (const auto& rock : m_rocks) {
+        const auto rock_pos = rock->GetPos();
+        target_pos.data.push_back(rock_pos.x());
+        target_pos.data.push_back(rock_pos.y());
+    }
+    m_target_pos_pub->publish(target_pos);
 }
 
 }  // namespace amd_uw
