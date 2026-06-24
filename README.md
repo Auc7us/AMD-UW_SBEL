@@ -1,5 +1,33 @@
 # AMD-UW SynChrono Demo
 
+## Directory Layout
+
+`CMakeLists.txt` currently assumes absolute Chrono/container paths. If your checkout is arranged differently, edit the path defaults near the top of `CMakeLists.txt`.
+
+```text
+/home/chrono-user/mountdir/
+|-- amd-uw/                 <- this project repo
+|   |-- CMakeLists.txt
+|   |-- data/
+|   |-- ros2_ws/
+|   `-- src/
+|
+|-- chrono/                 <- CHRONO_ROOT
+|   |-- build/              <- CHRONO_BUILD_DIR
+|   `-- data/
+|
+`-- packages/               <- CHRONO_PACKAGE_DIR
+    `-- optix/              <- OPTIX_INSTALL_DIR
+```
+
+```text
+CMake defaults to check/edit:
+CHRONO_ROOT        = /home/chrono-user/mountdir/chrono
+CHRONO_BUILD_DIR   = ${CHRONO_ROOT}/build
+CHRONO_PACKAGE_DIR = /home/chrono-user/mountdir/packages
+UW_AMD_DATA_DIR    = ${CMAKE_CURRENT_SOURCE_DIR}/data
+```
+
 ## Run ROS Demo
 
 Terminal 1:
