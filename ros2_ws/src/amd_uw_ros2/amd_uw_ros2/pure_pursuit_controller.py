@@ -67,6 +67,7 @@ class PurePursuitController(Node):
         self.state: Optional[RobotState] = None
         self.targets: List[Tuple[float, float]] = []
         self.target_index = 0
+        self.have_targets = False
         self.command = VehicleCommand()
         self.ramped_target_speed = 0.0
 
@@ -100,12 +101,21 @@ class PurePursuitController(Node):
             self.get_logger().warn("Ignoring targetPos message; expected [x0, y0, x1, y1, ...].")
             return
 
-        self.targets = [
+        targets = [
             (float(msg.data[i]), float(msg.data[i + 1]))
             for i in range(0, len(msg.data), 2)
         ]
-        if self.target_index >= len(self.targets):
+
+        if not targets:
+            return
+
+        self.targets = targets
+        if not self.have_targets:
+            self.have_targets = True
             self.target_index = 0
+            self.get_logger().info(f"Received {len(self.targets)} targetPos points.")
+        elif self.target_index > len(self.targets):
+            self.target_index = len(self.targets)
 
     def on_timer(self) -> None:
         if self.state is None or not self.targets:
@@ -118,6 +128,7 @@ class PurePursuitController(Node):
             target_x, target_y = self.targets[self.target_index]
             if math.hypot(target_x - self.state.x, target_y - self.state.y) > switch_radius:
                 break
+            self.get_logger().info(f"Reached targetPos[{self.target_index}], switching to next target.")
             self.target_index += 1
 
         if self.target_index >= len(self.targets):
