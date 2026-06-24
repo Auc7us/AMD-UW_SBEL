@@ -63,6 +63,13 @@ Optional target override:
 /robot_N/target_pose    geometry_msgs/Pose2D
 ```
 
+Manual target completion:
+
+```text
+/robot_N/target_done    std_msgs/Bool
+data = true
+```
+
 ## Speed-Only POC
 
 `constant_speed_controller` ignores steering for now and publishes:
@@ -75,9 +82,9 @@ It ramps the target speed, throttle, and brake so commands change gradually. Thi
 
 ## Pure-Pursuit Target POC
 
-`pure_pursuit_controller` subscribes to `/robot_N/egoState` and `/robot_N/targetPos`.
+`pure_pursuit_controller` subscribes to `/robot_N/egoState`, `/robot_N/targetPos`, and `/robot_N/target_done`.
 
-It picks the nearest unfinished `[x, y]` rock target, offsets the drive waypoint to one side of that rock by `rock_side_offset_m`, marks the rock finished when the robot is within `switch_radius_m` meters of that drive waypoint, and then picks the nearest remaining rock. It publishes:
+It picks the nearest unfinished `[x, y]` rock target and offsets the drive waypoint to one side of that rock by `rock_side_offset_m`. As the tractor rear reference point approaches the pickup zone, it linearly caps target speed across `pickup_slowdown_offset_m`, using `pickup_min_approach_speed_mps` and `pickup_boundary_speed_mps` as the low-speed limits, so the robot reaches the `switch_radius_m` boundary slowly instead of entering the circle at cruise speed. The default slowdown band is `10 m` and aims to enter the circle at `2.0 m/s`. It stops and waits when the drive waypoint is within `switch_radius_m` meters of the rear reference point and the rock bearing from that rear reference is in either pickup sector: `60..100` degrees or `-100..-60` degrees, with the tractor forward axis as `0` degrees. Publishing `true` on `/robot_N/target_done` marks the waiting target complete and lets the controller pick the nearest remaining rock after a short zero-steering settle. It publishes:
 
 ```text
 data = [steering, throttle, brake]

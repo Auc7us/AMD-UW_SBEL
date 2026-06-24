@@ -16,8 +16,8 @@ struct RockFieldConfig {
     int rocks_per_rank = 15;
     double mesh_scale = 0.3;
     double density = 2500.0;
-    double first_distance = 15.0;
-    double distance_step = 15.0;
+    double first_distance = 30.0;
+    double distance_step = 30.0;
     double surface_clearance = 0.05;
 };
 

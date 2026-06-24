@@ -4,6 +4,7 @@ from typing import List, Optional, Set, Tuple
 
 import rclpy
 from rclpy.node import Node
+from std_msgs.msg import Bool
 from std_msgs.msg import Float64MultiArray
 
 
@@ -51,18 +52,26 @@ class PurePursuitController(Node):
         self.declare_parameter("target_speed_mps", 1.0)
         self.declare_parameter("speed_kp", 0.55)
         self.declare_parameter("speed_tolerance_mps", 0.08)
-        self.declare_parameter("target_speed_ramp_mps2", 0.35)
-        self.declare_parameter("throttle_ramp_per_s", 0.7)
-        self.declare_parameter("brake_ramp_per_s", 1.2)
+        self.declare_parameter("target_speed_ramp_mps2", 10.0)
+        self.declare_parameter("throttle_ramp_per_s", 10.0)
+        self.declare_parameter("brake_ramp_per_s", 10.0)
         self.declare_parameter("switch_radius_m", 1.0)
         self.declare_parameter("lookahead_min_m", 2.0)
         self.declare_parameter("wheelbase_m", 2.5)
         self.declare_parameter("max_steering_angle_rad", 0.6)
         self.declare_parameter("rock_side_offset_m", 1.5)
+        self.declare_parameter("rear_reference_offset_m", 1.25)
+        self.declare_parameter("pickup_angle_min_deg", 60.0)
+        self.declare_parameter("pickup_angle_max_deg", 100.0)
+        self.declare_parameter("pickup_slowdown_offset_m", 10.0)
+        self.declare_parameter("pickup_min_approach_speed_mps", 2.0)
+        self.declare_parameter("pickup_boundary_speed_mps", 2.0)
+        self.declare_parameter("post_done_straighten_time_s", 0.75)
 
         self.robot_id = int(self.get_parameter("robot_id").value)
         self.ego_state_topic = f"/robot_{self.robot_id}/egoState"
         self.target_pos_topic = f"/robot_{self.robot_id}/targetPos"
+        self.target_done_topic = f"/robot_{self.robot_id}/target_done"
         self.command_topic = f"/robot_{self.robot_id}/vehicle_cmd"
 
         self.state: Optional[RobotState] = None
@@ -72,12 +81,15 @@ class PurePursuitController(Node):
         self.drive_target_index = -1
         self.drive_target_offset = (0.0, 0.0)
         self.have_targets = False
+        self.waiting_for_target_done = False
+        self.straighten_until_time_s: Optional[float] = None
         self.command = VehicleCommand()
         self.ramped_target_speed = 0.0
 
         self.command_pub = self.create_publisher(Float64MultiArray, self.command_topic, 10)
         self.create_subscription(Float64MultiArray, self.ego_state_topic, self.on_ego_state, 10)
         self.create_subscription(Float64MultiArray, self.target_pos_topic, self.on_target_pos, 10)
+        self.create_subscription(Bool, self.target_done_topic, self.on_target_done, 10)
 
         rate_hz = max(1e-6, float(self.get_parameter("control_rate_hz").value))
         self.dt = 1.0 / rate_hz
@@ -85,7 +97,7 @@ class PurePursuitController(Node):
 
         self.get_logger().info(
             f"robot_{self.robot_id} pure pursuit: {self.ego_state_topic} + "
-            f"{self.target_pos_topic} -> {self.command_topic}"
+            f"{self.target_pos_topic} + {self.target_done_topic} -> {self.command_topic}"
         )
 
     def on_ego_state(self, msg: Float64MultiArray) -> None:
@@ -121,10 +133,40 @@ class PurePursuitController(Node):
         if self.target_index >= len(self.targets):
             self.target_index = -1
             self.drive_target_index = -1
+            self.waiting_for_target_done = False
+
+    def on_target_done(self, msg: Bool) -> None:
+        if not msg.data:
+            return
+
+        if not (0 <= self.target_index < len(self.targets)):
+            self.get_logger().info("Ignoring target_done=true; no active targetPos is selected.")
+            return
+
+        self.completed_targets.add(self.target_index)
+        self.get_logger().info(f"target_done=true; completed targetPos[{self.target_index}], selecting next target.")
+        self.target_index = -1
+        self.drive_target_index = -1
+        self.waiting_for_target_done = False
+        self.ramped_target_speed = 0.0
+        self.command = VehicleCommand(steering=0.0, throttle=0.0, brake=1.0)
+        self.straighten_until_time_s = (
+            self.now_seconds() + max(0.0, float(self.get_parameter("post_done_straighten_time_s").value))
+        )
 
     def on_timer(self) -> None:
         if self.state is None or not self.targets:
             self.command = self.ramp_command(VehicleCommand())
+            self.publish_command(self.command)
+            return
+
+        if self.is_straightening_after_done():
+            self.command = self.ramp_command(VehicleCommand(steering=0.0, throttle=0.0, brake=1.0))
+            self.publish_command(self.command)
+            return
+
+        if self.waiting_for_target_done:
+            self.command = self.ramp_command(VehicleCommand(steering=0.0, throttle=0.0, brake=1.0))
             self.publish_command(self.command)
             return
 
@@ -135,17 +177,22 @@ class PurePursuitController(Node):
                 self.publish_command(self.command)
                 return
 
-            target_x, target_y = self.get_drive_target()
-            if math.hypot(target_x - self.state.x, target_y - self.state.y) > switch_radius:
+            if not self.is_target_in_pickup_position(switch_radius):
                 break
-            self.get_logger().info(f"Reached targetPos[{self.target_index}], switching to next target.")
-            self.completed_targets.add(self.target_index)
-            self.target_index = -1
-            self.drive_target_index = -1
+
+            rock_angle_deg = self.rock_angle_from_rear_reference_deg()
+            self.get_logger().info(
+                f"targetPos[{self.target_index}] is in pickup sector "
+                f"(rear-reference angle={rock_angle_deg:.1f} deg); waiting for {self.target_done_topic}=true."
+            )
+            self.waiting_for_target_done = True
+            self.command = self.ramp_command(VehicleCommand(steering=0.0, throttle=0.0, brake=1.0))
+            self.publish_command(self.command)
+            return
 
         target = self.get_drive_target()
         steering = self.compute_steering(target)
-        speed_command = self.compute_speed_command()
+        speed_command = self.compute_speed_command(self.pickup_approach_target_speed(switch_radius))
         speed_command.steering = steering
         self.command = self.ramp_command(speed_command)
         self.publish_command(self.command)
@@ -225,12 +272,20 @@ class PurePursuitController(Node):
             return left_offset
         return right_offset
 
-    def compute_speed_command(self) -> VehicleCommand:
-        target_speed = max(0.0, float(self.get_parameter("target_speed_mps").value))
+    def compute_speed_command(self, target_speed_override: Optional[float] = None) -> VehicleCommand:
+        if target_speed_override is None:
+            target_speed = max(0.0, float(self.get_parameter("target_speed_mps").value))
+        else:
+            target_speed = max(0.0, target_speed_override)
+
         if target_speed >= self.state.speed and self.ramped_target_speed < self.state.speed:
             self.ramped_target_speed = self.state.speed
 
-        target_ramp = max(0.0, float(self.get_parameter("target_speed_ramp_mps2").value)) * self.dt
+        target_ramp_mps2 = max(0.0, float(self.get_parameter("target_speed_ramp_mps2").value))
+        if target_speed < self.ramped_target_speed:
+            target_ramp_mps2 = max(target_ramp_mps2, target_speed / max(self.dt, 1e-6))
+
+        target_ramp = target_ramp_mps2 * self.dt
         self.ramped_target_speed = approach(self.ramped_target_speed, target_speed, target_ramp)
 
         speed_error = self.ramped_target_speed - self.state.speed
@@ -263,6 +318,63 @@ class PurePursuitController(Node):
             clamp(command.brake, 0.0, 1.0),
         ]
         self.command_pub.publish(msg)
+
+    def rear_reference_position(self) -> Tuple[float, float]:
+        offset = max(0.0, float(self.get_parameter("rear_reference_offset_m").value))
+        return (
+            self.state.x - offset * math.cos(self.state.yaw),
+            self.state.y - offset * math.sin(self.state.yaw),
+        )
+
+    def rock_angle_from_rear_reference_deg(self) -> float:
+        rock_x, rock_y = self.targets[self.target_index]
+        ref_x, ref_y = self.rear_reference_position()
+        return math.degrees(wrap_to_pi(math.atan2(rock_y - ref_y, rock_x - ref_x) - self.state.yaw))
+
+    def rock_is_in_pickup_angle_sector(self) -> bool:
+        angle = self.rock_angle_from_rear_reference_deg()
+        angle_min = abs(float(self.get_parameter("pickup_angle_min_deg").value))
+        angle_max = abs(float(self.get_parameter("pickup_angle_max_deg").value))
+        if angle_min > angle_max:
+            angle_min, angle_max = angle_max, angle_min
+
+        return angle_min <= abs(angle) <= angle_max
+
+    def is_target_in_pickup_position(self, switch_radius: float) -> bool:
+        target_x, target_y = self.get_drive_target()
+        ref_x, ref_y = self.rear_reference_position()
+        target_distance = math.hypot(target_x - ref_x, target_y - ref_y)
+        return target_distance <= switch_radius and self.rock_is_in_pickup_angle_sector()
+
+    def pickup_approach_target_speed(self, switch_radius: float) -> float:
+        target_speed = max(0.0, float(self.get_parameter("target_speed_mps").value))
+        target_x, target_y = self.get_drive_target()
+        ref_x, ref_y = self.rear_reference_position()
+        distance_to_boundary = max(0.0, math.hypot(target_x - ref_x, target_y - ref_y) - switch_radius)
+
+        boundary_speed = max(0.0, float(self.get_parameter("pickup_boundary_speed_mps").value))
+        if target_speed <= 0.0:
+            return 0.0
+
+        slowdown_offset = max(1e-6, float(self.get_parameter("pickup_slowdown_offset_m").value))
+        speed_scale = clamp(distance_to_boundary / slowdown_offset, 0.0, 1.0)
+        approach_speed = boundary_speed + speed_scale * (target_speed - boundary_speed)
+
+        min_approach_speed = max(0.0, float(self.get_parameter("pickup_min_approach_speed_mps").value))
+        return min(target_speed, max(min_approach_speed, approach_speed))
+
+    def now_seconds(self) -> float:
+        return self.get_clock().now().nanoseconds * 1e-9
+
+    def is_straightening_after_done(self) -> bool:
+        if self.straighten_until_time_s is None:
+            return False
+
+        if self.now_seconds() < self.straighten_until_time_s:
+            return True
+
+        self.straighten_until_time_s = None
+        return False
 
 
 def main(args=None) -> None:
