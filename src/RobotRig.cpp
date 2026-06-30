@@ -23,8 +23,17 @@ namespace amd_uw {
 
 namespace {
 
+constexpr double rock_collision_activation_radius = 12.0;
+constexpr double rock_collision_deactivation_radius = 16.0;
+
 double VecNorm(const chrono::ChVector3d& v) {
     return std::sqrt(v.x() * v.x() + v.y() * v.y() + v.z() * v.z());
+}
+
+double PlanarDistance2(const chrono::ChVector3d& a, const chrono::ChVector3d& b) {
+    const double dx = a.x() - b.x();
+    const double dy = a.y() - b.y();
+    return dx * dx + dy * dy;
 }
 
 }  // namespace
@@ -145,6 +154,7 @@ void RobotRig::InitializeOnTerrain(chrono::vehicle::RigidTerrain& terrain,
         for (const auto& rock : m_rocks)
             rock->SetSleeping(true);
     }
+    UpdateRockCollisionActivation();
 
     chrono::synchrono::SynLog() << "Rank " << m_rank << " owns robot index " << m_robot_index << " and "
                                 << m_rocks.size() << " dynamic rocks.\n";
@@ -282,6 +292,7 @@ void RobotRig::Settle(chrono::vehicle::RigidTerrain& terrain, double settle_time
 }
 
 void RobotRig::Synchronize(double time, chrono::vehicle::RigidTerrain& terrain) {
+    UpdateRockCollisionActivation();
     m_driver->Synchronize(time);
     const auto driver_inputs = m_driver->GetInputs();
     m_vehicle->Synchronize(time, driver_inputs, terrain);
@@ -297,6 +308,30 @@ void RobotRig::Advance(double step) {
 
 chrono::vehicle::DriverInputs RobotRig::GetDriverInputs() const {
     return m_driver->GetInputs();
+}
+
+void RobotRig::UpdateRockCollisionActivation() {
+    if (m_rocks.empty())
+        return;
+
+    const chrono::ChVector3d vehicle_pos = m_vehicle->GetChassisBody()->GetPos();
+    chrono::ChVector3d trailer_pos = vehicle_pos;
+    if (m_trailer && m_trailer->GetChassis())
+        trailer_pos = m_trailer->GetChassis()->GetPos();
+
+    const double activate2 = rock_collision_activation_radius * rock_collision_activation_radius;
+    const double deactivate2 = rock_collision_deactivation_radius * rock_collision_deactivation_radius;
+
+    for (const auto& rock : m_rocks) {
+        const auto rock_pos = rock->GetPos();
+        const double dist2 = std::min(PlanarDistance2(rock_pos, vehicle_pos), PlanarDistance2(rock_pos, trailer_pos));
+        if (!rock->IsCollisionEnabled() && dist2 <= activate2) {
+            rock->EnableCollision(true);
+            rock->SetSleeping(false);
+        } else if (rock->IsCollisionEnabled() && rock->IsSleeping() && dist2 >= deactivate2) {
+            rock->EnableCollision(false);
+        }
+    }
 }
 
 void RobotRig::UpdateAttachments() {

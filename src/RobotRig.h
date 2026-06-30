@@ -65,6 +65,7 @@ class RobotRig {
     void InitializeTrailerBed();
     void InitializeDriver();
     void Settle(chrono::vehicle::RigidTerrain& terrain, double settle_time, double step_size);
+    void UpdateRockCollisionActivation();
     void UpdateAttachments();
 
     int m_rank;
