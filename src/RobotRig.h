@@ -20,6 +20,9 @@ namespace amd_uw {
 
 class DriverWrapper;
 class LrvArm;
+#ifdef AMD_UW_ENABLE_ROS2
+class RosArmBridge;
+#endif
 
 class RobotRig {
   public:
@@ -66,6 +69,9 @@ class RobotRig {
     void InitializeArm(const std::string& amd_uw_data_path);
     void InitializeTrailerBed();
     void InitializeDriver();
+#ifdef AMD_UW_ENABLE_ROS2
+    void InitializeArmBridge(double height_probe_z);
+#endif
     void Settle(chrono::vehicle::RigidTerrain& terrain, double settle_time, double step_size);
     void UpdateRockCollisionActivation();
     void UpdateAttachments();
@@ -83,6 +89,9 @@ class RobotRig {
     std::unique_ptr<chrono::vehicle::ChDriver> m_driver;
     std::shared_ptr<chrono::vehicle::ChInteractiveDriver> m_irr_driver;
     std::unique_ptr<LrvArm> m_arm;
+#ifdef AMD_UW_ENABLE_ROS2
+    std::unique_ptr<RosArmBridge> m_arm_bridge;
+#endif
     std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> m_rocks;
 };
 

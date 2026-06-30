@@ -17,6 +17,7 @@
 #include "RobotLayout.h"
 
 #ifdef AMD_UW_ENABLE_ROS2
+#include "RosArmBridge.h"
 #include "RosControllerDriver.h"
 #endif
 
@@ -151,6 +152,9 @@ void RobotRig::InitializeOnTerrain(chrono::vehicle::RigidTerrain& terrain,
     for (const auto& rock : m_rocks)
         rock->SetSleepingAllowed(true);
     InitializeDriver();
+#ifdef AMD_UW_ENABLE_ROS2
+    InitializeArmBridge(height_probe_z);
+#endif
     Settle(terrain, settle_time, step_size);
     if (settle_time > 0) {
         for (const auto& rock : m_rocks)
@@ -274,6 +278,12 @@ void RobotRig::InitializeDriver() {
 #endif
 }
 
+#ifdef AMD_UW_ENABLE_ROS2
+void RobotRig::InitializeArmBridge(double height_probe_z) {
+    m_arm_bridge = std::make_unique<RosArmBridge>(m_rank, *m_arm, m_rocks, m_trailer, height_probe_z);
+}
+#endif
+
 void RobotRig::Settle(chrono::vehicle::RigidTerrain& terrain, double settle_time, double step_size) {
     if (settle_time <= 0)
         return;
@@ -303,6 +313,13 @@ void RobotRig::Settle(chrono::vehicle::RigidTerrain& terrain, double settle_time
 void RobotRig::Synchronize(double time, chrono::vehicle::RigidTerrain& terrain) {
     UpdateRockCollisionActivation();
     m_driver->Synchronize(time);
+#ifdef AMD_UW_ENABLE_ROS2
+    if (m_arm_bridge)
+        m_arm_bridge->Synchronize(time, terrain);
+#else
+    if (m_arm)
+        m_arm->Update(time);
+#endif
     const auto driver_inputs = m_driver->GetInputs();
     m_vehicle->Synchronize(time, driver_inputs, terrain);
     m_trailer->Synchronize(time, driver_inputs, terrain);

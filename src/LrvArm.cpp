@@ -1,8 +1,11 @@
 #include "LrvArm.h"
 
 #include <array>
+#include <cmath>
 #include <memory>
 #include <string>
+
+#include <Eigen/Dense>
 
 #include "chrono/assets/ChVisualShapeModelFile.h"
 #include "chrono/collision/ChCollisionShapeBox.h"
@@ -14,6 +17,30 @@
 namespace amd_uw {
 
 namespace {
+
+constexpr double arm_link_a1 = 0.32516;
+constexpr double arm_link_a2 = 1.27;
+constexpr double arm_link_a3 = 1.143;
+constexpr double arm_link_a4 = 0.3577;
+
+constexpr double approach_2_time = 1.0;
+constexpr double grasp_reach_tol = 0.15;
+constexpr double close_timeout = 8.0;
+constexpr double control_dt = 0.01;
+constexpr double finger_open_sep = 0.388;
+constexpr double finger_close_pos = 0.145;
+constexpr double finger_grasp_sep = 0.26;
+constexpr double finger_close_speed = 0.1;
+constexpr double lock_finger_dist = 0.27;
+constexpr double lift_theta2 = chrono::CH_PI / 3.0;
+constexpr double lift_speed = 0.5;
+constexpr double lift_delay = 1.5;
+constexpr double place_tol = 0.15;
+constexpr double place_timeout = 6.0;
+constexpr double release_hold_time = 1.0;
+constexpr double stow_hold_time = 2.0;
+constexpr double total_timeout = 45.0;
+constexpr std::array<double, 4> stow_theta = {-chrono::CH_PI, chrono::CH_PI / 5.0, chrono::CH_PI / 4.0, 0.0};
 
 struct BodySpec {
     const char* name;
@@ -129,7 +156,8 @@ LrvArm::LrvArm(chrono::ChSystem* system,
                std::shared_ptr<chrono::ChBody> chassis_body,
                const std::string& amd_uw_data_path,
                const chrono::ChVector3d& mount_pos,
-               const chrono::ChQuaternion<>& mount_rot) {
+               const chrono::ChQuaternion<>& mount_rot)
+    : m_system(system), m_chassis_body(std::move(chassis_body)) {
     std::string data_path = amd_uw_data_path;
     if (!data_path.empty() && data_path.back() != '/')
         data_path += "/";
@@ -179,7 +207,303 @@ LrvArm::LrvArm(chrono::ChSystem* system,
     m_motor_finger_1->SetMotionFunction(chrono_types::make_shared<chrono::ChFunctionConst>(-0.15));
     m_motor_finger_2->SetMotionFunction(chrono_types::make_shared<chrono::ChFunctionConst>(0.15));
 
-    m_chassis_lock = AddLink<chrono::ChLinkLockLock>(system, chassis_body, m_base, chrono::ChFramed(mount_pos, mount_rot));
+    m_chassis_lock =
+        AddLink<chrono::ChLinkLockLock>(system, m_chassis_body, m_base, chrono::ChFramed(mount_pos, mount_rot));
+}
+
+bool LrvArm::StartPickPlace(double command_seq,
+                            int target_index,
+                            std::shared_ptr<chrono::ChBodyAuxRef> rock,
+                            const chrono::ChVector3d& grab_target_world,
+                            const chrono::ChVector3d& place_target_world,
+                            double time) {
+    if (!rock) {
+        m_target_rock.reset();
+        m_status.command_seq = command_seq;
+        m_status.target_index = target_index;
+        FinishFailed(1);
+        return false;
+    }
+
+    RemoveRockLock();
+    OpenGripper();
+
+    m_status.command_seq = command_seq;
+    m_status.target_index = target_index;
+    m_status.state = 1;
+    m_status.success = false;
+    m_status.error_code = 0;
+    m_target_rock = std::move(rock);
+    m_grab_target_world = grab_target_world;
+    m_place_target_world = place_target_world;
+    m_start_time = time;
+    m_phase_time = time;
+    m_next_tick = time;
+    m_close_pos = 0.0;
+    m_bent_arm = false;
+
+    if (!SolveIk(m_grab_target_world, m_grab_theta)) {
+        FinishFailed(2);
+        return false;
+    }
+
+    if (!SolveIk(m_place_target_world, m_place_theta)) {
+        FinishFailed(2);
+        return false;
+    }
+
+    CommandJointAngles({m_grab_theta[0], m_grab_theta[1], 0.0, 0.0});
+    m_phase = Phase::APPROACH;
+    return true;
+}
+
+void LrvArm::Update(double time) {
+    if (m_phase == Phase::IDLE || m_phase == Phase::DONE || m_phase == Phase::FAILED)
+        return;
+
+    if (time - m_start_time > total_timeout) {
+        FinishFailed(4);
+        return;
+    }
+
+    if (m_phase == Phase::APPROACH) {
+        const double elapsed = time - m_phase_time;
+        if (!m_bent_arm && elapsed > approach_2_time) {
+            CommandJointAngles(m_grab_theta);
+            m_bent_arm = true;
+        }
+
+        if (m_bent_arm &&
+            ((GripperCenter() - m_grab_target_world).Length() < grasp_reach_tol || elapsed > close_timeout)) {
+            m_phase = Phase::CLOSING;
+            m_phase_time = time;
+            m_next_tick = time;
+        }
+        return;
+    }
+
+    if (time < m_next_tick)
+        return;
+    m_next_tick = time + control_dt;
+
+    if (m_phase == Phase::CLOSING) {
+        m_close_pos = std::min(m_close_pos + finger_close_speed * control_dt, finger_close_pos);
+        CommandFingerPosition(m_close_pos);
+
+        const double actual_sep = (m_finger_1->GetPos() - m_finger_2->GetPos()).Length();
+        const bool target_lockable =
+            m_target_rock &&
+            (m_target_rock->GetPos() - m_finger_1->GetPos()).Length() < lock_finger_dist &&
+            (m_target_rock->GetPos() - m_finger_2->GetPos()).Length() < lock_finger_dist;
+
+        if (target_lockable && actual_sep <= finger_grasp_sep) {
+            m_close_pos = std::min(finger_close_pos, 0.5 * (finger_open_sep - actual_sep) + 0.002);
+            CommandFingerPosition(m_close_pos);
+            if (TryLockRock()) {
+                m_target_rock->EnableCollision(false);
+                m_lift_angle = m_grab_theta[1];
+                m_phase = Phase::LIFTING;
+                m_phase_time = time;
+                return;
+            }
+        }
+
+        if (m_close_pos >= finger_close_pos) {
+            FinishFailed(3);
+        }
+        return;
+    }
+
+    if (m_phase == Phase::LIFTING) {
+        if (time - m_phase_time < lift_delay)
+            return;
+
+        const double diff = lift_theta2 - m_lift_angle;
+        if (std::abs(diff) <= lift_speed * control_dt) {
+            m_lift_angle = lift_theta2;
+            CommandJointAngles({m_grab_theta[0], m_lift_angle, m_grab_theta[2], m_grab_theta[3]});
+            CommandJointAngles(m_place_theta);
+            m_phase = Phase::PLACING;
+            m_phase_time = time;
+            return;
+        }
+
+        m_lift_angle += std::copysign(lift_speed * control_dt, diff);
+        CommandJointAngles({m_grab_theta[0], m_lift_angle, m_grab_theta[2], m_grab_theta[3]});
+        return;
+    }
+
+    if (m_phase == Phase::PLACING) {
+        if ((GripperCenter() - m_place_target_world).Length() < place_tol || time - m_phase_time > place_timeout) {
+            OpenGripper();
+            m_phase = Phase::RELEASING;
+            m_phase_time = time;
+        }
+        return;
+    }
+
+    if (m_phase == Phase::RELEASING) {
+        if (time - m_phase_time > release_hold_time) {
+            CommandJointAngles(stow_theta);
+            m_phase = Phase::STOWING;
+            m_phase_time = time;
+        }
+        return;
+    }
+
+    if (m_phase == Phase::STOWING && time - m_phase_time > stow_hold_time) {
+        FinishDone();
+    }
+}
+
+bool LrvArm::IsBusy() const {
+    return m_phase == Phase::APPROACH || m_phase == Phase::CLOSING || m_phase == Phase::LIFTING ||
+           m_phase == Phase::PLACING || m_phase == Phase::RELEASING || m_phase == Phase::STOWING;
+}
+
+ArmStatusSnapshot LrvArm::GetStatus() const {
+    return m_status;
+}
+
+void LrvArm::CommandJointAngles(const std::array<double, 4>& theta) {
+    m_motor_base_shoulder->SetAngleFunction(chrono_types::make_shared<chrono::ChFunctionConst>(-theta[0] - chrono::CH_PI));
+    m_motor_shoulder_biceps->SetAngleFunction(chrono_types::make_shared<chrono::ChFunctionConst>(theta[1]));
+    m_motor_biceps_elbow->SetAngleFunction(chrono_types::make_shared<chrono::ChFunctionConst>(-theta[2]));
+    m_motor_elbow_effector->SetAngleFunction(chrono_types::make_shared<chrono::ChFunctionConst>(-theta[3]));
+}
+
+void LrvArm::CommandFingerPosition(double close_pos) {
+    m_motor_finger_1->SetMotionFunction(chrono_types::make_shared<chrono::ChFunctionConst>(-close_pos));
+    m_motor_finger_2->SetMotionFunction(chrono_types::make_shared<chrono::ChFunctionConst>(close_pos));
+}
+
+void LrvArm::OpenGripper() {
+    RemoveRockLock();
+    m_close_pos = 0.0;
+    CommandFingerPosition(0.0);
+}
+
+bool LrvArm::TryLockRock() {
+    if (!m_target_rock || m_rock_lock)
+        return static_cast<bool>(m_rock_lock);
+
+    const auto rock_pos = m_target_rock->GetPos();
+    if ((rock_pos - m_finger_1->GetPos()).Length() >= lock_finger_dist ||
+        (rock_pos - m_finger_2->GetPos()).Length() >= lock_finger_dist) {
+        return false;
+    }
+
+    const auto midpoint = GripperCenter();
+    m_rock_lock = chrono_types::make_shared<chrono::ChLinkLockLock>();
+    m_rock_lock->Initialize(m_end_effector, m_target_rock, chrono::ChFramed(midpoint, chrono::QUNIT));
+    m_system->AddLink(m_rock_lock);
+    return true;
+}
+
+void LrvArm::RemoveRockLock() {
+    if (m_rock_lock) {
+        m_system->RemoveLink(m_rock_lock);
+        m_rock_lock.reset();
+    }
+    if (m_target_rock)
+        m_target_rock->EnableCollision(true);
+}
+
+bool LrvArm::SolveIk(const chrono::ChVector3d& target_world, std::array<double, 4>& theta) const {
+    const chrono::ChCoordsys<> arm_frame(m_base->GetPos(), m_chassis_body->GetRot());
+    const chrono::ChVector3d target = arm_frame.TransformPointParentToLocal(target_world);
+    Eigen::Vector3d target_v(target.x(), target.y(), target.z());
+
+    Eigen::Vector4d q(std::atan2(target.y(), target.x()), chrono::CH_PI_2, -chrono::CH_PI_2, -chrono::CH_PI_2);
+    constexpr double tolerance = 1e-3;
+    constexpr double fd_eps = 1e-5;
+    constexpr double lambda = 5e-3;
+
+    auto fk = [this](const Eigen::Vector4d& v) {
+        const auto p = ForwardKinematics({v[0], v[1], v[2], v[3]});
+        return Eigen::Vector3d(p.x(), p.y(), p.z());
+    };
+
+    for (int iter = 0; iter < 250; iter++) {
+        const Eigen::Vector3d current = fk(q);
+        Eigen::Vector3d err = target_v - current;
+        if (err.norm() <= tolerance) {
+            theta = {q[0], q[1], q[2], q[3]};
+            return true;
+        }
+
+        Eigen::Matrix<double, 3, 4> jac;
+        for (int j = 0; j < 4; j++) {
+            Eigen::Vector4d qp = q;
+            qp[j] += fd_eps;
+            jac.col(j) = (fk(qp) - current) / fd_eps;
+        }
+
+        const Eigen::Matrix3d damped = jac * jac.transpose() + lambda * lambda * Eigen::Matrix3d::Identity();
+        Eigen::Vector4d delta = jac.transpose() * damped.ldlt().solve(err);
+        const double delta_norm = delta.norm();
+        if (delta_norm > 0.25)
+            delta *= 0.25 / delta_norm;
+
+        q += delta;
+        if (q[2] > 0.0)
+            q[2] *= 0.7;
+    }
+
+    if ((fk(q) - target_v).norm() <= 0.03) {
+        theta = {q[0], q[1], q[2], q[3]};
+        return true;
+    }
+    return false;
+}
+
+chrono::ChVector3d LrvArm::ForwardKinematics(const std::array<double, 4>& theta) const {
+    const double theta1 = theta[0];
+    const double theta2 = theta[1];
+    const double theta3 = theta[2];
+    const double theta4 = theta[3];
+    const double s1 = std::sin(theta1);
+    const double s2 = std::sin(theta2);
+    const double s3 = std::sin(theta3);
+    const double s4 = std::sin(theta4);
+    const double c1 = std::cos(theta1);
+    const double c2 = std::cos(theta2);
+    const double c3 = std::cos(theta3);
+    const double c4 = std::cos(theta4);
+
+    const double sigma1 = c2 * c3 * s1 - s1 * s2 * s3;
+    const double sigma2 = c2 * s1 * s3 + c3 * s1 * s2;
+    const double sigma3 = c1 * c2 * c3 - c1 * s2 * s3;
+    const double sigma4 = c1 * c2 * s3 + c1 * c3 * s2;
+    const double sigma5 = c2 * c3 - s2 * s3;
+    const double sigma6 = c2 * s3 + c3 * s2;
+
+    return chrono::ChVector3d(
+        arm_link_a2 * c1 * c2 + arm_link_a4 * c4 * sigma3 - arm_link_a4 * s4 * sigma4 -
+            arm_link_a3 * c1 * s2 * s3 + arm_link_a3 * c1 * c2 * c3,
+        arm_link_a2 * c2 * s1 + arm_link_a4 * c4 * sigma1 - arm_link_a4 * s4 * sigma2 -
+            arm_link_a3 * s1 * s2 * s3 + arm_link_a3 * c2 * c3 * s1,
+        arm_link_a1 + arm_link_a2 * s2 + arm_link_a3 * c2 * s3 + arm_link_a3 * c3 * s2 +
+            arm_link_a4 * c4 * sigma6 + arm_link_a4 * s4 * sigma5);
+}
+
+chrono::ChVector3d LrvArm::GripperCenter() const {
+    return 0.5 * (m_finger_1->GetPos() + m_finger_2->GetPos());
+}
+
+void LrvArm::FinishDone() {
+    m_phase = Phase::DONE;
+    m_status.state = 2;
+    m_status.success = true;
+    m_status.error_code = 0;
+}
+
+void LrvArm::FinishFailed(int error_code) {
+    OpenGripper();
+    m_phase = Phase::FAILED;
+    m_status.state = 3;
+    m_status.success = false;
+    m_status.error_code = error_code;
 }
 
 }  // namespace amd_uw

@@ -66,12 +66,14 @@ class PurePursuitController(Node):
         self.declare_parameter("pickup_slowdown_offset_m", 10.0)
         self.declare_parameter("pickup_min_approach_speed_mps", 2.0)
         self.declare_parameter("pickup_boundary_speed_mps", 2.0)
+        self.declare_parameter("pickup_request_rate_hz", 1.0)
         self.declare_parameter("post_done_straighten_time_s", 0.75)
 
         self.robot_id = int(self.get_parameter("robot_id").value)
         self.ego_state_topic = f"/robot_{self.robot_id}/egoState"
         self.target_pos_topic = f"/robot_{self.robot_id}/targetPos"
         self.target_done_topic = f"/robot_{self.robot_id}/target_done"
+        self.pickup_request_topic = f"/robot_{self.robot_id}/pickup_request"
         self.command_topic = f"/robot_{self.robot_id}/vehicle_cmd"
 
         self.state: Optional[RobotState] = None
@@ -83,10 +85,13 @@ class PurePursuitController(Node):
         self.have_targets = False
         self.waiting_for_target_done = False
         self.straighten_until_time_s: Optional[float] = None
+        self.last_pickup_request_time_s: Optional[float] = None
+        self.last_pickup_request_index = -1
         self.command = VehicleCommand()
         self.ramped_target_speed = 0.0
 
         self.command_pub = self.create_publisher(Float64MultiArray, self.command_topic, 10)
+        self.pickup_request_pub = self.create_publisher(Float64MultiArray, self.pickup_request_topic, 10)
         self.create_subscription(Float64MultiArray, self.ego_state_topic, self.on_ego_state, 10)
         self.create_subscription(Float64MultiArray, self.target_pos_topic, self.on_target_pos, 10)
         self.create_subscription(Bool, self.target_done_topic, self.on_target_done, 10)
@@ -97,7 +102,8 @@ class PurePursuitController(Node):
 
         self.get_logger().info(
             f"robot_{self.robot_id} pure pursuit: {self.ego_state_topic} + "
-            f"{self.target_pos_topic} + {self.target_done_topic} -> {self.command_topic}"
+            f"{self.target_pos_topic} + {self.target_done_topic} -> "
+            f"{self.command_topic} + {self.pickup_request_topic}"
         )
 
     def on_ego_state(self, msg: Float64MultiArray) -> None:
@@ -148,6 +154,8 @@ class PurePursuitController(Node):
         self.target_index = -1
         self.drive_target_index = -1
         self.waiting_for_target_done = False
+        self.last_pickup_request_time_s = None
+        self.last_pickup_request_index = -1
         self.ramped_target_speed = 0.0
         self.command = VehicleCommand(steering=0.0, throttle=0.0, brake=1.0)
         self.straighten_until_time_s = (
@@ -166,6 +174,7 @@ class PurePursuitController(Node):
             return
 
         if self.waiting_for_target_done:
+            self.publish_pickup_request_if_due()
             self.command = self.ramp_command(VehicleCommand(steering=0.0, throttle=0.0, brake=1.0))
             self.publish_command(self.command)
             return
@@ -186,6 +195,7 @@ class PurePursuitController(Node):
                 f"(rear-reference angle={rock_angle_deg:.1f} deg); waiting for {self.target_done_topic}=true."
             )
             self.waiting_for_target_done = True
+            self.publish_pickup_request_if_due(force=True)
             self.command = self.ramp_command(VehicleCommand(steering=0.0, throttle=0.0, brake=1.0))
             self.publish_command(self.command)
             return
@@ -318,6 +328,28 @@ class PurePursuitController(Node):
             clamp(command.brake, 0.0, 1.0),
         ]
         self.command_pub.publish(msg)
+
+    def publish_pickup_request_if_due(self, force: bool = False) -> None:
+        if not (0 <= self.target_index < len(self.targets)):
+            return
+
+        now = self.now_seconds()
+        request_rate = max(1e-6, float(self.get_parameter("pickup_request_rate_hz").value))
+        request_period = 1.0 / request_rate
+        if (
+            not force
+            and self.last_pickup_request_index == self.target_index
+            and self.last_pickup_request_time_s is not None
+            and now - self.last_pickup_request_time_s < request_period
+        ):
+            return
+
+        rock_x, rock_y = self.targets[self.target_index]
+        msg = Float64MultiArray()
+        msg.data = [float(self.target_index), rock_x, rock_y]
+        self.pickup_request_pub.publish(msg)
+        self.last_pickup_request_time_s = now
+        self.last_pickup_request_index = self.target_index
 
     def rear_reference_position(self) -> Tuple[float, float]:
         offset = max(0.0, float(self.get_parameter("rear_reference_offset_m").value))

@@ -30,6 +30,12 @@ Run the target-position steering controller:
 ros2 run amd_uw_ros2 pure_pursuit_controller --ros-args -p robot_id:=1 -p target_speed_mps:=1.0 -p switch_radius_m:=3.0
 ```
 
+Launch drive and manipulator controllers together:
+
+```bash
+ros2 launch amd_uw_ros2 robot_controllers.launch.py robot_ids:=1,2 target_speed_mps:=1.0 switch_radius_m:=3.0
+```
+
 ## Temporary Topic Contract
 
 For robot rank `N`, the C++ sim publishes once per simulation loop:
@@ -47,6 +53,9 @@ The ROS node publishes:
 ```text
 /robot_N/vehicle_cmd    std_msgs/Float64MultiArray
 data = [steering, throttle, brake]
+
+/robot_N/pickup_request std_msgs/Float64MultiArray
+data = [target_index, rock_x_global, rock_y_global]
 ```
 
 Where:
@@ -70,6 +79,20 @@ Manual target completion:
 data = true
 ```
 
+Manipulator coordination:
+
+```text
+/robot_N/arm_cmd        std_msgs/Float64MultiArray
+data = [command_seq, target_index, rock_x_global, rock_y_global]
+
+/robot_N/arm_status     std_msgs/Float64MultiArray
+data = [command_seq, state, target_index, success, error_code]
+```
+
+Arm status state codes are `0=idle`, `1=busy`, `2=done`, and `3=failed`.
+Error codes are `0=none`, `1=bad_target`, `2=ik_failed`, `3=lock_failed`, and
+`4=timeout`.
+
 ## Speed-Only POC
 
 `constant_speed_controller` ignores steering for now and publishes:
@@ -90,7 +113,31 @@ It picks the nearest unfinished `[x, y]` rock target and offsets the drive waypo
 data = [steering, throttle, brake]
 ```
 
+While waiting, it publishes `/robot_N/pickup_request` at `pickup_request_rate_hz`
+(default `1 Hz`) so the manipulator controller can start even if launched after
+the rover has already stopped.
+
 The side is chosen once per rock from the two lateral waypoints perpendicular to the robot-to-rock approach line, preferring the side that needs the smaller heading change. Steering is normalized from a pure-pursuit steering angle using `wheelbase_m` and `max_steering_angle_rad`. Speed uses the same ramped speed controller as the speed-only node.
+
+## Manipulator Controller
+
+`manipulator_controller` subscribes to `/robot_N/pickup_request`, publishes one
+deduplicated `/robot_N/arm_cmd` per target, listens for `/robot_N/arm_status`,
+and publishes `/robot_N/target_done=true` after the C++ arm executor reports
+success. With the default `skip_failed_targets=true`, failed arm picks are also
+marked done so the drive controller can continue to the next rock.
+
+Run it beside the drive controller:
+
+```bash
+ros2 run amd_uw_ros2 manipulator_controller --ros-args -p robot_id:=1
+```
+
+Or start both the drive and manipulator controllers for each robot with:
+
+```bash
+ros2 launch amd_uw_ros2 robot_controllers.launch.py robot_ids:=1,2
+```
 
 ## C++ Integration Target
 
@@ -103,6 +150,8 @@ Expected behavior:
 3. Store the latest command.
 4. Return Chrono `DriverInputs` from that command.
 5. Publish `/robot_N/egoState` and `/robot_N/targetPos` each simulation tick.
+6. Subscribe to `/robot_N/arm_cmd`, execute the arm pick/place in the C++ sim,
+   and publish `/robot_N/arm_status`.
 
 `RobotRig::Synchronize()` asks this driver for inputs instead of the interactive driver when `AMD_UW_ENABLE_ROS2` is enabled.
 
@@ -110,32 +159,23 @@ If ROS2 is not found at CMake configure time, the C++ sim falls back to the inte
 
 ## Full POC Run Order
 
-Terminal 1, robot rank 1 controller:
+Terminal 1, ROS controllers for robot ranks 1 and 2:
 
 ```bash
 source /opt/ros/humble/setup.bash
 cd ~/mountdir/amd-uw/ros2_ws
 colcon build --symlink-install
 source install/setup.bash
-ros2 run amd_uw_ros2 constant_speed_controller --ros-args -p robot_id:=1 -p target_speed_mps:=1.0
+ros2 launch amd_uw_ros2 robot_controllers.launch.py robot_ids:=1,2 target_speed_mps:=1.0 switch_radius_m:=3.0
 ```
 
-Terminal 2, robot rank 2 controller:
-
-```bash
-source /opt/ros/humble/setup.bash
-cd ~/mountdir/amd-uw/ros2_ws
-source install/setup.bash
-ros2 run amd_uw_ros2 constant_speed_controller --ros-args -p robot_id:=2 -p target_speed_mps:=1.0
-```
-
-Terminal 3, C++ sim:
+Terminal 2, C++ sim:
 
 ```bash
 source /opt/ros/humble/setup.bash
 cd ~/mountdir/amd-uw
 cmake -S . -B build -DAMD_UW_ENABLE_ROS2=ON
-cmake --build build -j2
+ninja -C build -j2
 mpirun -np 3 ./build/demo_SYN_polaris_flat
 ```
 
@@ -147,7 +187,7 @@ rank 1 = robot 1
 rank 2 = robot 2
 ```
 
-Terminal 4, optional:
+Terminal 3, optional:
 
 ```bash
 source /opt/ros/humble/setup.bash
