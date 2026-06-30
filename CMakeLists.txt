@@ -31,6 +31,7 @@ option(AMD_UW_ENABLE_ROS2 "Enable ROS2 command/state bridge" ON)
 
 add_executable(demo_SYN_polaris_flat
     main.cpp
+    src/LrvArm.cpp
     src/MaterialUtils.cpp
     src/RobotRig.cpp
     src/RockField.cpp

@@ -19,6 +19,7 @@
 namespace amd_uw {
 
 class DriverWrapper;
+class LrvArm;
 
 class RobotRig {
   public:
@@ -62,6 +63,7 @@ class RobotRig {
                    const std::vector<chrono::ChBody*>& preexisting_bodies,
                    double height_probe_z,
                    double seat_clearance);
+    void InitializeArm(const std::string& amd_uw_data_path);
     void InitializeTrailerBed();
     void InitializeDriver();
     void Settle(chrono::vehicle::RigidTerrain& terrain, double settle_time, double step_size);
@@ -80,6 +82,7 @@ class RobotRig {
     std::shared_ptr<chrono::ChBodyEasyBox> m_trailer_bed;
     std::unique_ptr<chrono::vehicle::ChDriver> m_driver;
     std::shared_ptr<chrono::vehicle::ChInteractiveDriver> m_irr_driver;
+    std::unique_ptr<LrvArm> m_arm;
     std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> m_rocks;
 };
 

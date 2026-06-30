@@ -13,6 +13,7 @@
 #include "chrono_vehicle/ChVehicleDataPath.h"
 #include "chrono_vehicle/utils/ChVehicleUtilsJSON.h"
 
+#include "LrvArm.h"
 #include "RobotLayout.h"
 
 #ifdef AMD_UW_ENABLE_ROS2
@@ -143,6 +144,7 @@ void RobotRig::InitializeOnTerrain(chrono::vehicle::RigidTerrain& terrain,
     InitializeVehicle(chrono::ChCoordsys<>(init_loc, init_rot));
     InitializeTrailer();
     ReseatRig(terrain, preexisting_bodies, height_probe_z, seat_clearance);
+    InitializeArm(amd_uw_data_path);
     InitializeTrailerBed();
     for (const auto& body : GetSystem()->GetBodies())
         body->SetSleepingAllowed(false);
@@ -201,6 +203,13 @@ void RobotRig::InitializeTrailer() {
             tire->SetStepsize(m_tire_step_size);
         }
     }
+}
+
+void RobotRig::InitializeArm(const std::string& amd_uw_data_path) {
+    const chrono::ChVector3d mount_offset(-1.1, 0.0, 0.1);
+    const auto chassis = m_vehicle->GetChassisBody();
+    const chrono::ChVector3d mount_pos = chassis->GetPos() + chassis->GetRot().Rotate(mount_offset);
+    m_arm = std::make_unique<LrvArm>(GetSystem(), chassis, amd_uw_data_path, mount_pos, chassis->GetRot());
 }
 
 void RobotRig::ReseatRig(chrono::vehicle::RigidTerrain& terrain,
