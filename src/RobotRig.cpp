@@ -79,6 +79,7 @@ RobotRig::RobotRig(chrono::ChContactMethod contact_method,
       m_vehicle(std::make_unique<chrono::vehicle::WheeledVehicle>(
           chrono::vehicle::GetVehicleDataFile("LRV/Polaris.json"), contact_method)) {
     GetSystem()->SetCollisionSystemType(chrono::ChCollisionSystem::Type::BULLET);
+    GetSystem()->SetSleepingAllowed(true);
 }
 
 RobotRig::~RobotRig() = default;
@@ -134,8 +135,16 @@ void RobotRig::InitializeOnTerrain(chrono::vehicle::RigidTerrain& terrain,
     InitializeTrailer();
     ReseatRig(terrain, preexisting_bodies, height_probe_z, seat_clearance);
     InitializeTrailerBed();
+    for (const auto& body : GetSystem()->GetBodies())
+        body->SetSleepingAllowed(false);
+    for (const auto& rock : m_rocks)
+        rock->SetSleepingAllowed(true);
     InitializeDriver();
     Settle(terrain, settle_time, step_size);
+    if (settle_time > 0) {
+        for (const auto& rock : m_rocks)
+            rock->SetSleeping(true);
+    }
 
     chrono::synchrono::SynLog() << "Rank " << m_rank << " owns robot index " << m_robot_index << " and "
                                 << m_rocks.size() << " dynamic rocks.\n";

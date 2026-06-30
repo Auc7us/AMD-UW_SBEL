@@ -70,7 +70,7 @@ ros2 topic pub --once /robot_1/target_done std_msgs/msg/Bool "{data: true}"
 2. [x] Stop at rock.
 3. [ ] Integrate with Harry.
 4. [ ] Move to SCM terrain.
-5. [ ] Explore a PyChrono wrapper for SynChrono.
+5. [x] ~~Explore a PyChrono wrapper for SynChrono~~. Scrapped.
 6. [ ] Scale to many vehicles and rocks.
 
 ## Refactoring Note

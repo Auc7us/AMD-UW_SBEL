@@ -9,7 +9,7 @@
 #include "RobotLayout.h"
 
 #include "chrono/assets/ChVisualShapeTriangleMesh.h"
-#include "chrono/collision/ChCollisionShapeTriangleMesh.h"
+#include "chrono/collision/ChCollisionShapeConvexHull.h"
 #include "chrono/core/ChTypes.h"
 #include "chrono/physics/ChMassProperties.h"
 #include "chrono/utils/ChConstants.h"
@@ -66,14 +66,14 @@ std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> AddRockFields(
     auto rock_vis_mat = CreateLunarHapkeMaterial();
     std::array<std::shared_ptr<chrono::ChTriangleMeshConnected>, 3> rock_visual_meshes;
     std::array<std::shared_ptr<chrono::ChTriangleMeshConnected>, 3> rock_collision_meshes;
-    std::array<std::shared_ptr<chrono::ChCollisionShapeTriangleMesh>, 3> rock_ct_shapes;
+    std::array<std::shared_ptr<chrono::ChCollisionShapeConvexHull>, 3> rock_ct_shapes;
     std::array<std::shared_ptr<chrono::ChVisualShapeTriangleMesh>, 3> rock_vis_shapes;
 
     for (size_t i = 0; i < rock_visual_obj_files.size(); i++) {
         rock_visual_meshes[i] = LoadRockMesh(rock_visual_obj_files[i], true, config.mesh_scale);
         rock_collision_meshes[i] = LoadRockMesh(rock_collision_obj_files[i], false, config.mesh_scale);
-        rock_ct_shapes[i] = chrono_types::make_shared<chrono::ChCollisionShapeTriangleMesh>(
-            rock_mat, rock_collision_meshes[i], false, true, 0.005);
+        rock_ct_shapes[i] = chrono_types::make_shared<chrono::ChCollisionShapeConvexHull>(
+            rock_mat, rock_collision_meshes[i]->GetCoordsVertices());
 
         rock_vis_shapes[i] = chrono_types::make_shared<chrono::ChVisualShapeTriangleMesh>();
         rock_vis_shapes[i]->SetMesh(rock_visual_meshes[i]);
