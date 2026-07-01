@@ -93,6 +93,7 @@ class RobotRig {
     std::unique_ptr<RosArmBridge> m_arm_bridge;
 #endif
     std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> m_rocks;
+    std::vector<double> m_rock_top_heights;
 };
 
 }  // namespace amd_uw

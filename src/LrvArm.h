@@ -41,6 +41,11 @@ class LrvArm {
     bool IsBusy() const;
     ArmStatusSnapshot GetStatus() const;
 
+    // The rock the arm is currently positioning onto / holding, if any. While
+    // non-null the arm owns this rock's fixed/collision state (it is frozen so
+    // the approach cannot knock it), so the rig must not re-toggle its collision.
+    std::shared_ptr<chrono::ChBodyAuxRef> GetActiveRock() const;
+
   private:
     enum class Phase { IDLE, APPROACH, CLOSING, LIFTING, PLACING, RELEASING, STOWING, DONE, FAILED };
 
@@ -81,6 +86,8 @@ class LrvArm {
     std::shared_ptr<chrono::ChLinkLockLock> m_rock_lock;
     chrono::ChVector3d m_grab_target_world;
     chrono::ChVector3d m_place_target_world;
+    chrono::ChVector3d m_ik_target;  // world point currently fed to IK (closed-loop corrected)
+    int m_corrections = 0;           // closed-loop reach corrections applied this grab
     std::array<double, 4> m_grab_theta = {0.0, 0.0, 0.0, 0.0};
     std::array<double, 4> m_place_theta = {0.0, 0.0, 0.0, 0.0};
     double m_start_time = 0.0;

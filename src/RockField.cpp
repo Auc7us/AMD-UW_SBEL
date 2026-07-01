@@ -51,7 +51,8 @@ std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> AddRockFields(
     int num_robots,
     double start_spacing,
     double height_probe_z,
-    const RockFieldConfig& config) {
+    const RockFieldConfig& config,
+    std::vector<double>* rock_top_heights) {
     const std::array<std::string, 3> rock_visual_obj_files = {
         chrono_data_path + "robot/curiosity/rocks/rock1.obj",
         chrono_data_path + "robot/curiosity/rocks/rock2.obj",
@@ -123,6 +124,12 @@ std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> AddRockFields(
         rock_body->AddVisualShape(rock_vis_shapes[shape_index]);
         system->AddBody(rock_body);
         rocks.push_back(rock_body);
+
+        if (rock_top_heights) {
+            // Mesh is normalized so its bottom sits at the REF frame (min.z == 0);
+            // max.z is therefore the rock's height above its resting contact.
+            rock_top_heights->push_back(rock_visual_meshes[shape_index]->GetBoundingBox().max.z());
+        }
     }
 
     return rocks;

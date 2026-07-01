@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cmath>
+#include <iostream>
 #include <memory>
 #include <string>
 
@@ -26,6 +27,16 @@ constexpr double arm_link_a4 = 0.3577;
 constexpr double approach_2_time = 1.0;
 constexpr double grasp_reach_tol = 0.15;
 constexpr double close_timeout = 8.0;
+// Closed-loop reach correction. FK(theta) and the physically settled gripper
+// disagree by ~0.25 m in this rig; the reference demo hides this by recording
+// the actual settled pose and placing the rock there. Here the rock is fixed,
+// so instead we iterate: settle, measure the gripper error, and nudge the IK
+// target by that residual until the real gripper lands on the rock.
+constexpr double correction_settle = 0.6;    // settle time before each measurement
+constexpr int max_corrections = 8;           // cap on correction iterations
+constexpr double reach_converge_tol = 0.04;  // stop correcting within 4 cm
+constexpr double max_correction_step = 0.6;  // clamp a single residual nudge
+constexpr double divergence_abort = 1.0;     // gripper this far off => IK blew up, fail
 constexpr double control_dt = 0.01;
 constexpr double finger_open_sep = 0.388;
 constexpr double finger_close_pos = 0.145;
@@ -234,6 +245,13 @@ bool LrvArm::StartPickPlace(double command_seq,
     m_status.success = false;
     m_status.error_code = 0;
     m_target_rock = std::move(rock);
+    // Freeze the rock in place while the arm servos onto it: fixed so the
+    // multi-step approach cannot shove it, collision off so the arm passes
+    // through cleanly. The rig skips this rock in its collision activation
+    // (see GetActiveRock). It is unfrozen when the lock is applied (to lift)
+    // or when the grab is abandoned (RemoveRockLock).
+    m_target_rock->SetFixed(true);
+    m_target_rock->EnableCollision(false);
     m_grab_target_world = grab_target_world;
     m_place_target_world = place_target_world;
     m_start_time = time;
@@ -243,15 +261,24 @@ bool LrvArm::StartPickPlace(double command_seq,
     m_bent_arm = false;
 
     if (!SolveIk(m_grab_target_world, m_grab_theta)) {
+        std::cout << "[LrvArm] IK FAILED (grab) target=(" << m_grab_target_world.x() << ","
+                  << m_grab_target_world.y() << "," << m_grab_target_world.z() << ")\n";
         FinishFailed(2);
         return false;
     }
 
     if (!SolveIk(m_place_target_world, m_place_theta)) {
+        std::cout << "[LrvArm] IK FAILED (place) target=(" << m_place_target_world.x() << ","
+                  << m_place_target_world.y() << "," << m_place_target_world.z() << ")\n";
         FinishFailed(2);
         return false;
     }
 
+    std::cout << "[LrvArm] IK OK grab_theta=(" << m_grab_theta[0] << "," << m_grab_theta[1] << ","
+              << m_grab_theta[2] << "," << m_grab_theta[3] << ") -> starting APPROACH\n";
+
+    m_ik_target = m_grab_target_world;
+    m_corrections = 0;
     CommandJointAngles({m_grab_theta[0], m_grab_theta[1], 0.0, 0.0});
     m_phase = Phase::APPROACH;
     return true;
@@ -271,14 +298,52 @@ void LrvArm::Update(double time) {
         if (!m_bent_arm && elapsed > approach_2_time) {
             CommandJointAngles(m_grab_theta);
             m_bent_arm = true;
+            m_phase_time = time;  // begin settle window for the first correction
+            return;
         }
 
-        if (m_bent_arm &&
-            ((GripperCenter() - m_grab_target_world).Length() < grasp_reach_tol || elapsed > close_timeout)) {
-            m_phase = Phase::CLOSING;
-            m_phase_time = time;
-            m_next_tick = time;
+        if (!m_bent_arm || elapsed < correction_settle)
+            return;
+
+        // Measure the actual settled gripper error against the true rock target.
+        const auto gc = GripperCenter();
+        chrono::ChVector3d residual = m_grab_target_world - gc;
+        const double err = residual.Length();
+
+        // The systematic FK error is ~0.25 m; anything far larger means the IK
+        // returned a wild pose and the arm flung out. Abort instead of flailing.
+        if (err > divergence_abort) {
+            std::cout << "[LrvArm] IK DIVERGED (grab) err=" << err << " after " << m_corrections
+                      << " corrections -> failing\n";
+            FinishFailed(2);
+            return;
         }
+
+        if (err >= reach_converge_tol && m_corrections < max_corrections) {
+            // Aim the IK beyond the target by the residual so the physically
+            // settled gripper converges onto the rock (fixed-point correction).
+            if (residual.Length() > max_correction_step)
+                residual *= max_correction_step / residual.Length();
+            m_ik_target += residual;
+            std::array<double, 4> corrected;
+            if (SolveIk(m_ik_target, corrected)) {
+                m_grab_theta = corrected;
+                CommandJointAngles(m_grab_theta);
+            }
+            m_corrections++;
+            m_phase_time = time;  // re-settle before the next measurement
+            return;
+        }
+
+        const auto rref = m_target_rock ? m_target_rock->GetFrameRefToAbs().GetPos() : chrono::VNULL;
+        std::cout << "[LrvArm] APPROACH->CLOSING t=" << time << " corrections=" << m_corrections
+                  << " gripper=(" << gc.x() << "," << gc.y() << "," << gc.z() << ")"
+                  << " |gripper-target|=" << err << " |gripper-rockREF|xy="
+                  << std::hypot(gc.x() - rref.x(), gc.y() - rref.y()) << " dz=" << (gc.z() - rref.z())
+                  << (m_corrections >= max_corrections ? " (hit max_corrections)" : "") << "\n";
+        m_phase = Phase::CLOSING;
+        m_phase_time = time;
+        m_next_tick = time;
         return;
     }
 
@@ -300,6 +365,10 @@ void LrvArm::Update(double time) {
             m_close_pos = std::min(finger_close_pos, 0.5 * (finger_open_sep - actual_sep) + 0.002);
             CommandFingerPosition(m_close_pos);
             if (TryLockRock()) {
+                std::cout << "[LrvArm] LOCKED t=" << time << " actual_sep=" << actual_sep << "\n";
+                // Now bonded to the end-effector: unfreeze so it lifts with the
+                // arm, but keep collision off so it doesn't fight terrain/fingers.
+                m_target_rock->SetFixed(false);
                 m_target_rock->EnableCollision(false);
                 m_lift_angle = m_grab_theta[1];
                 m_phase = Phase::LIFTING;
@@ -309,6 +378,12 @@ void LrvArm::Update(double time) {
         }
 
         if (m_close_pos >= finger_close_pos) {
+            const double d1 = m_target_rock ? (m_target_rock->GetPos() - m_finger_1->GetPos()).Length() : -1.0;
+            const double d2 = m_target_rock ? (m_target_rock->GetPos() - m_finger_2->GetPos()).Length() : -1.0;
+            std::cout << "[LrvArm] GRAB FAILED(3) t=" << time << " actual_sep=" << actual_sep
+                      << " (grasp_sep=" << finger_grasp_sep << ")"
+                      << " dist_finger1_rock=" << d1 << " dist_finger2_rock=" << d2
+                      << " (lock_dist=" << lock_finger_dist << ")\n";
             FinishFailed(3);
         }
         return;
@@ -365,6 +440,16 @@ ArmStatusSnapshot LrvArm::GetStatus() const {
     return m_status;
 }
 
+std::shared_ptr<chrono::ChBodyAuxRef> LrvArm::GetActiveRock() const {
+    // Only while the arm is actively positioning onto / holding the rock. Once
+    // it is being released (RELEASING/STOWING) the rig may manage it again.
+    if (m_phase == Phase::APPROACH || m_phase == Phase::CLOSING || m_phase == Phase::LIFTING ||
+        m_phase == Phase::PLACING) {
+        return m_target_rock;
+    }
+    return nullptr;
+}
+
 void LrvArm::CommandJointAngles(const std::array<double, 4>& theta) {
     m_motor_base_shoulder->SetAngleFunction(chrono_types::make_shared<chrono::ChFunctionConst>(-theta[0] - chrono::CH_PI));
     m_motor_shoulder_biceps->SetAngleFunction(chrono_types::make_shared<chrono::ChFunctionConst>(theta[1]));
@@ -405,8 +490,10 @@ void LrvArm::RemoveRockLock() {
         m_system->RemoveLink(m_rock_lock);
         m_rock_lock.reset();
     }
-    if (m_target_rock)
+    if (m_target_rock) {
+        m_target_rock->SetFixed(false);
         m_target_rock->EnableCollision(true);
+    }
 }
 
 bool LrvArm::SolveIk(const chrono::ChVector3d& target_world, std::array<double, 4>& theta) const {

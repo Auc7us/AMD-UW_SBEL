@@ -9,7 +9,12 @@ namespace amd_uw {
 
 namespace {
 
-constexpr double grab_height = 0.22;
+// Fallback gripper-center height used only if a rock's measured height is
+// missing. With the per-rock height available (the common path) the gripper
+// aims at the rock's top plus this margin, reproducing the reference demo's
+// gripper-center-at-the-rock-top grasp for rocks of any size/mesh.
+constexpr double grab_height_fallback = 0.22;
+constexpr double grab_top_margin = 0.0;
 constexpr double place_height = 0.5;
 constexpr double place_spread_y = 0.4;
 
@@ -31,11 +36,13 @@ std::string TopicForRobot(int robot_id, const std::string& suffix) {
 RosArmBridge::RosArmBridge(int robot_id,
                            LrvArm& arm,
                            const std::vector<std::shared_ptr<chrono::ChBodyAuxRef>>& rocks,
+                           const std::vector<double>& rock_top_heights,
                            std::shared_ptr<chrono::vehicle::WheeledTrailer> trailer,
                            double height_probe_z)
     : m_robot_id(robot_id),
       m_arm(arm),
       m_rocks(rocks),
+      m_rock_top_heights(rock_top_heights),
       m_trailer(std::move(trailer)),
       m_height_probe_z(height_probe_z) {
     EnsureRosInitialized();
@@ -82,9 +89,24 @@ void RosArmBridge::Synchronize(double time, chrono::vehicle::RigidTerrain& terra
                                  time);
         } else {
             auto rock = m_rocks[command->target_index];
-            const auto rock_pos = rock->GetPos();
-            const double terrain_z = terrain.GetHeight(chrono::ChVector3d(rock_pos.x(), rock_pos.y(), m_height_probe_z));
-            const chrono::ChVector3d grab_target(rock_pos.x(), rock_pos.y(), terrain_z + grab_height);
+            // Aim at the rock's geometric center (REF frame), not GetPos(), which
+            // for a ChBodyAuxRef is the center of mass -- offset from the visible
+            // center by the mesh's COM offset (and the rock's random yaw).
+            const auto rock_ref = rock->GetFrameRefToAbs().GetPos();
+            const double terrain_z =
+                terrain.GetHeight(chrono::ChVector3d(rock_ref.x(), rock_ref.y(), m_height_probe_z));
+            // Height above the ground: reach for this rock's actual top (per-mesh),
+            // falling back to the legacy fixed height only if it wasn't measured.
+            const double grab_z =
+                command->target_index < static_cast<int>(m_rock_top_heights.size())
+                    ? m_rock_top_heights[command->target_index] + grab_top_margin
+                    : grab_height_fallback;
+            const chrono::ChVector3d grab_target(rock_ref.x(), rock_ref.y(), terrain_z + grab_z);
+            RCLCPP_INFO(m_node->get_logger(),
+                        "pickup start: target_index=%d rock_top_height=%.3f grab_z(rel ground)=%.3f "
+                        "grab_target=(%.3f, %.3f, %.3f)",
+                        command->target_index, grab_z - grab_top_margin, grab_z, grab_target.x(),
+                        grab_target.y(), grab_target.z());
             m_arm.StartPickPlace(command->command_seq,
                                  command->target_index,
                                  rock,

@@ -21,6 +21,7 @@ class RosArmBridge {
     RosArmBridge(int robot_id,
                  LrvArm& arm,
                  const std::vector<std::shared_ptr<chrono::ChBodyAuxRef>>& rocks,
+                 const std::vector<double>& rock_top_heights,
                  std::shared_ptr<chrono::vehicle::WheeledTrailer> trailer,
                  double height_probe_z);
     ~RosArmBridge();
@@ -42,6 +43,7 @@ class RosArmBridge {
     int m_robot_id;
     LrvArm& m_arm;
     const std::vector<std::shared_ptr<chrono::ChBodyAuxRef>>& m_rocks;
+    const std::vector<double>& m_rock_top_heights;
     std::shared_ptr<chrono::vehicle::WheeledTrailer> m_trailer;
     double m_height_probe_z;
     double m_last_started_seq = -1.0;

@@ -126,8 +126,9 @@ void RobotRig::InitializeOnTerrain(chrono::vehicle::RigidTerrain& terrain,
                                    double settle_time,
                                    double step_size,
                                    const RockFieldConfig& rock_field_config) {
+    m_rock_top_heights.clear();
     m_rocks = AddRockFields(GetSystem(), terrain, rock_mat, chrono_data_path, amd_uw_data_path, m_robot_index,
-                            m_num_robots, start_spacing, height_probe_z, rock_field_config);
+                            m_num_robots, start_spacing, height_probe_z, rock_field_config, &m_rock_top_heights);
 
     const chrono::ChVector3d start_ground = InitialGroundPositionForRobot(m_robot_index, m_num_robots, start_spacing);
     const double start_x = start_ground.x();
@@ -280,7 +281,8 @@ void RobotRig::InitializeDriver() {
 
 #ifdef AMD_UW_ENABLE_ROS2
 void RobotRig::InitializeArmBridge(double height_probe_z) {
-    m_arm_bridge = std::make_unique<RosArmBridge>(m_rank, *m_arm, m_rocks, m_trailer, height_probe_z);
+    m_arm_bridge =
+        std::make_unique<RosArmBridge>(m_rank, *m_arm, m_rocks, m_rock_top_heights, m_trailer, height_probe_z);
 }
 #endif
 
@@ -348,7 +350,13 @@ void RobotRig::UpdateRockCollisionActivation() {
     const double activate2 = rock_collision_activation_radius * rock_collision_activation_radius;
     const double deactivate2 = rock_collision_deactivation_radius * rock_collision_deactivation_radius;
 
+    // The arm freezes its target rock (fixed + collision off) while grabbing;
+    // don't fight that here.
+    const auto active_rock = m_arm ? m_arm->GetActiveRock() : nullptr;
+
     for (const auto& rock : m_rocks) {
+        if (rock == active_rock)
+            continue;
         const auto rock_pos = rock->GetPos();
         const double dist2 = std::min(PlanarDistance2(rock_pos, vehicle_pos), PlanarDistance2(rock_pos, trailer_pos));
         if (!rock->IsCollisionEnabled() && dist2 <= activate2) {
