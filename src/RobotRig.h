@@ -9,6 +9,7 @@
 #include "chrono/physics/ChBodyAuxRef.h"
 #include "chrono/physics/ChBodyEasy.h"
 #include "chrono/physics/ChContactMaterial.h"
+#include "chrono/physics/ChLinkMotorRotationAngle.h"
 #include "chrono/physics/ChSystem.h"
 #include "chrono_vehicle/ChDriver.h"
 #include "chrono_vehicle/driver/ChInteractiveDriver.h"
@@ -68,13 +69,13 @@ class RobotRig {
                    double seat_clearance);
     void InitializeArm(const std::string& amd_uw_data_path);
     void InitializeTrailerBed();
+    void DumpTrailerBed();
     void InitializeDriver();
 #ifdef AMD_UW_ENABLE_ROS2
     void InitializeArmBridge(double height_probe_z);
 #endif
     void Settle(chrono::vehicle::RigidTerrain& terrain, double settle_time, double step_size);
     void UpdateRockCollisionActivation();
-    void UpdateAttachments();
 
     int m_rank;
     int m_robot_index;
@@ -85,7 +86,8 @@ class RobotRig {
 
     std::unique_ptr<chrono::vehicle::WheeledVehicle> m_vehicle;
     std::shared_ptr<chrono::vehicle::WheeledTrailer> m_trailer;
-    std::shared_ptr<chrono::ChBodyEasyBox> m_trailer_bed;
+    std::shared_ptr<chrono::ChBody> m_trailer_bed;
+    std::shared_ptr<chrono::ChLinkMotorRotationAngle> m_trailer_bed_motor;
     std::unique_ptr<chrono::vehicle::ChDriver> m_driver;
     std::shared_ptr<chrono::vehicle::ChInteractiveDriver> m_irr_driver;
     std::unique_ptr<LrvArm> m_arm;

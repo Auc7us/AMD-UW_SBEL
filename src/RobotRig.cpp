@@ -5,10 +5,14 @@
 #include <limits>
 #include <set>
 
+#include "chrono/collision/ChCollisionShapeBox.h"
+#include "chrono/core/ChFrame.h"
 #include "chrono/core/ChTypes.h"
 #include "chrono/core/ChVector3.h"
+#include "chrono/functions/ChFunctionConst.h"
 #include "chrono/physics/ChBody.h"
 #include "chrono/physics/ChSystem.h"
+#include "chrono/utils/ChConstants.h"
 #include "chrono_synchrono/utils/SynLog.h"
 #include "chrono_vehicle/ChVehicleDataPath.h"
 #include "chrono_vehicle/utils/ChVehicleUtilsJSON.h"
@@ -253,15 +257,58 @@ void RobotRig::ReseatRig(chrono::vehicle::RigidTerrain& terrain,
 }
 
 void RobotRig::InitializeTrailerBed() {
-    auto trailer_bed_mat = chrono::ChContactMaterial::DefaultMaterial(m_contact_method);
-    trailer_bed_mat->SetFriction(0.9f);
-    m_trailer_bed = chrono_types::make_shared<chrono::ChBodyEasyBox>(1.0, 1.2, 0.02, 1000.0,
-                                                                     /*visualize=*/false,
-                                                                     /*collide=*/true, trailer_bed_mat);
-    m_trailer_bed->SetFixed(true);
+    auto bed_mat = chrono::ChContactMaterial::DefaultMaterial(m_contact_method);
+    bed_mat->SetFriction(0.9f);
+
+    const auto chassis = m_trailer->GetChassis()->GetBody();
+    const chrono::ChVector3d offset(0.0, 0.0, 0.03);  // bed floor just above the trailer chassis
+    const chrono::ChVector3d bed_pos = chassis->GetPos() + chassis->GetRot().Rotate(offset);
+
+    // Open dumping tub (floor + front +x and both +/-y walls, open rear -x), a
+    // DYNAMIC body carried by the trailer through a lateral-axis revolute motor
+    // held flat. Unlike the old fixed/teleported plate, a jointed dynamic bed has
+    // real velocity, so friction keeps placed rocks aboard while driving. Mirrors
+    // the Python TrailerDumpBed; the motor can later run a dump cycle.
+    const double ex = 1.0, ey = 1.2;   // footprint: x along the trailer, y across
+    const double wall_h = 0.15, t = 0.03;
+
+    m_trailer_bed = chrono_types::make_shared<chrono::ChBody>();
+    m_trailer_bed->SetName("trailer_bed");
+    m_trailer_bed->SetPos(bed_pos);
+    m_trailer_bed->SetRot(chassis->GetRot());
+    const double mass = 30.0;
+    m_trailer_bed->SetMass(mass);
+    m_trailer_bed->SetInertiaXX(chrono::ChVector3d(mass / 12.0 * (ey * ey + wall_h * wall_h),
+                                                   mass / 12.0 * (ex * ex + wall_h * wall_h),
+                                                   mass / 12.0 * (ex * ex + ey * ey)));
+
+    auto add_box = [&](double sx, double sy, double sz, double cx, double cy, double cz) {
+        m_trailer_bed->AddCollisionShape(
+            chrono_types::make_shared<chrono::ChCollisionShapeBox>(bed_mat, sx, sy, sz),
+            chrono::ChFramed(chrono::ChVector3d(cx, cy, cz), chrono::QUNIT));
+    };
+    add_box(ex, ey, t, 0.0, 0.0, 0.0);                       // floor
+    add_box(t, ey, wall_h, ex / 2.0, 0.0, wall_h / 2.0);     // +x front wall
+    add_box(ex, t, wall_h, 0.0, ey / 2.0, wall_h / 2.0);     // +y left wall
+    add_box(ex, t, wall_h, 0.0, -ey / 2.0, wall_h / 2.0);    // -y right wall
     m_trailer_bed->EnableCollision(true);
-    UpdateAttachments();
     GetSystem()->AddBody(m_trailer_bed);
+
+    // Revolute motor about the chassis lateral (Y) axis. A rotation motor turns
+    // about its frame Z, so rotate the frame +90 deg about X to land Z on the
+    // chassis Y axis. Held at 0 => bed stays flat (rigidly carried).
+    const chrono::ChQuaternion<> frame_rot = chassis->GetRot() * chrono::QuatFromAngleX(chrono::CH_PI_2);
+    m_trailer_bed_motor = chrono_types::make_shared<chrono::ChLinkMotorRotationAngle>();
+    m_trailer_bed_motor->Initialize(m_trailer_bed, chassis, chrono::ChFramed(bed_pos, frame_rot));
+    m_trailer_bed_motor->SetAngleFunction(chrono_types::make_shared<chrono::ChFunctionConst>(0.0));
+    GetSystem()->AddLink(m_trailer_bed_motor);
+}
+
+void RobotRig::DumpTrailerBed() {
+    // Placeholder for a future dump cycle: ramp the motor angle up to tip the bed
+    // and slide the load off the open rear, then return to flat. Not wired to ROS.
+    if (m_trailer_bed_motor)
+        m_trailer_bed_motor->SetAngleFunction(chrono_types::make_shared<chrono::ChFunctionConst>(0.0));
 }
 
 void RobotRig::InitializeDriver() {
@@ -331,7 +378,6 @@ void RobotRig::Advance(double step) {
     m_driver->Advance(step);
     m_vehicle->Advance(step);
     m_trailer->Advance(step);
-    UpdateAttachments();
 }
 
 chrono::vehicle::DriverInputs RobotRig::GetDriverInputs() const {
@@ -357,6 +403,15 @@ void RobotRig::UpdateRockCollisionActivation() {
     for (const auto& rock : m_rocks) {
         if (rock == active_rock)
             continue;
+#ifdef AMD_UW_ENABLE_ROS2
+        // Rocks welded to the trailer bed have their collision managed by the
+        // arm bridge; leave them alone.
+        if (m_arm_bridge) {
+            const auto& welded = m_arm_bridge->WeldedRocks();
+            if (std::find(welded.begin(), welded.end(), rock) != welded.end())
+                continue;
+        }
+#endif
         const auto rock_pos = rock->GetPos();
         const double dist2 = std::min(PlanarDistance2(rock_pos, vehicle_pos), PlanarDistance2(rock_pos, trailer_pos));
         if (!rock->IsCollisionEnabled() && dist2 <= activate2) {
@@ -366,11 +421,6 @@ void RobotRig::UpdateRockCollisionActivation() {
             rock->EnableCollision(false);
         }
     }
-}
-
-void RobotRig::UpdateAttachments() {
-    m_trailer_bed->SetPos(m_trailer->GetChassis()->GetPos() + chrono::ChVector3d(0, 0, 0.01));
-    m_trailer_bed->SetRot(m_trailer->GetChassis()->GetRot());
 }
 
 void RobotRig::LogMotionIfNeeded(int step_number,

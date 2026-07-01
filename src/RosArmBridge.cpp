@@ -15,8 +15,20 @@ namespace {
 // gripper-center-at-the-rock-top grasp for rocks of any size/mesh.
 constexpr double grab_height_fallback = 0.22;
 constexpr double grab_top_margin = 0.0;
-constexpr double place_height = 0.5;
-constexpr double place_spread_y = 0.4;
+// Placement grid on the trailer bed, in the trailer's LOCAL frame (x = along the
+// trailer, y = across it). Rocks tile across a bounded grid that fits inside the
+// bed (~1.0 x 1.2 m) so they land on the bed at any heading, instead of a spread
+// tied to the whole rock field that flung them meters off to the side.
+// Welding placed rocks to the trailer keeps them from being left behind, but a
+// rigid rock locked to the suspended trailer chassis destabilizes it (rolls a
+// wheel up and flips under drive). Disabled until carry is done a stable way
+// (e.g. near-massless rock, or a proper hinged bed like the Python demo).
+constexpr bool enable_bed_weld = false;
+constexpr double place_height = 0.5;  // local-z release height above the bed
+constexpr int place_cols = 4;         // lateral slots (across the bed, y)
+constexpr int place_rows = 4;         // longitudinal slots (along the bed, x)
+constexpr double place_step_y = 0.25;
+constexpr double place_step_x = 0.25;
 
 void EnsureRosInitialized() {
     if (rclcpp::ok())
@@ -102,21 +114,67 @@ void RosArmBridge::Synchronize(double time, chrono::vehicle::RigidTerrain& terra
                     ? m_rock_top_heights[command->target_index] + grab_top_margin
                     : grab_height_fallback;
             const chrono::ChVector3d grab_target(rock_ref.x(), rock_ref.y(), terrain_z + grab_z);
+            const chrono::ChVector3d place_target = PlacePoint(m_place_count);
             RCLCPP_INFO(m_node->get_logger(),
                         "pickup start: target_index=%d rock_top_height=%.3f grab_z(rel ground)=%.3f "
-                        "grab_target=(%.3f, %.3f, %.3f)",
+                        "grab_target=(%.3f, %.3f, %.3f) place_slot=%d place_target=(%.3f, %.3f, %.3f)",
                         command->target_index, grab_z - grab_top_margin, grab_z, grab_target.x(),
-                        grab_target.y(), grab_target.z());
+                        grab_target.y(), grab_target.z(), m_place_count, place_target.x(), place_target.y(),
+                        place_target.z());
+            // Carry + stability check: is the previously placed rock still on the
+            // trailer (small dist, elevated), and is the trailer upright (up.z ~ 1)?
+            if (m_inflight_rock && m_trailer && m_trailer->GetChassis()) {
+                auto chassis = m_trailer->GetChassis()->GetBody();
+                const auto tp = chassis->GetPos();
+                const auto rp = m_inflight_rock->GetPos();
+                const double tz = terrain.GetHeight(chrono::ChVector3d(rp.x(), rp.y(), m_height_probe_z));
+                const double up_z = chassis->GetRot().Rotate(chrono::ChVector3d(0, 0, 1)).z();
+                RCLCPP_INFO(m_node->get_logger(),
+                            "prev rock: dist_to_trailer_xy=%.3f height_above_terrain=%.3f | trailer up.z=%.3f",
+                            std::hypot(rp.x() - tp.x(), rp.y() - tp.y()), rp.z() - tz, up_z);
+            }
+            m_inflight_rock = rock;
+
             m_arm.StartPickPlace(command->command_seq,
                                  command->target_index,
                                  rock,
                                  grab_target,
-                                 PlacePoint(command->target_index),
+                                 place_target,
                                  time);
+            m_place_count++;
         }
     }
 
     m_arm.Update(time);
+
+    // On a successful place, weld the rock to the trailer so it rides along
+    // instead of being left behind (the bed is teleported and can't carry it by
+    // friction). Keep it awake so it doesn't freeze mid-air after settling.
+    const auto status = m_arm.GetStatus();
+    if (status.state == 2 && status.success && status.command_seq == m_last_started_seq &&
+        m_welded_seq != m_last_started_seq && m_inflight_rock && m_trailer && m_trailer->GetChassis()) {
+        // Keep the placed rock awake so it rides the dynamic bed via friction
+        // instead of napping and freezing in place when the trailer next stops.
+        m_inflight_rock->SetSleepingAllowed(false);
+        m_inflight_rock->SetSleeping(false);
+
+        if (enable_bed_weld) {
+            auto chassis = m_trailer->GetChassis()->GetBody();
+            if (auto* sys = chassis->GetSystem()) {
+                auto weld = chrono_types::make_shared<chrono::ChLinkLockLock>();
+                weld->Initialize(chassis, m_inflight_rock,
+                                 chrono::ChFramed(m_inflight_rock->GetPos(), chrono::QUNIT));
+                sys->AddLink(weld);
+                m_inflight_rock->EnableCollision(false);
+                m_bed_welds.push_back(weld);
+                m_welded_rocks.push_back(m_inflight_rock);
+                RCLCPP_INFO(m_node->get_logger(), "welded placed rock to trailer (total on bed: %zu)",
+                            m_bed_welds.size());
+            }
+        }
+        m_welded_seq = m_last_started_seq;  // handled this placement once
+    }
+
     PublishStatus();
 }
 
@@ -150,13 +208,19 @@ void RosArmBridge::PublishStatus() {
     m_arm_status_pub->publish(msg);
 }
 
-chrono::ChVector3d RosArmBridge::PlacePoint(int target_index) const {
+chrono::ChVector3d RosArmBridge::PlacePoint(int slot) const {
     if (!m_trailer || !m_trailer->GetChassis())
         return chrono::ChVector3d(0.0, 0.0, place_height);
 
-    const int n = std::max(1, static_cast<int>(m_rocks.size()));
-    const double lateral = (target_index - 0.5 * (n - 1)) * place_spread_y;
-    return m_trailer->GetChassis()->GetBody()->GetPos() + chrono::ChVector3d(0.0, lateral, place_height);
+    // Grid slot on the bed (wraps if more rocks than slots), centered on the bed.
+    const int col = slot % place_cols;
+    const int row = (slot / place_cols) % place_rows;
+    const double y_local = (col - 0.5 * (place_cols - 1)) * place_step_y;
+    const double x_local = (row - 0.5 * (place_rows - 1)) * place_step_x;
+    // Express in the trailer's local frame and map to world, so the drop point
+    // stays over the bed whatever way the trailer is pointing.
+    const chrono::ChVector3d local(x_local, y_local, place_height);
+    return m_trailer->GetChassis()->GetBody()->TransformPointLocalToParent(local);
 }
 
 }  // namespace amd_uw

@@ -398,6 +398,8 @@ void LrvArm::Update(double time) {
             m_lift_angle = lift_theta2;
             CommandJointAngles({m_grab_theta[0], m_lift_angle, m_grab_theta[2], m_grab_theta[3]});
             CommandJointAngles(m_place_theta);
+            m_ik_target = m_place_target_world;  // closed-loop correct the place too
+            m_corrections = 0;
             m_phase = Phase::PLACING;
             m_phase_time = time;
             return;
@@ -579,6 +581,13 @@ chrono::ChVector3d LrvArm::GripperCenter() const {
 }
 
 void LrvArm::FinishDone() {
+    if (m_target_rock) {
+        const auto rp = m_target_rock->GetPos();
+        std::cout << "[LrvArm] DONE rock_final=(" << rp.x() << "," << rp.y() << "," << rp.z() << ")"
+                  << " place_target=(" << m_place_target_world.x() << "," << m_place_target_world.y() << ","
+                  << m_place_target_world.z() << ")"
+                  << " |rock-place|=" << (rp - m_place_target_world).Length() << "\n";
+    }
     m_phase = Phase::DONE;
     m_status.state = 2;
     m_status.success = true;
