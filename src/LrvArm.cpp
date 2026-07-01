@@ -32,7 +32,8 @@ constexpr double close_timeout = 8.0;
 // the actual settled pose and placing the rock there. Here the rock is fixed,
 // so instead we iterate: settle, measure the gripper error, and nudge the IK
 // target by that residual until the real gripper lands on the rock.
-constexpr double correction_settle = 0.6;    // settle time before each measurement
+constexpr double approach_min_settle = 0.4;  // min time at a pose before judging it
+constexpr double settle_speed_tol = 0.05;    // gripper speed (m/s) below which it's "settled"
 constexpr int max_corrections = 8;           // cap on correction iterations
 constexpr double reach_converge_tol = 0.04;  // stop correcting within 4 cm
 constexpr double max_correction_step = 0.6;  // clamp a single residual nudge
@@ -260,11 +261,18 @@ bool LrvArm::StartPickPlace(double command_seq,
     m_close_pos = 0.0;
     m_bent_arm = false;
 
-    if (!SolveIk(m_grab_target_world, m_grab_theta)) {
-        std::cout << "[LrvArm] IK FAILED (grab) target=(" << m_grab_target_world.x() << ","
-                  << m_grab_target_world.y() << "," << m_grab_target_world.z() << ")\n";
-        FinishFailed(2);
-        return false;
+    // Aim the initial IK at the rock plus the learned FK-vs-actual offset, so the
+    // arm reaches the rock directly. If that biased aim is out of reach, fall back
+    // to the raw target (the closed-loop APPROACH still corrects the rest).
+    chrono::ChVector3d biased_grab = m_grab_target_world + m_chassis_body->GetRot().Rotate(m_reach_bias);
+    if (!SolveIk(biased_grab, m_grab_theta)) {
+        biased_grab = m_grab_target_world;
+        if (!SolveIk(biased_grab, m_grab_theta)) {
+            std::cout << "[LrvArm] IK FAILED (grab) target=(" << m_grab_target_world.x() << ","
+                      << m_grab_target_world.y() << "," << m_grab_target_world.z() << ")\n";
+            FinishFailed(2);
+            return false;
+        }
     }
 
     if (!SolveIk(m_place_target_world, m_place_theta)) {
@@ -277,7 +285,7 @@ bool LrvArm::StartPickPlace(double command_seq,
     std::cout << "[LrvArm] IK OK grab_theta=(" << m_grab_theta[0] << "," << m_grab_theta[1] << ","
               << m_grab_theta[2] << "," << m_grab_theta[3] << ") -> starting APPROACH\n";
 
-    m_ik_target = m_grab_target_world;
+    m_ik_target = biased_grab;
     m_corrections = 0;
     CommandJointAngles({m_grab_theta[0], m_grab_theta[1], 0.0, 0.0});
     m_phase = Phase::APPROACH;
@@ -302,7 +310,15 @@ void LrvArm::Update(double time) {
             return;
         }
 
-        if (!m_bent_arm || elapsed < correction_settle)
+        if (!m_bent_arm)
+            return;
+        // Only judge the pose once the arm has actually ARRIVED and settled --
+        // gate on gripper speed, not a short fixed timer. Measuring mid-swing was
+        // what caused the spurious corrections (flinging the aim low/around before
+        // homing back onto the rock). A time cap is the fallback if it never quiets.
+        const double gripper_speed = (0.5 * (m_finger_1->GetPosDt() + m_finger_2->GetPosDt())).Length();
+        const bool settled = gripper_speed < settle_speed_tol;
+        if (elapsed < approach_min_settle || (!settled && elapsed < close_timeout))
             return;
 
         // Measure the actual settled gripper error against the true rock target.
@@ -335,11 +351,19 @@ void LrvArm::Update(double time) {
             return;
         }
 
+        // Total offset (arm frame) needed for the real gripper to reach the rock.
+        const chrono::ChVector3d offset_local =
+            m_chassis_body->GetRot().RotateBack(m_ik_target - m_grab_target_world);
+        // If we converged, learn it so the next grab aims closer on the first move.
+        if (err < reach_converge_tol)
+            m_reach_bias = 0.4 * m_reach_bias + 0.6 * offset_local;
+
         const auto rref = m_target_rock ? m_target_rock->GetFrameRefToAbs().GetPos() : chrono::VNULL;
         std::cout << "[LrvArm] APPROACH->CLOSING t=" << time << " corrections=" << m_corrections
-                  << " gripper=(" << gc.x() << "," << gc.y() << "," << gc.z() << ")"
-                  << " |gripper-target|=" << err << " |gripper-rockREF|xy="
-                  << std::hypot(gc.x() - rref.x(), gc.y() - rref.y()) << " dz=" << (gc.z() - rref.z())
+                  << " |gripper-target|=" << err
+                  << " offset_local=(" << offset_local.x() << "," << offset_local.y() << ","
+                  << offset_local.z() << ")"
+                  << " |gripper-rockREF|xy=" << std::hypot(gc.x() - rref.x(), gc.y() - rref.y())
                   << (m_corrections >= max_corrections ? " (hit max_corrections)" : "") << "\n";
         m_phase = Phase::CLOSING;
         m_phase_time = time;

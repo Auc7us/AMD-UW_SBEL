@@ -88,6 +88,10 @@ class LrvArm {
     chrono::ChVector3d m_place_target_world;
     chrono::ChVector3d m_ik_target;  // world point currently fed to IK (closed-loop corrected)
     int m_corrections = 0;           // closed-loop reach corrections applied this grab
+    // Learned systematic FK-vs-actual gripper offset (in the arm/chassis frame),
+    // pre-applied to the initial IK aim so the arm reaches the rock directly
+    // instead of visibly overshooting and correcting on every grab.
+    chrono::ChVector3d m_reach_bias{0.0, 0.0, 0.0};
     std::array<double, 4> m_grab_theta = {0.0, 0.0, 0.0, 0.0};
     std::array<double, 4> m_place_theta = {0.0, 0.0, 0.0, 0.0};
     double m_start_time = 0.0;
