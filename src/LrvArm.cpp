@@ -48,6 +48,7 @@ constexpr double lift_theta2 = chrono::CH_PI / 3.0;
 constexpr double lift_speed = 0.5;
 constexpr double lift_delay = 1.5;
 constexpr double place_tol = 0.15;
+constexpr double place_min_settle = 0.4;
 constexpr double place_timeout = 6.0;
 constexpr double release_hold_time = 1.0;
 constexpr double stow_hold_time = 2.0;
@@ -435,7 +436,14 @@ void LrvArm::Update(double time) {
     }
 
     if (m_phase == Phase::PLACING) {
-        if ((GripperCenter() - m_place_target_world).Length() < place_tol || time - m_phase_time > place_timeout) {
+        const double elapsed = time - m_phase_time;
+        const double place_err = (GripperCenter() - m_place_target_world).Length();
+        const double gripper_speed = (0.5 * (m_finger_1->GetPosDt() + m_finger_2->GetPosDt())).Length();
+        const bool settled = gripper_speed < settle_speed_tol;
+        if (place_err < place_tol || (elapsed >= place_min_settle && settled) || elapsed > place_timeout) {
+            std::cout << "[LrvArm] PLACING->RELEASING t=" << time << " elapsed=" << elapsed
+                      << " |gripper-place|=" << place_err << " gripper_speed=" << gripper_speed
+                      << (elapsed > place_timeout ? " (timeout)" : "") << "\n";
             OpenGripper();
             m_phase = Phase::RELEASING;
             m_phase_time = time;
