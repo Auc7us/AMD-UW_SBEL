@@ -28,6 +28,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 option(AMD_UW_ENABLE_ROS2 "Enable ROS2 command/state bridge" ON)
+option(AMD_UW_USE_SOLIDWORKS_IMPORTER "Build the LRV arm from the Chrono SolidWorks Python importer" OFF)
 
 add_executable(demo_SYN_polaris_flat
     main.cpp
@@ -67,6 +68,16 @@ target_compile_definitions(demo_SYN_polaris_flat
         "CHRONO_VEHICLE_DATA_DIR=\"${CHRONO_BUILD_DIR}/bin/data/vehicle/\""
         "UW_AMD_DATA_DIR=\"${UW_AMD_DATA_DIR}\""
         "UW_AMD_VEHICLE_DATA_DIR=\"${UW_AMD_VEHICLE_DATA_DIR}\"")
+
+if(AMD_UW_USE_SOLIDWORKS_IMPORTER)
+    target_compile_definitions(demo_SYN_polaris_flat
+        PRIVATE
+            AMD_UW_USE_SOLIDWORKS_IMPORTER
+            # So the embedded interpreter can `import pychrono` without the caller
+            # having to export PYTHONPATH; the bindings live in the Chrono build's bin/.
+            "PYCHRONO_MODULE_DIR=\"${CHRONO_BUILD_DIR}/bin\"")
+    message(STATUS "LRV arm SolidWorks importer enabled")
+endif()
 
 target_include_directories(demo_SYN_polaris_flat
     PRIVATE
@@ -109,6 +120,19 @@ target_link_options(demo_SYN_polaris_flat
         "-Wl,-rpath-link,${CHRONO_PACKAGE_DIR}/vsg/lib")
 
 target_link_libraries(demo_SYN_polaris_flat
+        # SolidWorks importer only: libChrono_parsers.so statically embeds and
+        # globally re-exports its own tinyxml2. FastDDS (the ROS2 rmw) links the
+        # system libtinyxml2.so.9 and parses XML profiles at DDS-participant/node
+        # creation. With parsers loaded, ELF global-symbol interposition binds
+        # FastDDS's tinyxml2 calls to Chrono's ABI-incompatible copy, so a virtual
+        # call lands on a bad vtable slot and jumps to 0x0 (SIGSEGV during
+        # rclcpp::Node creation). Force the system tinyxml2 to load first so it
+        # wins global resolution; the SolidWorks import path never calls tinyxml2
+        # (that is only Chrono's URDF parser), so Chrono is unaffected.
+        # --no-as-needed keeps the (directly unreferenced) lib in DT_NEEDED.
+        "$<$<BOOL:${AMD_UW_USE_SOLIDWORKS_IMPORTER}>:-Wl,--no-as-needed>"
+        "$<$<BOOL:${AMD_UW_USE_SOLIDWORKS_IMPORTER}>:/usr/lib/x86_64-linux-gnu/libtinyxml2.so.9>"
+        "$<$<BOOL:${AMD_UW_USE_SOLIDWORKS_IMPORTER}>:-Wl,--as-needed>"
         "${CHRONO_BUILD_DIR}/lib/libChrono_synchrono.so"
         "${CHRONO_BUILD_DIR}/lib/libChronoModels_vehicle.so"
         "${CHRONO_BUILD_DIR}/lib/libChronoModels_robot.so"
@@ -144,6 +168,10 @@ target_link_libraries(demo_SYN_polaris_flat
         /usr/lib/x86_64-linux-gnu/libIrrlicht.so
         /usr/lib/x86_64-linux-gnu/openmpi/lib/libmpi_cxx.so
         /usr/lib/x86_64-linux-gnu/openmpi/lib/libmpi.so)
+
+if(AMD_UW_USE_SOLIDWORKS_IMPORTER)
+    target_link_libraries(demo_SYN_polaris_flat "${CHRONO_BUILD_DIR}/lib/libChrono_parsers.so")
+endif()
 
 if(AMD_UW_ENABLE_ROS2)
     if(ament_cmake_FOUND)

@@ -4,6 +4,7 @@
 #include <cmath>
 #include <iostream>
 #include <memory>
+#include <stdexcept>
 #include <string>
 
 #include <Eigen/Dense>
@@ -14,6 +15,9 @@
 #include "chrono/core/ChTypes.h"
 #include "chrono/functions/ChFunctionConst.h"
 #include "chrono/physics/ChContactMaterial.h"
+#ifdef AMD_UW_USE_SOLIDWORKS_IMPORTER
+#include "chrono_parsers/ChParserPython.h"
+#endif
 
 namespace amd_uw {
 
@@ -44,6 +48,7 @@ constexpr double finger_close_pos = 0.145;
 constexpr double finger_grasp_sep = 0.26;
 constexpr double finger_close_speed = 0.1;
 constexpr double lock_finger_dist = 0.27;
+constexpr double grip_force_tol = 30.0;
 constexpr double lift_theta2 = chrono::CH_PI / 3.0;
 constexpr double lift_speed = 0.5;
 constexpr double lift_delay = 1.5;
@@ -163,6 +168,33 @@ std::shared_ptr<LinkT> AddLink(chrono::ChSystem* system,
     return link;
 }
 
+std::shared_ptr<chrono::ChBodyAuxRef> RequireBody(chrono::ChSystem* system, const std::string& name) {
+    auto body = std::dynamic_pointer_cast<chrono::ChBodyAuxRef>(system->SearchBody(name));
+    if (!body)
+        throw std::runtime_error("Imported LRV arm is missing body: " + name);
+    return body;
+}
+
+#ifdef AMD_UW_USE_SOLIDWORKS_IMPORTER
+void MoveImportedAssembly(const std::array<std::shared_ptr<chrono::ChBodyAuxRef>, 8>& bodies,
+                          const chrono::ChVector3d& mount_pos,
+                          const chrono::ChQuaternion<>& mount_rot) {
+    for (const auto& body : bodies) {
+        body->SetFixed(false);
+        body->SetPos(mount_pos + body->GetPos());
+    }
+
+    // Match model/arm_model.py: after shifting the imported assembly, pin the
+    // base body itself exactly at the requested mount point.
+    bodies[2]->SetPos(mount_pos);
+
+    for (const auto& body : bodies) {
+        body->SetPos(mount_pos + mount_rot.Rotate(body->GetPos() - mount_pos));
+        body->SetRot(mount_rot * body->GetRot());
+    }
+}
+#endif
+
 }  // namespace
 
 LrvArm::LrvArm(chrono::ChSystem* system,
@@ -174,6 +206,33 @@ LrvArm::LrvArm(chrono::ChSystem* system,
     std::string data_path = amd_uw_data_path;
     if (!data_path.empty() && data_path.back() != '/')
         data_path += "/";
+#ifdef AMD_UW_USE_SOLIDWORKS_IMPORTER
+    const std::string arm_file = data_path + "lrv_robotarm/lrv_arm.py";
+
+    {
+        chrono::parsers::ChPythonEngine importer;
+#ifdef PYCHRONO_MODULE_DIR
+        // The exported SolidWorks file does `import pychrono`. The embedded
+        // interpreter only finds it if the Chrono build's python bindings are on
+        // sys.path, so add the build-configured location (idempotent if the
+        // environment already exports it via PYTHONPATH).
+        importer.Run(std::string("import sys\n"
+                                 "p = r'") + PYCHRONO_MODULE_DIR + "'\n"
+                     "if p not in sys.path:\n"
+                     "    sys.path.insert(0, p)\n");
+#endif
+        importer.ImportSolidWorksSystem(arm_file, *system);
+    }
+
+    m_end_effector = RequireBody(system, "endeffector-1");
+    m_biceps = RequireBody(system, "bicep-1");
+    m_base = RequireBody(system, "base-1");
+    m_shoulder = RequireBody(system, "shoulder-1");
+    m_elbow = RequireBody(system, "elbow-1");
+    m_wrist = RequireBody(system, "wrist-1");
+    m_finger_2 = RequireBody(system, "finger-2");
+    m_finger_1 = RequireBody(system, "finger-1");
+#else
     const std::string shapes_dir = data_path + "lrv_robotarm/lrv_arm_shapes/";
 
     m_end_effector = CreateBody(system, arm_bodies[0], shapes_dir, mount_pos, mount_rot);
@@ -184,25 +243,46 @@ LrvArm::LrvArm(chrono::ChSystem* system,
     m_wrist = CreateBody(system, arm_bodies[5], shapes_dir, mount_pos, mount_rot);
     m_finger_2 = CreateBody(system, arm_bodies[6], shapes_dir, mount_pos, mount_rot);
     m_finger_1 = CreateBody(system, arm_bodies[7], shapes_dir, mount_pos, mount_rot);
+#endif
 
     const auto joint_base_shoulder =
+#ifdef AMD_UW_USE_SOLIDWORKS_IMPORTER
+        TransformFrame({{-5.74189588383473e-19, 7.96390791413929e-18, 0.127}, chrono::QUNIT}, chrono::VNULL, chrono::QUNIT);
+#else
         TransformFrame({{-5.74189588383473e-19, 7.96390791413929e-18, 0.127}, chrono::QUNIT}, mount_pos, mount_rot);
+#endif
     const auto joint_shoulder_biceps =
         TransformFrame({{-8.07010409222406e-17, 1.5234866438078e-16, 0.325155513123522},
                         {1.17756934401283e-16, -1.17756934401283e-16, 0.707106781186548, -0.707106781186547}},
+#ifdef AMD_UW_USE_SOLIDWORKS_IMPORTER
+                       chrono::VNULL, chrono::QUNIT);
+#else
                        mount_pos, mount_rot);
+#endif
     const auto joint_biceps_elbow =
         TransformFrame({{-1.27, -2.66188598930217e-16, 0.325155513123522},
                         {0.707106781186548, -0.707106781186547, -1.17756934401283e-16, 1.17756934401283e-16}},
+#ifdef AMD_UW_USE_SOLIDWORKS_IMPORTER
+                       chrono::VNULL, chrono::QUNIT);
+#else
                        mount_pos, mount_rot);
+#endif
     const auto joint_elbow_effector =
         TransformFrame({{-2.413, -0.0190500000000001, 0.325155513123522},
                         {0.707106781186548, -0.707106781186547, -2.17894099802631e-33, 2.17894099802631e-33}},
+#ifdef AMD_UW_USE_SOLIDWORKS_IMPORTER
+                       chrono::VNULL, chrono::QUNIT);
+#else
                        mount_pos, mount_rot);
+#endif
     const auto joint_effector =
         TransformFrame({{-2.6924, -9.00811551237124e-16, 0.325155513123523},
                         {-3.92523114670944e-17, 3.92523114670943e-17, -0.707106781186547, 0.707106781186548}},
+#ifdef AMD_UW_USE_SOLIDWORKS_IMPORTER
+                       chrono::VNULL, chrono::QUNIT);
+#else
                        mount_pos, mount_rot);
+#endif
 
     m_wrist_lock = AddLink<chrono::ChLinkLockLock>(system, m_end_effector, m_wrist, joint_effector);
     m_motor_base_shoulder =
@@ -220,8 +300,19 @@ LrvArm::LrvArm(chrono::ChSystem* system,
     m_motor_finger_1->SetMotionFunction(chrono_types::make_shared<chrono::ChFunctionConst>(-0.15));
     m_motor_finger_2->SetMotionFunction(chrono_types::make_shared<chrono::ChFunctionConst>(0.15));
 
+#ifdef AMD_UW_USE_SOLIDWORKS_IMPORTER
+    MoveImportedAssembly({m_end_effector, m_biceps, m_base, m_shoulder, m_elbow, m_wrist, m_finger_2, m_finger_1},
+                         mount_pos,
+                         mount_rot);
+
+    m_chassis_lock =
+        AddLink<chrono::ChLinkLockLock>(system, m_chassis_body, m_base, chrono::ChFramed(m_base->GetPos(), m_base->GetRot()));
+
+    std::cout << "[LrvArm] imported SolidWorks arm via ChPythonEngine: " << arm_file << "\n";
+#else
     m_chassis_lock =
         AddLink<chrono::ChLinkLockLock>(system, m_chassis_body, m_base, chrono::ChFramed(mount_pos, mount_rot));
+#endif
 }
 
 bool LrvArm::StartPickPlace(double command_seq,
@@ -229,7 +320,8 @@ bool LrvArm::StartPickPlace(double command_seq,
                             std::shared_ptr<chrono::ChBodyAuxRef> rock,
                             const chrono::ChVector3d& grab_target_world,
                             const chrono::ChVector3d& place_target_world,
-                            double time) {
+                            double time,
+                            const std::array<double, 4>* grab_theta_override) {
     if (!rock) {
         m_target_rock.reset();
         m_status.command_seq = command_seq;
@@ -247,32 +339,39 @@ bool LrvArm::StartPickPlace(double command_seq,
     m_status.success = false;
     m_status.error_code = 0;
     m_target_rock = std::move(rock);
-    // Freeze the rock in place while the arm servos onto it: fixed so the
-    // multi-step approach cannot shove it, collision off so the arm passes
-    // through cleanly. The rig skips this rock in its collision activation
-    // (see GetActiveRock). It is unfrozen when the lock is applied (to lift)
-    // or when the grab is abandoned (RemoveRockLock).
+    // Freeze the rock in place while the arm servos onto it so the multi-step
+    // approach cannot shove it, but keep collision on like the Python path so
+    // the fingers cannot ghost through before the contact-triggered lock.
     m_target_rock->SetFixed(true);
-    m_target_rock->EnableCollision(false);
+    m_target_rock->EnableCollision(true);
     m_grab_target_world = grab_target_world;
     m_place_target_world = place_target_world;
+    m_dbg_base_pos0 = m_base->GetPos();
+    m_dbg_chassis_rot0 = m_chassis_body->GetRot();
     m_start_time = time;
     m_phase_time = time;
     m_next_tick = time;
     m_close_pos = 0.0;
     m_bent_arm = false;
+    m_contact_seen = false;
+    m_grab_theta_from_command = grab_theta_override != nullptr;
 
-    // Aim the initial IK at the rock plus the learned FK-vs-actual offset, so the
-    // arm reaches the rock directly. If that biased aim is out of reach, fall back
-    // to the raw target (the closed-loop APPROACH still corrects the rest).
-    chrono::ChVector3d biased_grab = m_grab_target_world + m_chassis_body->GetRot().Rotate(m_reach_bias);
-    if (!SolveIk(biased_grab, m_grab_theta)) {
-        biased_grab = m_grab_target_world;
+    chrono::ChVector3d biased_grab = m_grab_target_world;
+    if (grab_theta_override) {
+        m_grab_theta = *grab_theta_override;
+    } else {
+        // Aim the initial IK at the rock plus the learned FK-vs-actual offset, so the
+        // arm reaches the rock directly. If that biased aim is out of reach, fall back
+        // to the raw target (the closed-loop APPROACH still corrects the rest).
+        biased_grab = m_grab_target_world + m_chassis_body->GetRot().Rotate(m_reach_bias);
         if (!SolveIk(biased_grab, m_grab_theta)) {
-            std::cout << "[LrvArm] IK FAILED (grab) target=(" << m_grab_target_world.x() << ","
-                      << m_grab_target_world.y() << "," << m_grab_target_world.z() << ")\n";
-            FinishFailed(2);
-            return false;
+            biased_grab = m_grab_target_world;
+            if (!SolveIk(biased_grab, m_grab_theta)) {
+                std::cout << "[LrvArm] IK FAILED (grab) target=(" << m_grab_target_world.x() << ","
+                          << m_grab_target_world.y() << "," << m_grab_target_world.z() << ")\n";
+                FinishFailed(2);
+                return false;
+            }
         }
     }
 
@@ -283,8 +382,19 @@ bool LrvArm::StartPickPlace(double command_seq,
         return false;
     }
 
-    std::cout << "[LrvArm] IK OK grab_theta=(" << m_grab_theta[0] << "," << m_grab_theta[1] << ","
+    std::cout << "[LrvArm] " << (grab_theta_override ? "PYTHON IK" : "C++ IK")
+              << " OK grab_theta=(" << m_grab_theta[0] << "," << m_grab_theta[1] << ","
               << m_grab_theta[2] << "," << m_grab_theta[3] << ") -> starting APPROACH\n";
+    if (grab_theta_override) {
+        const chrono::ChCoordsys<> arm_frame(m_base->GetPos(), m_chassis_body->GetRot());
+        const chrono::ChVector3d target_local = arm_frame.TransformPointParentToLocal(m_grab_target_world);
+        const chrono::ChVector3d fk_local = ForwardKinematics(m_grab_theta);
+        const chrono::ChVector3d fk_residual = target_local - fk_local;
+        std::cout << "[LrvArm] PYTHON IK CHECK target_local=(" << target_local.x() << ","
+                  << target_local.y() << "," << target_local.z() << ")"
+                  << " fk=(" << fk_local.x() << "," << fk_local.y() << "," << fk_local.z() << ")"
+                  << " fk_err=" << fk_residual.Length() << "\n";
+    }
 
     m_ik_target = biased_grab;
     m_corrections = 0;
@@ -327,8 +437,31 @@ void LrvArm::Update(double time) {
         chrono::ChVector3d residual = m_grab_target_world - gc;
         const double err = residual.Length();
 
+        // DEBUG decomposition of the settled reach error (prints every settle tick):
+        //  base_moved  = how far the arm base drifted since grab start (chassis tilt/settle)
+        //  reach_now   = gripper vs FK(theta) in the CURRENT base frame (arm compliance/settle)
+        //  reach_start = gripper vs FK(theta) in the base frame at grab start (what Python solved for)
+        {
+            const chrono::ChVector3d fk_local = ForwardKinematics(m_grab_theta);
+            const chrono::ChVector3d fk_world_now = m_base->GetPos() + m_chassis_body->GetRot().Rotate(fk_local);
+            const chrono::ChVector3d fk_world_start = m_dbg_base_pos0 + m_dbg_chassis_rot0.Rotate(fk_local);
+            // Split base motion since grab start into translation (slide) vs rotation (tilt).
+            const double dpos = (m_base->GetPos() - m_dbg_base_pos0).Length();
+            const chrono::ChQuaternion<> drot = m_chassis_body->GetRot() * m_dbg_chassis_rot0.GetConjugate();
+            const double dtilt_deg = drot.GetRotVec().Length() * 180.0 / chrono::CH_PI;
+            // Gripper shift attributable purely to the base tilt (same fk_local, start pos):
+            const chrono::ChVector3d fk_world_tiltonly = m_dbg_base_pos0 + m_chassis_body->GetRot().Rotate(fk_local);
+            const double tilt_shift = (fk_world_tiltonly - fk_world_start).Length();
+            std::cout << "[LrvArm] DBG corr=" << m_corrections
+                      << " slide=" << dpos << " tilt_deg=" << dtilt_deg << " tilt_shift=" << tilt_shift
+                      << " reach_now=" << (gc - fk_world_now).Length()
+                      << " reach_start=" << (gc - fk_world_start).Length()
+                      << " |gripper-target|=" << err << "\n";
+        }
+
         // The systematic FK error is ~0.25 m; anything far larger means the IK
         // returned a wild pose and the arm flung out. Abort instead of flailing.
+        // (kept enabled so a diverged single-shot pose still fails cleanly)
         if (err > divergence_abort) {
             std::cout << "[LrvArm] IK DIVERGED (grab) err=" << err << " after " << m_corrections
                       << " corrections -> failing\n";
@@ -336,7 +469,10 @@ void LrvArm::Update(double time) {
             return;
         }
 
-        if (err >= reach_converge_tol && m_corrections < max_corrections) {
+        // Single-shot: trust Python's grab theta verbatim (no C++ re-solve) so the
+        // raw |gripper-target| stays visible and we can measure whether the base-
+        // motion fix actually lands the gripper. Drop the guard to restore the loop.
+        if (!m_grab_theta_from_command && err >= reach_converge_tol && m_corrections < max_corrections) {
             // Aim the IK beyond the target by the residual so the physically
             // settled gripper converges onto the rock (fixed-point correction).
             if (residual.Length() > max_correction_step)
@@ -356,7 +492,7 @@ void LrvArm::Update(double time) {
         const chrono::ChVector3d offset_local =
             m_chassis_body->GetRot().RotateBack(m_ik_target - m_grab_target_world);
         // If we converged, learn it so the next grab aims closer on the first move.
-        if (err < reach_converge_tol)
+        if (!m_grab_theta_from_command && err < reach_converge_tol)
             m_reach_bias = 0.4 * m_reach_bias + 0.6 * offset_local;
 
         const auto rref = m_target_rock ? m_target_rock->GetFrameRefToAbs().GetPos() : chrono::VNULL;
@@ -381,16 +517,21 @@ void LrvArm::Update(double time) {
         CommandFingerPosition(m_close_pos);
 
         const double actual_sep = (m_finger_1->GetPos() - m_finger_2->GetPos()).Length();
+        const double pad_force =
+            std::max(m_finger_1->GetContactForce().Length(), m_finger_2->GetContactForce().Length());
         const bool target_lockable =
             m_target_rock &&
             (m_target_rock->GetPos() - m_finger_1->GetPos()).Length() < lock_finger_dist &&
             (m_target_rock->GetPos() - m_finger_2->GetPos()).Length() < lock_finger_dist;
+        if (target_lockable && pad_force > grip_force_tol)
+            m_contact_seen = true;
 
-        if (target_lockable && actual_sep <= finger_grasp_sep) {
+        if (m_contact_seen && target_lockable && actual_sep <= finger_grasp_sep) {
             m_close_pos = std::min(finger_close_pos, 0.5 * (finger_open_sep - actual_sep) + 0.002);
             CommandFingerPosition(m_close_pos);
             if (TryLockRock()) {
-                std::cout << "[LrvArm] LOCKED t=" << time << " actual_sep=" << actual_sep << "\n";
+                std::cout << "[LrvArm] LOCKED t=" << time << " actual_sep=" << actual_sep
+                          << " pad_force=" << pad_force << "\n";
                 // Now bonded to the end-effector: unfreeze so it lifts with the
                 // arm, but keep collision off so it doesn't fight terrain/fingers.
                 m_target_rock->SetFixed(false);
@@ -408,6 +549,7 @@ void LrvArm::Update(double time) {
             std::cout << "[LrvArm] GRAB FAILED(3) t=" << time << " actual_sep=" << actual_sep
                       << " (grasp_sep=" << finger_grasp_sep << ")"
                       << " dist_finger1_rock=" << d1 << " dist_finger2_rock=" << d2
+                      << " pad_force=" << pad_force
                       << " (lock_dist=" << lock_finger_dist << ")\n";
             FinishFailed(3);
         }
@@ -472,6 +614,14 @@ bool LrvArm::IsBusy() const {
 
 ArmStatusSnapshot LrvArm::GetStatus() const {
     return m_status;
+}
+
+chrono::ChVector3d LrvArm::GetIkFramePos() const {
+    return m_base ? m_base->GetPos() : chrono::VNULL;
+}
+
+chrono::ChQuaternion<> LrvArm::GetIkFrameRot() const {
+    return m_chassis_body ? m_chassis_body->GetRot() : chrono::QUNIT;
 }
 
 std::shared_ptr<chrono::ChBodyAuxRef> LrvArm::GetActiveRock() const {

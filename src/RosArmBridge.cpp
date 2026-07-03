@@ -9,12 +9,11 @@ namespace amd_uw {
 
 namespace {
 
-// Fallback gripper-center height used only if a rock's measured height is
-// missing. With the per-rock height available (the common path) the gripper
-// aims at the rock's top plus this margin, reproducing the reference demo's
-// gripper-center-at-the-rock-top grasp for rocks of any size/mesh.
-constexpr double grab_height_fallback = 0.22;
-constexpr double grab_top_margin = 0.0;
+// Aim the grab target at the rock's actual center (rock.GetPos()) plus a tiny
+// vertical offset, so the target tracks each rock's real height instead of a
+// fixed height above terrain. Must match manipulator_controller's grab_z_offset_m
+// so the C++ target and the Python-solved theta agree.
+constexpr double grab_z_offset = 0.05;
 // Placement grid on the trailer bed, in the trailer's LOCAL frame (x = along the
 // trailer, y = across it). Rocks tile across a bounded grid that fits inside the
 // bed (~1.0 x 1.2 m) so they land on the bed at any heading, instead of a spread
@@ -61,6 +60,8 @@ RosArmBridge::RosArmBridge(int robot_id,
 
     m_executor = std::make_unique<rclcpp::executors::SingleThreadedExecutor>();
     m_node = rclcpp::Node::make_shared("chrono_robot_" + std::to_string(m_robot_id) + "_arm");
+    m_arm_base_pose_pub =
+        m_node->create_publisher<std_msgs::msg::Float64MultiArray>(TopicForRobot(m_robot_id, "arm_base_pose"), 10);
     m_arm_status_pub =
         m_node->create_publisher<std_msgs::msg::Float64MultiArray>(TopicForRobot(m_robot_id, "arm_status"), 10);
     m_arm_cmd_sub = m_node->create_subscription<std_msgs::msg::Float64MultiArray>(
@@ -82,6 +83,7 @@ RosArmBridge::~RosArmBridge() {
 
 void RosArmBridge::Synchronize(double time, chrono::vehicle::RigidTerrain& terrain) {
     m_executor->spin_some();
+    PublishArmBasePose();
 
     std::optional<ArmCommand> command;
     {
@@ -101,26 +103,21 @@ void RosArmBridge::Synchronize(double time, chrono::vehicle::RigidTerrain& terra
                                  time);
         } else {
             auto rock = m_rocks[command->target_index];
-            // Aim at the rock's geometric center (REF frame), not GetPos(), which
-            // for a ChBodyAuxRef is the center of mass -- offset from the visible
-            // center by the mesh's COM offset (and the rock's random yaw).
-            const auto rock_ref = rock->GetFrameRefToAbs().GetPos();
-            const double terrain_z =
-                terrain.GetHeight(chrono::ChVector3d(rock_ref.x(), rock_ref.y(), m_height_probe_z));
-            // Height above the ground: reach for this rock's actual top (per-mesh),
-            // falling back to the legacy fixed height only if it wasn't measured.
-            const double grab_z =
-                command->target_index < static_cast<int>(m_rock_top_heights.size())
-                    ? m_rock_top_heights[command->target_index] + grab_top_margin
-                    : grab_height_fallback;
-            const chrono::ChVector3d grab_target(rock_ref.x(), rock_ref.y(), terrain_z + grab_z);
+            const auto rock_pos = rock->GetPos();
+            // Target the rock's real center height plus a tiny offset (matches the
+            // Python controller), rather than a fixed height above the terrain.
+            const chrono::ChVector3d grab_target(rock_pos.x(), rock_pos.y(), rock_pos.z() + grab_z_offset);
             const chrono::ChVector3d place_target = PlacePoint(m_place_count);
             RCLCPP_INFO(m_node->get_logger(),
-                        "pickup start: target_index=%d rock_top_height=%.3f grab_z(rel ground)=%.3f "
-                        "grab_target=(%.3f, %.3f, %.3f) place_slot=%d place_target=(%.3f, %.3f, %.3f)",
-                        command->target_index, grab_z - grab_top_margin, grab_z, grab_target.x(),
-                        grab_target.y(), grab_target.z(), m_place_count, place_target.x(), place_target.y(),
-                        place_target.z());
+                        "pickup start: target_index=%d mode=rock_center+offset "
+                        "grab_z_offset=%.3f rock_z=%.3f grab_target=(%.3f, %.3f, %.3f) "
+                        "theta=(%.3f, %.3f, %.3f, %.3f) "
+                        "place_slot=%d place_target=(%.3f, %.3f, %.3f)",
+                        command->target_index, grab_z_offset, rock_pos.z(),
+                        grab_target.x(), grab_target.y(), grab_target.z(),
+                        command->grab_theta[0], command->grab_theta[1], command->grab_theta[2],
+                        command->grab_theta[3],
+                        m_place_count, place_target.x(), place_target.y(), place_target.z());
             // Carry + stability check: is the previously placed rock still on the
             // trailer (small dist, elevated), and is the trailer upright (up.z ~ 1)?
             if (m_inflight_rock && m_trailer && m_trailer->GetChassis()) {
@@ -140,7 +137,8 @@ void RosArmBridge::Synchronize(double time, chrono::vehicle::RigidTerrain& terra
                                  rock,
                                  grab_target,
                                  place_target,
-                                 time);
+                                 time,
+                                 &command->grab_theta);
             m_place_count++;
         }
     }
@@ -179,9 +177,9 @@ void RosArmBridge::Synchronize(double time, chrono::vehicle::RigidTerrain& terra
 }
 
 void RosArmBridge::OnArmCommand(const std_msgs::msg::Float64MultiArray::SharedPtr msg) {
-    if (msg->data.size() < 4) {
+    if (msg->data.size() < 8) {
         RCLCPP_WARN(m_node->get_logger(),
-                    "Ignoring arm_cmd; expected [command_seq, target_index, rock_x_global, rock_y_global].");
+                    "Ignoring arm_cmd; expected [command_seq, target_index, rock_x_global, rock_y_global, theta1..theta4].");
         return;
     }
 
@@ -190,9 +188,26 @@ void RosArmBridge::OnArmCommand(const std_msgs::msg::Float64MultiArray::SharedPt
     command.target_index = static_cast<int>(std::llround(msg->data[1]));
     command.rock_x = msg->data[2];
     command.rock_y = msg->data[3];
+    command.grab_theta = {msg->data[4], msg->data[5], msg->data[6], msg->data[7]};
 
     std::lock_guard<std::mutex> lock(m_command_mutex);
     m_pending_command = command;
+}
+
+void RosArmBridge::PublishArmBasePose() {
+    const auto pos = m_arm.GetIkFramePos();
+    const auto rot = m_arm.GetIkFrameRot();
+    std_msgs::msg::Float64MultiArray msg;
+    msg.data = {
+        pos.x(),
+        pos.y(),
+        pos.z(),
+        rot.e0(),
+        rot.e1(),
+        rot.e2(),
+        rot.e3(),
+    };
+    m_arm_base_pose_pub->publish(msg);
 }
 
 void RosArmBridge::PublishStatus() {

@@ -4,6 +4,7 @@
 #include <cmath>
 
 #include "chrono/core/ChQuaternion.h"
+#include "std_msgs/msg/multi_array_dimension.hpp"
 
 namespace amd_uw {
 
@@ -109,15 +110,21 @@ void RosControllerDriver::PublishTelemetry() {
         pos.y(),
         yaw,
         m_vehicle.GetSpeed(),
+        pos.z(),
     };
     m_ego_state_pub->publish(ego_state);
 
     std_msgs::msg::Float64MultiArray target_pos;
-    target_pos.data.reserve(2 * m_rocks.size());
+    target_pos.layout.dim.resize(1);
+    target_pos.layout.dim[0].label = "xyz";
+    target_pos.layout.dim[0].size = m_rocks.size();
+    target_pos.layout.dim[0].stride = 3 * m_rocks.size();
+    target_pos.data.reserve(3 * m_rocks.size());
     for (const auto& rock : m_rocks) {
         const auto rock_pos = rock->GetPos();
         target_pos.data.push_back(rock_pos.x());
         target_pos.data.push_back(rock_pos.y());
+        target_pos.data.push_back(rock_pos.z());
     }
     m_target_pos_pub->publish(target_pos);
 }

@@ -104,16 +104,44 @@ def pickup_request(target_index=0):
     return msg
 
 
+def ego_state():
+    msg = Float64MultiArray()
+    msg.data = [0.0, 0.0, 0.0, 0.0, 0.5]
+    return msg
+
+
+def arm_base_pose():
+    msg = Float64MultiArray()
+    msg.data = [0.0, 0.0, 0.6, 1.0, 0.0, 0.0, 0.0]
+    return msg
+
+
 def arm_status(command_seq, state, target_index, success, error_code):
     msg = Float64MultiArray()
     msg.data = [float(command_seq), float(state), float(target_index), float(success), float(error_code)]
     return msg
 
 
+class FakeIkSolver:
+    def inverse_kinematics_solver(self, *_args, **_kwargs):
+        return [0.1, 0.2, -0.3, -0.4]
+
+    def forward_kinematics(self, *_args, **_kwargs):
+        return [1.0, 2.0, 0.0]
+
+
+def ready_node(module):
+    node = module.ManipulatorController()
+    node.ik_solver = FakeIkSolver()
+    node.on_ego_state(ego_state())
+    node.on_arm_base_pose(arm_base_pose())
+    return node
+
+
 class ManipulatorControllerTest(unittest.TestCase):
     def test_pickup_request_is_deduplicated_by_active_target(self):
         module = import_controller_with_fakes()
-        node = module.ManipulatorController()
+        node = ready_node(module)
 
         node.on_pickup_request(pickup_request(0))
         node.on_pickup_request(pickup_request(0))
@@ -121,11 +149,11 @@ class ManipulatorControllerTest(unittest.TestCase):
         self.assertEqual(len(node.arm_cmd_pub.messages), 1)
         command_seq = node.arm_cmd_pub.messages[0].data[0]
         self.assertGreater(command_seq, 0.0)
-        self.assertEqual(node.arm_cmd_pub.messages[0].data[1:], [0.0, 1.0, 2.0])
+        self.assertEqual(node.arm_cmd_pub.messages[0].data[1:], [0.0, 1.0, 2.0, 0.1, 0.2, -0.3, -0.4])
 
     def test_done_status_publishes_target_done(self):
         module = import_controller_with_fakes()
-        node = module.ManipulatorController()
+        node = ready_node(module)
 
         node.on_pickup_request(pickup_request(0))
         command_seq = node.arm_cmd_pub.messages[0].data[0]
@@ -137,7 +165,7 @@ class ManipulatorControllerTest(unittest.TestCase):
 
     def test_active_command_republishes_until_status_is_seen(self):
         module = import_controller_with_fakes()
-        node = module.ManipulatorController()
+        node = ready_node(module)
         now_s = 0.0
         node.now_seconds = lambda: now_s
 
@@ -147,7 +175,7 @@ class ManipulatorControllerTest(unittest.TestCase):
         node.on_timer()
 
         self.assertEqual(len(node.arm_cmd_pub.messages), 2)
-        self.assertEqual(node.arm_cmd_pub.messages[1].data, [command_seq, 0.0, 1.0, 2.0])
+        self.assertEqual(node.arm_cmd_pub.messages[1].data, [command_seq, 0.0, 1.0, 2.0, 0.1, 0.2, -0.3, -0.4])
 
         node.on_arm_status(arm_status(command_seq, module.ARM_STATE_BUSY, 0, 0, 0))
         now_s = 2.2
@@ -157,7 +185,7 @@ class ManipulatorControllerTest(unittest.TestCase):
 
     def test_failed_status_is_skipped_by_default(self):
         module = import_controller_with_fakes()
-        node = module.ManipulatorController()
+        node = ready_node(module)
 
         node.on_pickup_request(pickup_request(0))
         command_seq = node.arm_cmd_pub.messages[0].data[0]

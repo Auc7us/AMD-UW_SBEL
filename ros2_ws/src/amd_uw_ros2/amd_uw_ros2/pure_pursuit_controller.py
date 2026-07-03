@@ -64,9 +64,23 @@ class PurePursuitController(Node):
         self.declare_parameter("pickup_angle_min_deg", 60.0)
         self.declare_parameter("pickup_angle_max_deg", 100.0)
         self.declare_parameter("pickup_slowdown_offset_m", 10.0)
-        self.declare_parameter("pickup_min_approach_speed_mps", 2.0)
-        self.declare_parameter("pickup_boundary_speed_mps", 2.0)
+        # Crawl into the pickup zone so a real full stop is reachable: on low-traction
+        # lunar terrain a rover entering at 2 m/s just slides with the wheels locked
+        # and never settles. Ramp down to a slow boundary speed and allow it to reach
+        # ~0 at the boundary (min approach floor = 0).
+        self.declare_parameter("pickup_min_approach_speed_mps", 0.0)
+        self.declare_parameter("pickup_boundary_speed_mps", 0.5)
         self.declare_parameter("pickup_request_rate_hz", 1.0)
+        # Only request a pickup once the chassis has actually come to a FULL STOP:
+        # the arm IK is solved for the base pose at request time, and the rover
+        # coasts after the wheels brake (low lunar traction), so requesting while
+        # still moving leaves the gripper short of the rock. "Full stop" = speed at
+        # or below stop_speed held continuously for stop_dwell_s (so we fire at rest,
+        # not while still decelerating through the threshold). stop_timeout_s is a
+        # safety fallback so a rover that can't fully settle still proceeds.
+        self.declare_parameter("pickup_stop_speed_mps", 0.05)
+        self.declare_parameter("pickup_stop_dwell_s", 0.4)
+        self.declare_parameter("pickup_stop_timeout_s", 10.0)
         self.declare_parameter("post_done_straighten_time_s", 0.75)
 
         self.robot_id = int(self.get_parameter("robot_id").value)
@@ -77,13 +91,15 @@ class PurePursuitController(Node):
         self.command_topic = f"/robot_{self.robot_id}/vehicle_cmd"
 
         self.state: Optional[RobotState] = None
-        self.targets: List[Tuple[float, float]] = []
+        self.targets: List[Tuple[float, float, float]] = []
         self.target_index = -1
         self.completed_targets: Set[int] = set()
         self.drive_target_index = -1
         self.drive_target_offset = (0.0, 0.0)
         self.have_targets = False
         self.waiting_for_target_done = False
+        self.stop_dwell_s = 0.0                    # how long we've been at/below stop_speed
+        self.wait_start_s: Optional[float] = None  # when we began waiting at this target
         self.straighten_until_time_s: Optional[float] = None
         self.last_pickup_request_time_s: Optional[float] = None
         self.last_pickup_request_index = -1
@@ -119,14 +135,25 @@ class PurePursuitController(Node):
         )
 
     def on_target_pos(self, msg: Float64MultiArray) -> None:
-        if len(msg.data) % 2 != 0:
-            self.get_logger().warn("Ignoring targetPos message; expected [x0, y0, x1, y1, ...].")
-            return
+        layout_dims = getattr(getattr(msg, "layout", None), "dim", [])
+        is_xyz = bool(layout_dims and getattr(layout_dims[0], "label", "") == "xyz")
 
-        targets = [
-            (float(msg.data[i]), float(msg.data[i + 1]))
-            for i in range(0, len(msg.data), 2)
-        ]
+        if is_xyz:
+            if len(msg.data) % 3 != 0:
+                self.get_logger().warn("Ignoring targetPos xyz message; expected [x0, y0, z0, ...].")
+                return
+            targets = [
+                (float(msg.data[i]), float(msg.data[i + 1]), float(msg.data[i + 2]))
+                for i in range(0, len(msg.data), 3)
+            ]
+        else:
+            if len(msg.data) % 2 != 0:
+                self.get_logger().warn("Ignoring targetPos message; expected [x0, y0, x1, y1, ...].")
+                return
+            targets = [
+                (float(msg.data[i]), float(msg.data[i + 1]), 0.0)
+                for i in range(0, len(msg.data), 2)
+            ]
 
         if not targets:
             return
@@ -154,6 +181,8 @@ class PurePursuitController(Node):
         self.target_index = -1
         self.drive_target_index = -1
         self.waiting_for_target_done = False
+        self.stop_dwell_s = 0.0
+        self.wait_start_s = None
         self.last_pickup_request_time_s = None
         self.last_pickup_request_index = -1
         self.ramped_target_speed = 0.0
@@ -161,6 +190,18 @@ class PurePursuitController(Node):
         self.straighten_until_time_s = (
             self.now_seconds() + max(0.0, float(self.get_parameter("post_done_straighten_time_s").value))
         )
+
+    def update_stop_dwell(self) -> None:
+        """Accumulate time the chassis has been at/below the stop speed (reset if it moves)."""
+        stop_speed = float(self.get_parameter("pickup_stop_speed_mps").value)
+        if self.state is not None and abs(self.state.speed) <= stop_speed:
+            self.stop_dwell_s += self.dt
+        else:
+            self.stop_dwell_s = 0.0
+
+    def is_fully_stopped(self) -> bool:
+        """True once the chassis has held the stop speed continuously for the dwell time."""
+        return self.stop_dwell_s >= float(self.get_parameter("pickup_stop_dwell_s").value)
 
     def on_timer(self) -> None:
         if self.state is None or not self.targets:
@@ -174,9 +215,23 @@ class PurePursuitController(Node):
             return
 
         if self.waiting_for_target_done:
-            self.publish_pickup_request_if_due()
+            # Hold full brake and wait for a confirmed full stop before triggering the
+            # grab. Send the pickup request exactly once per target; a timeout is a
+            # safety net so a rover that can't perfectly settle still proceeds.
             self.command = self.ramp_command(VehicleCommand(steering=0.0, throttle=0.0, brake=1.0))
             self.publish_command(self.command)
+            self.update_stop_dwell()
+            if self.last_pickup_request_index != self.target_index:
+                waited = self.now_seconds() - (self.wait_start_s or self.now_seconds())
+                timed_out = waited >= float(self.get_parameter("pickup_stop_timeout_s").value)
+                if self.is_fully_stopped() or timed_out:
+                    self.publish_pickup_request_if_due(force=True)
+                    self.get_logger().info(
+                        f"targetPos[{self.target_index}] full stop "
+                        f"(speed={self.state.speed:.3f} m/s, dwell={self.stop_dwell_s:.2f}s"
+                        f"{', TIMEOUT' if timed_out and not self.is_fully_stopped() else ''}); "
+                        f"sent pickup request."
+                    )
             return
 
         switch_radius = max(0.0, float(self.get_parameter("switch_radius_m").value))
@@ -194,8 +249,12 @@ class PurePursuitController(Node):
                 f"targetPos[{self.target_index}] is in pickup sector "
                 f"(rear-reference angle={rock_angle_deg:.1f} deg); waiting for {self.target_done_topic}=true."
             )
+            # Latch into the wait state and just brake. The pickup request is NOT sent
+            # here -- it is deferred to the waiting-state handler above, which fires it
+            # once only after a confirmed full stop. Reset the stop dwell / wait clock.
             self.waiting_for_target_done = True
-            self.publish_pickup_request_if_due(force=True)
+            self.stop_dwell_s = 0.0
+            self.wait_start_s = self.now_seconds()
             self.command = self.ramp_command(VehicleCommand(steering=0.0, throttle=0.0, brake=1.0))
             self.publish_command(self.command)
             return
@@ -234,7 +293,7 @@ class PurePursuitController(Node):
             key=lambda i: math.hypot(self.targets[i][0] - self.state.x, self.targets[i][1] - self.state.y),
         )
         self.drive_target_index = -1
-        target_x, target_y = self.targets[self.target_index]
+        target_x, target_y, _target_z = self.targets[self.target_index]
         distance = math.hypot(target_x - self.state.x, target_y - self.state.y)
         self.get_logger().info(
             f"Selected nearest targetPos[{self.target_index}] at ({target_x:.2f}, {target_y:.2f}), "
@@ -243,7 +302,7 @@ class PurePursuitController(Node):
         return True
 
     def get_drive_target(self) -> Tuple[float, float]:
-        rock_x, rock_y = self.targets[self.target_index]
+        rock_x, rock_y, _rock_z = self.targets[self.target_index]
         if self.drive_target_index != self.target_index:
             self.drive_target_offset = self.compute_rock_side_offset(rock_x, rock_y)
             self.drive_target_index = self.target_index
@@ -344,9 +403,9 @@ class PurePursuitController(Node):
         ):
             return
 
-        rock_x, rock_y = self.targets[self.target_index]
+        rock_x, rock_y, rock_z = self.targets[self.target_index]
         msg = Float64MultiArray()
-        msg.data = [float(self.target_index), rock_x, rock_y]
+        msg.data = [float(self.target_index), rock_x, rock_y, rock_z]
         self.pickup_request_pub.publish(msg)
         self.last_pickup_request_time_s = now
         self.last_pickup_request_index = self.target_index
@@ -359,7 +418,7 @@ class PurePursuitController(Node):
         )
 
     def rock_angle_from_rear_reference_deg(self) -> float:
-        rock_x, rock_y = self.targets[self.target_index]
+        rock_x, rock_y, _rock_z = self.targets[self.target_index]
         ref_x, ref_y = self.rear_reference_position()
         return math.degrees(wrap_to_pi(math.atan2(rock_y - ref_y, rock_x - ref_x) - self.state.yaw))
 

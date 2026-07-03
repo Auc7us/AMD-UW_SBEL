@@ -36,10 +36,13 @@ class LrvArm {
                         std::shared_ptr<chrono::ChBodyAuxRef> rock,
                         const chrono::ChVector3d& grab_target_world,
                         const chrono::ChVector3d& place_target_world,
-                        double time);
+                        double time,
+                        const std::array<double, 4>* grab_theta_override = nullptr);
     void Update(double time);
     bool IsBusy() const;
     ArmStatusSnapshot GetStatus() const;
+    chrono::ChVector3d GetIkFramePos() const;
+    chrono::ChQuaternion<> GetIkFrameRot() const;
 
     // The rock the arm is currently positioning onto / holding, if any. While
     // non-null the arm owns this rock's fixed/collision state (it is frozen so
@@ -100,6 +103,12 @@ class LrvArm {
     double m_close_pos = 0.0;
     double m_lift_angle = 0.0;
     bool m_bent_arm = false;
+    bool m_contact_seen = false;
+    bool m_grab_theta_from_command = false;
+
+    // DEBUG: base pose captured at grab start, to decompose the settled reach error.
+    chrono::ChVector3d m_dbg_base_pos0;
+    chrono::ChQuaternion<> m_dbg_chassis_rot0;
 };
 
 }  // namespace amd_uw

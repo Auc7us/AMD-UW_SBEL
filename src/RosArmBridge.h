@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -39,9 +40,11 @@ class RosArmBridge {
         int target_index = -1;
         double rock_x = 0.0;
         double rock_y = 0.0;
+        std::array<double, 4> grab_theta = {0.0, 0.0, 0.0, 0.0};
     };
 
     void OnArmCommand(const std_msgs::msg::Float64MultiArray::SharedPtr msg);
+    void PublishArmBasePose();
     void PublishStatus();
     chrono::ChVector3d PlacePoint(int slot) const;
 
@@ -61,6 +64,7 @@ class RosArmBridge {
     rclcpp::Node::SharedPtr m_node;
     std::unique_ptr<rclcpp::executors::SingleThreadedExecutor> m_executor;
     rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr m_arm_cmd_sub;
+    rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr m_arm_base_pose_pub;
     rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr m_arm_status_pub;
 
     std::mutex m_command_mutex;
