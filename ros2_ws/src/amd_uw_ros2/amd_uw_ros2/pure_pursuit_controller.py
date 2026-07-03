@@ -69,7 +69,7 @@ class PurePursuitController(Node):
         # and never settles. Ramp down to a slow boundary speed and allow it to reach
         # ~0 at the boundary (min approach floor = 0).
         self.declare_parameter("pickup_min_approach_speed_mps", 0.0)
-        self.declare_parameter("pickup_boundary_speed_mps", 0.5)
+        self.declare_parameter("pickup_boundary_speed_mps", 1.0)
         self.declare_parameter("pickup_request_rate_hz", 1.0)
         # Only request a pickup once the chassis has actually come to a FULL STOP:
         # the arm IK is solved for the base pose at request time, and the rover
