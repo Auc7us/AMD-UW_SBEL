@@ -58,8 +58,6 @@ class LrvArm {
     void OpenGripper();
     bool TryLockRock();
     void RemoveRockLock();
-    bool SolveIk(const chrono::ChVector3d& target_world, std::array<double, 4>& theta) const;
-    chrono::ChVector3d ForwardKinematics(const std::array<double, 4>& theta) const;
     chrono::ChVector3d GripperCenter() const;
     void FinishDone();
     void FinishFailed(int error_code);
@@ -90,12 +88,6 @@ class LrvArm {
     std::shared_ptr<chrono::ChLinkLockLock> m_rock_lock;
     chrono::ChVector3d m_grab_target_world;
     chrono::ChVector3d m_place_target_world;
-    chrono::ChVector3d m_ik_target;  // world point currently fed to IK (closed-loop corrected)
-    int m_corrections = 0;           // closed-loop reach corrections applied this grab
-    // Learned systematic FK-vs-actual gripper offset (in the arm/chassis frame),
-    // pre-applied to the initial IK aim so the arm reaches the rock directly
-    // instead of visibly overshooting and correcting on every grab.
-    chrono::ChVector3d m_reach_bias{0.0, 0.0, 0.0};
     std::array<double, 4> m_grab_theta = {0.0, 0.0, 0.0, 0.0};
     std::array<double, 4> m_place_theta = {0.0, 0.0, 0.0, 0.0};
     double m_start_time = 0.0;
@@ -105,11 +97,6 @@ class LrvArm {
     double m_lift_angle = 0.0;
     bool m_bent_arm = false;
     bool m_contact_seen = false;
-    bool m_grab_theta_from_command = false;
-
-    // DEBUG: base pose captured at grab start, to decompose the settled reach error.
-    chrono::ChVector3d m_dbg_base_pos0;
-    chrono::ChQuaternion<> m_dbg_chassis_rot0;
 };
 
 }  // namespace amd_uw

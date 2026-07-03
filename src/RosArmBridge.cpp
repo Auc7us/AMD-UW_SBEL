@@ -18,11 +18,6 @@ constexpr double grab_z_offset = 0.05;
 // trailer, y = across it). Rocks tile across a bounded grid that fits inside the
 // bed (~1.0 x 1.2 m) so they land on the bed at any heading, instead of a spread
 // tied to the whole rock field that flung them meters off to the side.
-// Welding placed rocks to the trailer keeps them from being left behind, but a
-// rigid rock locked to the suspended trailer chassis destabilizes it (rolls a
-// wheel up and flips under drive). Disabled until carry is done a stable way
-// (e.g. near-massless rock, or a proper hinged bed like the Python demo).
-constexpr bool enable_bed_weld = false;
 constexpr double place_height = 0.5;  // local-z release height above the bed
 constexpr int place_cols = 4;         // lateral slots (across the bed, y)
 constexpr int place_rows = 4;         // longitudinal slots (along the bed, x)
@@ -149,32 +144,14 @@ void RosArmBridge::Synchronize(double time, chrono::vehicle::RigidTerrain& terra
 
     m_arm.Update(time);
 
-    // On a successful place, weld the rock to the trailer so it rides along
-    // instead of being left behind (the bed is teleported and can't carry it by
-    // friction). Keep it awake so it doesn't freeze mid-air after settling.
+    // On a successful place, keep the dropped rock awake so it doesn't settle-
+    // freeze on the bed when the trailer next stops.
     const auto status = m_arm.GetStatus();
     if (status.state == 2 && status.success && status.command_seq == m_last_started_seq &&
-        m_welded_seq != m_last_started_seq && m_inflight_rock && m_trailer && m_trailer->GetChassis()) {
-        // Keep the placed rock awake so it rides the dynamic bed via friction
-        // instead of napping and freezing in place when the trailer next stops.
+        m_placed_seq != m_last_started_seq && m_inflight_rock) {
         m_inflight_rock->SetSleepingAllowed(false);
         m_inflight_rock->SetSleeping(false);
-
-        if (enable_bed_weld) {
-            auto chassis = m_trailer->GetChassis()->GetBody();
-            if (auto* sys = chassis->GetSystem()) {
-                auto weld = chrono_types::make_shared<chrono::ChLinkLockLock>();
-                weld->Initialize(chassis, m_inflight_rock,
-                                 chrono::ChFramed(m_inflight_rock->GetPos(), chrono::QUNIT));
-                sys->AddLink(weld);
-                m_inflight_rock->EnableCollision(false);
-                m_bed_welds.push_back(weld);
-                m_welded_rocks.push_back(m_inflight_rock);
-                RCLCPP_INFO(m_node->get_logger(), "welded placed rock to trailer (total on bed: %zu)",
-                            m_bed_welds.size());
-            }
-        }
-        m_welded_seq = m_last_started_seq;  // handled this placement once
+        m_placed_seq = m_last_started_seq;  // handled this placement once
     }
 
     PublishStatus();

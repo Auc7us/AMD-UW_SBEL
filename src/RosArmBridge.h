@@ -9,7 +9,6 @@
 #include "LrvArm.h"
 
 #include "chrono/physics/ChBodyAuxRef.h"
-#include "chrono/physics/ChLinkLock.h"
 #include "chrono_vehicle/terrain/RigidTerrain.h"
 #include "chrono_vehicle/wheeled_vehicle/vehicle/WheeledTrailer.h"
 
@@ -29,10 +28,6 @@ class RosArmBridge {
     ~RosArmBridge();
 
     void Synchronize(double time, chrono::vehicle::RigidTerrain& terrain);
-
-    // Rocks welded to the trailer bed (collision managed here). The rig must not
-    // re-toggle their collision in its distance-based activation.
-    const std::vector<std::shared_ptr<chrono::ChBodyAuxRef>>& WeldedRocks() const { return m_welded_rocks; }
 
   private:
     struct ArmCommand {
@@ -60,9 +55,7 @@ class RosArmBridge {
     double m_last_started_seq = -1.0;
     int m_place_count = 0;  // rocks dispatched to placement so far (grid slot index)
     std::shared_ptr<chrono::ChBodyAuxRef> m_inflight_rock;     // rock of the active pick/place
-    double m_welded_seq = -2.0;                                // command_seq already welded
-    std::vector<std::shared_ptr<chrono::ChLinkLockLock>> m_bed_welds;  // placed rocks welded to trailer
-    std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> m_welded_rocks;  // rocks welded to the bed
+    double m_placed_seq = -2.0;                                // command_seq whose drop was handled
 
     rclcpp::Node::SharedPtr m_node;
     std::unique_ptr<rclcpp::executors::SingleThreadedExecutor> m_executor;

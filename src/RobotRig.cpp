@@ -403,15 +403,6 @@ void RobotRig::UpdateRockCollisionActivation() {
     for (const auto& rock : m_rocks) {
         if (rock == active_rock)
             continue;
-#ifdef AMD_UW_ENABLE_ROS2
-        // Rocks welded to the trailer bed have their collision managed by the
-        // arm bridge; leave them alone.
-        if (m_arm_bridge) {
-            const auto& welded = m_arm_bridge->WeldedRocks();
-            if (std::find(welded.begin(), welded.end(), rock) != welded.end())
-                continue;
-        }
-#endif
         const auto rock_pos = rock->GetPos();
         const double dist2 = std::min(PlanarDistance2(rock_pos, vehicle_pos), PlanarDistance2(rock_pos, trailer_pos));
         if (!rock->IsCollisionEnabled() && dist2 <= activate2) {

@@ -7,8 +7,6 @@
 #include <stdexcept>
 #include <string>
 
-#include <Eigen/Dense>
-
 #include "chrono/assets/ChVisualShapeModelFile.h"
 #include "chrono/collision/ChCollisionShapeBox.h"
 #include "chrono/core/ChFrame.h"
@@ -23,25 +21,13 @@ namespace amd_uw {
 
 namespace {
 
-constexpr double arm_link_a1 = 0.32516;
-constexpr double arm_link_a2 = 1.27;
-constexpr double arm_link_a3 = 1.143;
-constexpr double arm_link_a4 = 0.3577;
-
 constexpr double approach_2_time = 1.0;
-constexpr double grasp_reach_tol = 0.15;
 constexpr double close_timeout = 8.0;
-// Closed-loop reach correction. FK(theta) and the physically settled gripper
-// disagree by ~0.25 m in this rig; the reference demo hides this by recording
-// the actual settled pose and placing the rock there. Here the rock is fixed,
-// so instead we iterate: settle, measure the gripper error, and nudge the IK
-// target by that residual until the real gripper lands on the rock.
+// APPROACH settle gating: judge the pose only once the gripper has actually
+// arrived and quieted, then sanity-check the reach.
 constexpr double approach_min_settle = 0.4;  // min time at a pose before judging it
 constexpr double settle_speed_tol = 0.05;    // gripper speed (m/s) below which it's "settled"
-constexpr int max_corrections = 8;           // cap on correction iterations
-constexpr double reach_converge_tol = 0.04;  // stop correcting within 4 cm
-constexpr double max_correction_step = 0.6;  // clamp a single residual nudge
-constexpr double divergence_abort = 1.0;     // gripper this far off => IK blew up, fail
+constexpr double divergence_abort = 1.0;     // gripper this far off the target => bad pose, fail
 constexpr double control_dt = 0.01;
 constexpr double finger_open_sep = 0.388;
 constexpr double finger_close_pos = 0.145;
@@ -347,62 +333,33 @@ bool LrvArm::StartPickPlace(double command_seq,
     m_target_rock->EnableCollision(true);
     m_grab_target_world = grab_target_world;
     m_place_target_world = place_target_world;
-    m_dbg_base_pos0 = m_base->GetPos();
-    m_dbg_chassis_rot0 = m_chassis_body->GetRot();
     m_start_time = time;
     m_phase_time = time;
     m_next_tick = time;
     m_close_pos = 0.0;
     m_bent_arm = false;
     m_contact_seen = false;
-    m_grab_theta_from_command = grab_theta_override != nullptr;
 
-    chrono::ChVector3d biased_grab = m_grab_target_world;
-    if (grab_theta_override) {
-        m_grab_theta = *grab_theta_override;
-    } else {
-        // Aim the initial IK at the rock plus the learned FK-vs-actual offset, so the
-        // arm reaches the rock directly. If that biased aim is out of reach, fall back
-        // to the raw target (the closed-loop APPROACH still corrects the rest).
-        biased_grab = m_grab_target_world + m_chassis_body->GetRot().Rotate(m_reach_bias);
-        if (!SolveIk(biased_grab, m_grab_theta)) {
-            biased_grab = m_grab_target_world;
-            if (!SolveIk(biased_grab, m_grab_theta)) {
-                std::cout << "[LrvArm] IK FAILED (grab) target=(" << m_grab_target_world.x() << ","
-                          << m_grab_target_world.y() << "," << m_grab_target_world.z() << ")\n";
-                FinishFailed(2);
-                return false;
-            }
-        }
-    }
-
-    // Prefer the Python-solved place pose (same IK as the grab); fall back to the
-    // C++ SolveIk only if none was provided.
-    if (place_theta_override) {
-        m_place_theta = *place_theta_override;
-    } else if (!SolveIk(m_place_target_world, m_place_theta)) {
-        std::cout << "[LrvArm] IK FAILED (place) target=(" << m_place_target_world.x() << ","
-                  << m_place_target_world.y() << "," << m_place_target_world.z() << ")\n";
+    // Python is the sole IK authority: both the grab and place poses must arrive
+    // in the arm_cmd. The C++ IK and closed-loop reach correction have been
+    // removed, so a command that is missing a solved pose fails cleanly instead
+    // of silently self-solving with a different solver/frame.
+    if (!grab_theta_override) {
+        std::cout << "[LrvArm] no grab theta in command -> failing (C++ IK removed)\n";
         FinishFailed(2);
         return false;
     }
-
-    std::cout << "[LrvArm] " << (grab_theta_override ? "PYTHON IK" : "C++ IK")
-              << " OK grab_theta=(" << m_grab_theta[0] << "," << m_grab_theta[1] << ","
-              << m_grab_theta[2] << "," << m_grab_theta[3] << ") -> starting APPROACH\n";
-    if (grab_theta_override) {
-        const chrono::ChCoordsys<> arm_frame(m_base->GetPos(), m_chassis_body->GetRot());
-        const chrono::ChVector3d target_local = arm_frame.TransformPointParentToLocal(m_grab_target_world);
-        const chrono::ChVector3d fk_local = ForwardKinematics(m_grab_theta);
-        const chrono::ChVector3d fk_residual = target_local - fk_local;
-        std::cout << "[LrvArm] PYTHON IK CHECK target_local=(" << target_local.x() << ","
-                  << target_local.y() << "," << target_local.z() << ")"
-                  << " fk=(" << fk_local.x() << "," << fk_local.y() << "," << fk_local.z() << ")"
-                  << " fk_err=" << fk_residual.Length() << "\n";
+    if (!place_theta_override) {
+        std::cout << "[LrvArm] no place theta in command -> failing (C++ IK removed)\n";
+        FinishFailed(2);
+        return false;
     }
+    m_grab_theta = *grab_theta_override;
+    m_place_theta = *place_theta_override;
 
-    m_ik_target = biased_grab;
-    m_corrections = 0;
+    std::cout << "[LrvArm] grab_theta=(" << m_grab_theta[0] << "," << m_grab_theta[1] << ","
+              << m_grab_theta[2] << "," << m_grab_theta[3] << ") -> starting APPROACH\n";
+
     CommandJointAngles({m_grab_theta[0], m_grab_theta[1], 0.0, 0.0});
     m_phase = Phase::APPROACH;
     return true;
@@ -439,74 +396,21 @@ void LrvArm::Update(double time) {
 
         // Measure the actual settled gripper error against the true rock target.
         const auto gc = GripperCenter();
-        chrono::ChVector3d residual = m_grab_target_world - gc;
-        const double err = residual.Length();
+        const double err = (m_grab_target_world - gc).Length();
 
-        // DEBUG decomposition of the settled reach error (prints every settle tick):
-        //  base_moved  = how far the arm base drifted since grab start (chassis tilt/settle)
-        //  reach_now   = gripper vs FK(theta) in the CURRENT base frame (arm compliance/settle)
-        //  reach_start = gripper vs FK(theta) in the base frame at grab start (what Python solved for)
-        {
-            const chrono::ChVector3d fk_local = ForwardKinematics(m_grab_theta);
-            const chrono::ChVector3d fk_world_now = m_base->GetPos() + m_chassis_body->GetRot().Rotate(fk_local);
-            const chrono::ChVector3d fk_world_start = m_dbg_base_pos0 + m_dbg_chassis_rot0.Rotate(fk_local);
-            // Split base motion since grab start into translation (slide) vs rotation (tilt).
-            const double dpos = (m_base->GetPos() - m_dbg_base_pos0).Length();
-            const chrono::ChQuaternion<> drot = m_chassis_body->GetRot() * m_dbg_chassis_rot0.GetConjugate();
-            const double dtilt_deg = drot.GetRotVec().Length() * 180.0 / chrono::CH_PI;
-            // Gripper shift attributable purely to the base tilt (same fk_local, start pos):
-            const chrono::ChVector3d fk_world_tiltonly = m_dbg_base_pos0 + m_chassis_body->GetRot().Rotate(fk_local);
-            const double tilt_shift = (fk_world_tiltonly - fk_world_start).Length();
-            std::cout << "[LrvArm] DBG corr=" << m_corrections
-                      << " slide=" << dpos << " tilt_deg=" << dtilt_deg << " tilt_shift=" << tilt_shift
-                      << " reach_now=" << (gc - fk_world_now).Length()
-                      << " reach_start=" << (gc - fk_world_start).Length()
-                      << " |gripper-target|=" << err << "\n";
-        }
-
-        // The systematic FK error is ~0.25 m; anything far larger means the IK
-        // returned a wild pose and the arm flung out. Abort instead of flailing.
-        // (kept enabled so a diverged single-shot pose still fails cleanly)
+        // A grab pose Python solved should settle near the rock. A gross miss means
+        // the pose was bad (unreachable / wrong frame); fail cleanly instead of
+        // clamping the fingers onto empty space.
         if (err > divergence_abort) {
-            std::cout << "[LrvArm] IK DIVERGED (grab) err=" << err << " after " << m_corrections
-                      << " corrections -> failing\n";
+            std::cout << "[LrvArm] grab pose diverged err=" << err << " -> failing\n";
             FinishFailed(2);
             return;
         }
 
-        // Single-shot: trust Python's grab theta verbatim (no C++ re-solve) so the
-        // raw |gripper-target| stays visible and we can measure whether the base-
-        // motion fix actually lands the gripper. Drop the guard to restore the loop.
-        if (!m_grab_theta_from_command && err >= reach_converge_tol && m_corrections < max_corrections) {
-            // Aim the IK beyond the target by the residual so the physically
-            // settled gripper converges onto the rock (fixed-point correction).
-            if (residual.Length() > max_correction_step)
-                residual *= max_correction_step / residual.Length();
-            m_ik_target += residual;
-            std::array<double, 4> corrected;
-            if (SolveIk(m_ik_target, corrected)) {
-                m_grab_theta = corrected;
-                CommandJointAngles(m_grab_theta);
-            }
-            m_corrections++;
-            m_phase_time = time;  // re-settle before the next measurement
-            return;
-        }
-
-        // Total offset (arm frame) needed for the real gripper to reach the rock.
-        const chrono::ChVector3d offset_local =
-            m_chassis_body->GetRot().RotateBack(m_ik_target - m_grab_target_world);
-        // If we converged, learn it so the next grab aims closer on the first move.
-        if (!m_grab_theta_from_command && err < reach_converge_tol)
-            m_reach_bias = 0.4 * m_reach_bias + 0.6 * offset_local;
-
         const auto rref = m_target_rock ? m_target_rock->GetFrameRefToAbs().GetPos() : chrono::VNULL;
-        std::cout << "[LrvArm] APPROACH->CLOSING t=" << time << " corrections=" << m_corrections
+        std::cout << "[LrvArm] APPROACH->CLOSING t=" << time
                   << " |gripper-target|=" << err
-                  << " offset_local=(" << offset_local.x() << "," << offset_local.y() << ","
-                  << offset_local.z() << ")"
-                  << " |gripper-rockREF|xy=" << std::hypot(gc.x() - rref.x(), gc.y() - rref.y())
-                  << (m_corrections >= max_corrections ? " (hit max_corrections)" : "") << "\n";
+                  << " |gripper-rockREF|xy=" << std::hypot(gc.x() - rref.x(), gc.y() - rref.y()) << "\n";
         m_phase = Phase::CLOSING;
         m_phase_time = time;
         m_next_tick = time;
@@ -570,8 +474,6 @@ void LrvArm::Update(double time) {
             m_lift_angle = lift_theta2;
             CommandJointAngles({m_grab_theta[0], m_lift_angle, m_grab_theta[2], m_grab_theta[3]});
             CommandJointAngles(m_place_theta);
-            m_ik_target = m_place_target_world;  // closed-loop correct the place too
-            m_corrections = 0;
             m_phase = Phase::PLACING;
             m_phase_time = time;
             return;
@@ -683,84 +585,6 @@ void LrvArm::RemoveRockLock() {
         m_target_rock->SetFixed(false);
         m_target_rock->EnableCollision(true);
     }
-}
-
-bool LrvArm::SolveIk(const chrono::ChVector3d& target_world, std::array<double, 4>& theta) const {
-    const chrono::ChCoordsys<> arm_frame(m_base->GetPos(), m_chassis_body->GetRot());
-    const chrono::ChVector3d target = arm_frame.TransformPointParentToLocal(target_world);
-    Eigen::Vector3d target_v(target.x(), target.y(), target.z());
-
-    Eigen::Vector4d q(std::atan2(target.y(), target.x()), chrono::CH_PI_2, -chrono::CH_PI_2, -chrono::CH_PI_2);
-    constexpr double tolerance = 1e-3;
-    constexpr double fd_eps = 1e-5;
-    constexpr double lambda = 5e-3;
-
-    auto fk = [this](const Eigen::Vector4d& v) {
-        const auto p = ForwardKinematics({v[0], v[1], v[2], v[3]});
-        return Eigen::Vector3d(p.x(), p.y(), p.z());
-    };
-
-    for (int iter = 0; iter < 250; iter++) {
-        const Eigen::Vector3d current = fk(q);
-        Eigen::Vector3d err = target_v - current;
-        if (err.norm() <= tolerance) {
-            theta = {q[0], q[1], q[2], q[3]};
-            return true;
-        }
-
-        Eigen::Matrix<double, 3, 4> jac;
-        for (int j = 0; j < 4; j++) {
-            Eigen::Vector4d qp = q;
-            qp[j] += fd_eps;
-            jac.col(j) = (fk(qp) - current) / fd_eps;
-        }
-
-        const Eigen::Matrix3d damped = jac * jac.transpose() + lambda * lambda * Eigen::Matrix3d::Identity();
-        Eigen::Vector4d delta = jac.transpose() * damped.ldlt().solve(err);
-        const double delta_norm = delta.norm();
-        if (delta_norm > 0.25)
-            delta *= 0.25 / delta_norm;
-
-        q += delta;
-        if (q[2] > 0.0)
-            q[2] *= 0.7;
-    }
-
-    if ((fk(q) - target_v).norm() <= 0.03) {
-        theta = {q[0], q[1], q[2], q[3]};
-        return true;
-    }
-    return false;
-}
-
-chrono::ChVector3d LrvArm::ForwardKinematics(const std::array<double, 4>& theta) const {
-    const double theta1 = theta[0];
-    const double theta2 = theta[1];
-    const double theta3 = theta[2];
-    const double theta4 = theta[3];
-    const double s1 = std::sin(theta1);
-    const double s2 = std::sin(theta2);
-    const double s3 = std::sin(theta3);
-    const double s4 = std::sin(theta4);
-    const double c1 = std::cos(theta1);
-    const double c2 = std::cos(theta2);
-    const double c3 = std::cos(theta3);
-    const double c4 = std::cos(theta4);
-
-    const double sigma1 = c2 * c3 * s1 - s1 * s2 * s3;
-    const double sigma2 = c2 * s1 * s3 + c3 * s1 * s2;
-    const double sigma3 = c1 * c2 * c3 - c1 * s2 * s3;
-    const double sigma4 = c1 * c2 * s3 + c1 * c3 * s2;
-    const double sigma5 = c2 * c3 - s2 * s3;
-    const double sigma6 = c2 * s3 + c3 * s2;
-
-    return chrono::ChVector3d(
-        arm_link_a2 * c1 * c2 + arm_link_a4 * c4 * sigma3 - arm_link_a4 * s4 * sigma4 -
-            arm_link_a3 * c1 * s2 * s3 + arm_link_a3 * c1 * c2 * c3,
-        arm_link_a2 * c2 * s1 + arm_link_a4 * c4 * sigma1 - arm_link_a4 * s4 * sigma2 -
-            arm_link_a3 * s1 * s2 * s3 + arm_link_a3 * c2 * c3 * s1,
-        arm_link_a1 + arm_link_a2 * s2 + arm_link_a3 * c2 * s3 + arm_link_a3 * c3 * s2 +
-            arm_link_a4 * c4 * sigma6 + arm_link_a4 * s4 * sigma5);
 }
 
 chrono::ChVector3d LrvArm::GripperCenter() const {
