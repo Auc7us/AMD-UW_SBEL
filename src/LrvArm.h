@@ -37,7 +37,8 @@ class LrvArm {
                         const chrono::ChVector3d& grab_target_world,
                         const chrono::ChVector3d& place_target_world,
                         double time,
-                        const std::array<double, 4>* grab_theta_override = nullptr);
+                        const std::array<double, 4>* grab_theta_override = nullptr,
+                        const std::array<double, 4>* place_theta_override = nullptr);
     void Update(double time);
     bool IsBusy() const;
     ArmStatusSnapshot GetStatus() const;

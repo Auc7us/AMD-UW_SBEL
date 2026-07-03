@@ -65,6 +65,7 @@ class ActiveCommand:
     theta: Tuple[float, float, float, float]
     last_publish_time_s: float
     status_seen: bool = False
+    place_theta: Optional[Tuple[float, float, float, float]] = None
 
 
 class ManipulatorController(Node):
@@ -89,6 +90,7 @@ class ManipulatorController(Node):
         self.pickup_request_topic = f"/robot_{self.robot_id}/pickup_request"
         self.ego_state_topic = f"/robot_{self.robot_id}/egoState"
         self.arm_base_pose_topic = f"/robot_{self.robot_id}/arm_base_pose"
+        self.place_target_topic = f"/robot_{self.robot_id}/place_target"
         self.arm_cmd_topic = f"/robot_{self.robot_id}/arm_cmd"
         self.arm_status_topic = f"/robot_{self.robot_id}/arm_status"
         self.target_done_topic = f"/robot_{self.robot_id}/target_done"
@@ -100,6 +102,7 @@ class ManipulatorController(Node):
         self.active_start_time_s: Optional[float] = None
         self.ego_state: Optional[EgoState] = None
         self.arm_base_pose: Optional[ArmBasePose] = None
+        self.place_target: Optional[Tuple[float, float, float]] = None
         self.completed_targets: Set[int] = set()
         self.ik_solver = RobotArmInverseKinematicsSolver() if RobotArmInverseKinematicsSolver is not None else None
 
@@ -108,6 +111,7 @@ class ManipulatorController(Node):
         self.create_subscription(Float64MultiArray, self.pickup_request_topic, self.on_pickup_request, 10)
         self.create_subscription(Float64MultiArray, self.ego_state_topic, self.on_ego_state, 10)
         self.create_subscription(Float64MultiArray, self.arm_base_pose_topic, self.on_arm_base_pose, 10)
+        self.create_subscription(Float64MultiArray, self.place_target_topic, self.on_place_target, 10)
         self.create_subscription(Float64MultiArray, self.arm_status_topic, self.on_arm_status, 10)
         self.timer = self.create_timer(0.5, self.on_timer)
 
@@ -136,6 +140,11 @@ class ManipulatorController(Node):
         if theta is None:
             return
 
+        # Solve the drop pose with the same IK, in the same arm-base frame, from the
+        # place target the C++ arm published. If unavailable/unreachable, leave it
+        # None and the arm falls back to its own place IK.
+        place_theta = self.compute_place_theta(request.target_index)
+
         self.command_seq += 1
         now_s = self.now_seconds()
         self.active = ActiveCommand(
@@ -145,6 +154,7 @@ class ManipulatorController(Node):
             request.rock_y,
             theta,
             now_s,
+            place_theta=place_theta,
         )
         self.active_start_time_s = now_s
 
@@ -153,7 +163,8 @@ class ManipulatorController(Node):
         self.get_logger().info(
             f"Sent arm_cmd seq={self.command_seq} target={request.target_index} "
             f"rock=({request.rock_x:.2f}, {request.rock_y:.2f}{z_text}) "
-            f"theta={[round(t, 3) for t in theta]}."
+            f"theta={[round(t, 3) for t in theta]} "
+            f"place_theta={[round(t, 3) for t in place_theta] if place_theta else None}."
         )
 
     def on_ego_state(self, msg: Float64MultiArray) -> None:
@@ -181,6 +192,12 @@ class ManipulatorController(Node):
             qy=float(msg.data[5]),
             qz=float(msg.data[6]),
         )
+
+    def on_place_target(self, msg: Float64MultiArray) -> None:
+        if len(msg.data) < 3:
+            self.get_logger().warn("Ignoring place_target; expected [x, y, z].")
+            return
+        self.place_target = (float(msg.data[0]), float(msg.data[1]), float(msg.data[2]))
 
     def on_arm_status(self, msg: Float64MultiArray) -> None:
         if len(msg.data) < 5:
@@ -244,6 +261,10 @@ class ManipulatorController(Node):
             self.active.rock_y,
             *[float(theta) for theta in self.active.theta],
         ]
+        # Append the Python-solved drop pose (12-element command) when available;
+        # otherwise the 8-element command tells the arm to use its own place IK.
+        if self.active.place_theta is not None:
+            cmd.data.extend(float(theta) for theta in self.active.place_theta)
         self.arm_cmd_pub.publish(cmd)
         self.active.last_publish_time_s = self.now_seconds()
 
@@ -314,6 +335,24 @@ class ManipulatorController(Node):
             f"fk=({float(fk[0]):.3f}, {float(fk[1]):.3f}, {float(fk[2]):.3f}) "
             f"fk_err={fk_err:.4f}"
         )
+        return tuple(float(value) for value in theta[:4])
+
+    def compute_place_theta(self, target_index: int) -> Optional[Tuple[float, float, float, float]]:
+        """Solve the drop pose with the same IK/frame as the grab, from the C++
+        place target. Returns None (arm falls back to its own place IK) if the
+        target or arm base pose is unavailable, or the point is unreachable."""
+        if self.ik_solver is None or self.arm_base_pose is None or self.place_target is None:
+            return None
+        px, py, pz = self.place_target
+        local_target = self.world_to_arm_base_local(px, py, pz)
+        try:
+            theta = self.ik_solver.inverse_kinematics_solver(local_target, elbow_up=True)
+        except ValueError as exc:
+            self.get_logger().warn(
+                f"Python place IK failed for target {target_index}: {exc}; "
+                f"place_local=({local_target[0]:.3f}, {local_target[1]:.3f}, {local_target[2]:.3f})"
+            )
+            return None
         return tuple(float(value) for value in theta[:4])
 
     def world_to_arm_base_local(self, x: float, y: float, z: float) -> Tuple[float, float, float]:

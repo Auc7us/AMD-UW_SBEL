@@ -321,7 +321,8 @@ bool LrvArm::StartPickPlace(double command_seq,
                             const chrono::ChVector3d& grab_target_world,
                             const chrono::ChVector3d& place_target_world,
                             double time,
-                            const std::array<double, 4>* grab_theta_override) {
+                            const std::array<double, 4>* grab_theta_override,
+                            const std::array<double, 4>* place_theta_override) {
     if (!rock) {
         m_target_rock.reset();
         m_status.command_seq = command_seq;
@@ -375,7 +376,11 @@ bool LrvArm::StartPickPlace(double command_seq,
         }
     }
 
-    if (!SolveIk(m_place_target_world, m_place_theta)) {
+    // Prefer the Python-solved place pose (same IK as the grab); fall back to the
+    // C++ SolveIk only if none was provided.
+    if (place_theta_override) {
+        m_place_theta = *place_theta_override;
+    } else if (!SolveIk(m_place_target_world, m_place_theta)) {
         std::cout << "[LrvArm] IK FAILED (place) target=(" << m_place_target_world.x() << ","
                   << m_place_target_world.y() << "," << m_place_target_world.z() << ")\n";
         FinishFailed(2);

@@ -41,10 +41,13 @@ class RosArmBridge {
         double rock_x = 0.0;
         double rock_y = 0.0;
         std::array<double, 4> grab_theta = {0.0, 0.0, 0.0, 0.0};
+        std::array<double, 4> place_theta = {0.0, 0.0, 0.0, 0.0};
+        bool has_place_theta = false;  // Python supplied a place pose (12-element cmd)
     };
 
     void OnArmCommand(const std_msgs::msg::Float64MultiArray::SharedPtr msg);
     void PublishArmBasePose();
+    void PublishPlaceTarget();
     void PublishStatus();
     chrono::ChVector3d PlacePoint(int slot) const;
 
@@ -65,6 +68,7 @@ class RosArmBridge {
     std::unique_ptr<rclcpp::executors::SingleThreadedExecutor> m_executor;
     rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr m_arm_cmd_sub;
     rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr m_arm_base_pose_pub;
+    rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr m_place_target_pub;
     rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr m_arm_status_pub;
 
     std::mutex m_command_mutex;

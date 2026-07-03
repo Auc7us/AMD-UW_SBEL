@@ -62,6 +62,8 @@ RosArmBridge::RosArmBridge(int robot_id,
     m_node = rclcpp::Node::make_shared("chrono_robot_" + std::to_string(m_robot_id) + "_arm");
     m_arm_base_pose_pub =
         m_node->create_publisher<std_msgs::msg::Float64MultiArray>(TopicForRobot(m_robot_id, "arm_base_pose"), 10);
+    m_place_target_pub =
+        m_node->create_publisher<std_msgs::msg::Float64MultiArray>(TopicForRobot(m_robot_id, "place_target"), 10);
     m_arm_status_pub =
         m_node->create_publisher<std_msgs::msg::Float64MultiArray>(TopicForRobot(m_robot_id, "arm_status"), 10);
     m_arm_cmd_sub = m_node->create_subscription<std_msgs::msg::Float64MultiArray>(
@@ -84,6 +86,7 @@ RosArmBridge::~RosArmBridge() {
 void RosArmBridge::Synchronize(double time, chrono::vehicle::RigidTerrain& terrain) {
     m_executor->spin_some();
     PublishArmBasePose();
+    PublishPlaceTarget();
 
     std::optional<ArmCommand> command;
     {
@@ -138,7 +141,8 @@ void RosArmBridge::Synchronize(double time, chrono::vehicle::RigidTerrain& terra
                                  grab_target,
                                  place_target,
                                  time,
-                                 &command->grab_theta);
+                                 &command->grab_theta,
+                                 command->has_place_theta ? &command->place_theta : nullptr);
             m_place_count++;
         }
     }
@@ -189,6 +193,12 @@ void RosArmBridge::OnArmCommand(const std_msgs::msg::Float64MultiArray::SharedPt
     command.rock_x = msg->data[2];
     command.rock_y = msg->data[3];
     command.grab_theta = {msg->data[4], msg->data[5], msg->data[6], msg->data[7]};
+    // Optional Python-solved place pose (12-element command); otherwise the arm
+    // falls back to its own place IK.
+    if (msg->data.size() >= 12) {
+        command.place_theta = {msg->data[8], msg->data[9], msg->data[10], msg->data[11]};
+        command.has_place_theta = true;
+    }
 
     std::lock_guard<std::mutex> lock(m_command_mutex);
     m_pending_command = command;
@@ -208,6 +218,16 @@ void RosArmBridge::PublishArmBasePose() {
         rot.e3(),
     };
     m_arm_base_pose_pub->publish(msg);
+}
+
+void RosArmBridge::PublishPlaceTarget() {
+    // World point of the NEXT drop slot, so the Python controller can solve the
+    // place IK in the same frame it uses for the grab. m_place_count is the slot the
+    // next accepted pickup will use, matching what StartPickPlace passes below.
+    const auto p = PlacePoint(m_place_count);
+    std_msgs::msg::Float64MultiArray msg;
+    msg.data = {p.x(), p.y(), p.z()};
+    m_place_target_pub->publish(msg);
 }
 
 void RosArmBridge::PublishStatus() {
