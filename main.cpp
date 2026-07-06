@@ -260,6 +260,15 @@ int main(int argc, char* argv[]) {
                               AgentKey(robot_rank, 3));
     }
 
+    // The SolidWorks importer's embedded `import pychrono` (in LrvArm) resets
+    // Chrono's global data paths to the library's compiled-in default. That breaks
+    // the zombie vehicle mesh lookups in Initialize() below (they resolve
+    // "vehicle/LRV/meshes/..." against the wrong root and segfault on the missing
+    // OBJ). Re-assert our data paths right before zombie creation so the lookups
+    // resolve against the AMD-UW vehicle data. No-op for the non-importer build.
+    SetChronoDataPath(vehicle_data_path);
+    SetVehicleDataPath(vehicle_data_path);
+
     syn_manager.Initialize(system);
 
     std::shared_ptr<ChSensorManager> sensor_manager;

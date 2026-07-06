@@ -5,11 +5,20 @@
 import pychrono as chrono 
 import builtins 
 
-# Some global settings 
+# Some global settings
 sphereswept_r = 0.001
-chrono.ChCollisionModel.SetDefaultSuggestedEnvelope(0.003)
-chrono.ChCollisionModel.SetDefaultSuggestedMargin(0.003)
-chrono.ChCollisionSystemBullet.SetContactBreakingThreshold(0.002)
+# NOTE (amd-uw): these three lines are DISABLED on purpose. When this file is
+# imported into the C++ demo via ChPythonEngine::ImportSolidWorksSystem, it runs
+# in the SAME process as the rest of the sim and mutates Chrono's PROCESS-GLOBAL
+# collision defaults. The terrain and rocks are created AFTER the arm import, so
+# they would inherit a 0.003 m envelope (vs Chrono's 0.03 m default) and tunnel /
+# fall through, and the gripper's contact detection would differ from the manual
+# arm build the pickup offsets were tuned against. Collision defaults are the
+# embedding sim's responsibility (main.cpp), not an imported arm asset's. If you
+# re-export from SolidWorks, re-comment these.
+# chrono.ChCollisionModel.SetDefaultSuggestedEnvelope(0.003)
+# chrono.ChCollisionModel.SetDefaultSuggestedMargin(0.003)
+# chrono.ChCollisionSystemBullet.SetContactBreakingThreshold(0.002)
 
 shapes_dir = 'lrv_arm_shapes/' 
 

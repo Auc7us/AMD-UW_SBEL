@@ -161,26 +161,6 @@ std::shared_ptr<chrono::ChBodyAuxRef> RequireBody(chrono::ChSystem* system, cons
     return body;
 }
 
-#ifdef AMD_UW_USE_SOLIDWORKS_IMPORTER
-void MoveImportedAssembly(const std::array<std::shared_ptr<chrono::ChBodyAuxRef>, 8>& bodies,
-                          const chrono::ChVector3d& mount_pos,
-                          const chrono::ChQuaternion<>& mount_rot) {
-    for (const auto& body : bodies) {
-        body->SetFixed(false);
-        body->SetPos(mount_pos + body->GetPos());
-    }
-
-    // Match model/arm_model.py: after shifting the imported assembly, pin the
-    // base body itself exactly at the requested mount point.
-    bodies[2]->SetPos(mount_pos);
-
-    for (const auto& body : bodies) {
-        body->SetPos(mount_pos + mount_rot.Rotate(body->GetPos() - mount_pos));
-        body->SetRot(mount_rot * body->GetRot());
-    }
-}
-#endif
-
 }  // namespace
 
 LrvArm::LrvArm(chrono::ChSystem* system,
@@ -218,6 +198,29 @@ LrvArm::LrvArm(chrono::ChSystem* system,
     m_wrist = RequireBody(system, "wrist-1");
     m_finger_2 = RequireBody(system, "finger-2");
     m_finger_1 = RequireBody(system, "finger-1");
+
+    // Place the imported bodies at EXACTLY the manual-construction poses before the
+    // joints are built, then build the joints from the same mount-based frames the
+    // manual arm uses. Each imported body already carries its COM-to-REF offset, so
+    // pinning its REF to (P, R) -- P = mount_pos(+mount_rot*spec.pos), R =
+    // mount_rot*spec.rot -- reproduces the manual arm's COM positions bit-for-bit
+    // (base REF at mount_pos, COM ~3.8 cm below). This is what makes GetIkFramePos()
+    // and the settled gripper match the calibrated manual build. (The older
+    // approach built joints at raw frames then shifted the assembly, which pinned
+    // the base COM at mount_pos and left the base<->shoulder motor violated, so the
+    // solver dragged the whole arm ~3.8 cm low.)
+    {
+        const std::array<std::shared_ptr<chrono::ChBodyAuxRef>, 8> imported = {
+            m_end_effector, m_biceps, m_base, m_shoulder, m_elbow, m_wrist, m_finger_2, m_finger_1};
+        for (size_t i = 0; i < imported.size(); ++i) {
+            const auto& spec = arm_bodies[i];
+            const chrono::ChVector3d P =
+                (std::string(spec.name) == "base-1") ? mount_pos : mount_pos + mount_rot.Rotate(spec.pos);
+            const chrono::ChQuaternion<> R = mount_rot * spec.rot;
+            imported[i]->SetFixed(false);
+            imported[i]->SetFrameRefToAbs(chrono::ChFramed(P, R));
+        }
+    }
 #else
     const std::string shapes_dir = data_path + "lrv_robotarm/lrv_arm_shapes/";
 
@@ -231,44 +234,26 @@ LrvArm::LrvArm(chrono::ChSystem* system,
     m_finger_1 = CreateBody(system, arm_bodies[7], shapes_dir, mount_pos, mount_rot);
 #endif
 
+    // Both builds now place the arm bodies at the same mount-based poses before
+    // this point, so the joints use identical mount-based frames.
     const auto joint_base_shoulder =
-#ifdef AMD_UW_USE_SOLIDWORKS_IMPORTER
-        TransformFrame({{-5.74189588383473e-19, 7.96390791413929e-18, 0.127}, chrono::QUNIT}, chrono::VNULL, chrono::QUNIT);
-#else
         TransformFrame({{-5.74189588383473e-19, 7.96390791413929e-18, 0.127}, chrono::QUNIT}, mount_pos, mount_rot);
-#endif
     const auto joint_shoulder_biceps =
         TransformFrame({{-8.07010409222406e-17, 1.5234866438078e-16, 0.325155513123522},
                         {1.17756934401283e-16, -1.17756934401283e-16, 0.707106781186548, -0.707106781186547}},
-#ifdef AMD_UW_USE_SOLIDWORKS_IMPORTER
-                       chrono::VNULL, chrono::QUNIT);
-#else
                        mount_pos, mount_rot);
-#endif
     const auto joint_biceps_elbow =
         TransformFrame({{-1.27, -2.66188598930217e-16, 0.325155513123522},
                         {0.707106781186548, -0.707106781186547, -1.17756934401283e-16, 1.17756934401283e-16}},
-#ifdef AMD_UW_USE_SOLIDWORKS_IMPORTER
-                       chrono::VNULL, chrono::QUNIT);
-#else
                        mount_pos, mount_rot);
-#endif
     const auto joint_elbow_effector =
         TransformFrame({{-2.413, -0.0190500000000001, 0.325155513123522},
                         {0.707106781186548, -0.707106781186547, -2.17894099802631e-33, 2.17894099802631e-33}},
-#ifdef AMD_UW_USE_SOLIDWORKS_IMPORTER
-                       chrono::VNULL, chrono::QUNIT);
-#else
                        mount_pos, mount_rot);
-#endif
     const auto joint_effector =
         TransformFrame({{-2.6924, -9.00811551237124e-16, 0.325155513123523},
                         {-3.92523114670944e-17, 3.92523114670943e-17, -0.707106781186547, 0.707106781186548}},
-#ifdef AMD_UW_USE_SOLIDWORKS_IMPORTER
-                       chrono::VNULL, chrono::QUNIT);
-#else
                        mount_pos, mount_rot);
-#endif
 
     m_wrist_lock = AddLink<chrono::ChLinkLockLock>(system, m_end_effector, m_wrist, joint_effector);
     m_motor_base_shoulder =
@@ -286,18 +271,11 @@ LrvArm::LrvArm(chrono::ChSystem* system,
     m_motor_finger_1->SetMotionFunction(chrono_types::make_shared<chrono::ChFunctionConst>(-0.15));
     m_motor_finger_2->SetMotionFunction(chrono_types::make_shared<chrono::ChFunctionConst>(0.15));
 
-#ifdef AMD_UW_USE_SOLIDWORKS_IMPORTER
-    MoveImportedAssembly({m_end_effector, m_biceps, m_base, m_shoulder, m_elbow, m_wrist, m_finger_2, m_finger_1},
-                         mount_pos,
-                         mount_rot);
-
-    m_chassis_lock =
-        AddLink<chrono::ChLinkLockLock>(system, m_chassis_body, m_base, chrono::ChFramed(m_base->GetPos(), m_base->GetRot()));
-
-    std::cout << "[LrvArm] imported SolidWorks arm via ChPythonEngine: " << arm_file << "\n";
-#else
     m_chassis_lock =
         AddLink<chrono::ChLinkLockLock>(system, m_chassis_body, m_base, chrono::ChFramed(mount_pos, mount_rot));
+
+#ifdef AMD_UW_USE_SOLIDWORKS_IMPORTER
+    std::cout << "[LrvArm] imported SolidWorks arm via ChPythonEngine: " << arm_file << "\n";
 #endif
 }
 
