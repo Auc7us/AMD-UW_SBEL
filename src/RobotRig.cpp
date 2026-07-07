@@ -5,6 +5,7 @@
 #include <limits>
 #include <set>
 
+#include "chrono/assets/ChVisualShapeBox.h"
 #include "chrono/collision/ChCollisionShapeBox.h"
 #include "chrono/core/ChFrame.h"
 #include "chrono/core/ChTypes.h"
@@ -206,7 +207,7 @@ void RobotRig::InitializeTrailer() {
     m_trailer = chrono_types::make_shared<chrono::vehicle::WheeledTrailer>(
         GetSystem(), chrono::vehicle::GetVehicleDataFile("LRV_Wagon/Polaris.json"));
     m_trailer->Initialize(m_vehicle->GetChassis());
-    m_trailer->SetChassisVisualizationType(chrono::VisualizationType::PRIMITIVES);
+    m_trailer->SetChassisVisualizationType(chrono::VisualizationType::NONE);
     m_trailer->SetSuspensionVisualizationType(chrono::VisualizationType::PRIMITIVES);
     m_trailer->SetWheelVisualizationType(chrono::VisualizationType::PRIMITIVES);
 
@@ -289,9 +290,15 @@ void RobotRig::InitializeTrailerBed() {
                                                    mass / 12.0 * (ex * ex + ey * ey)));
 
     auto add_box = [&](double sx, double sy, double sz, double cx, double cy, double cz) {
+        const chrono::ChFramed frame(chrono::ChVector3d(cx, cy, cz), chrono::QUNIT);
+
         m_trailer_bed->AddCollisionShape(
             chrono_types::make_shared<chrono::ChCollisionShapeBox>(bed_mat, sx, sy, sz),
-            chrono::ChFramed(chrono::ChVector3d(cx, cy, cz), chrono::QUNIT));
+            frame);
+
+        auto visual = chrono_types::make_shared<chrono::ChVisualShapeBox>(sx, sy, sz);
+        visual->SetColor(chrono::ChColor(0.75f, 0.5f, 0.5f));
+        m_trailer_bed->AddVisualShape(visual, frame);
     };
     add_box(ex, ey, t, 0.0, 0.0, 0.0);                       // floor
     add_box(t, ey, wall_h, ex / 2.0, 0.0, wall_h / 2.0);     // +x front wall
