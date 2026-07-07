@@ -289,23 +289,59 @@ void RobotRig::InitializeTrailerBed() {
                                                    mass / 12.0 * (ex * ex + wall_h * wall_h),
                                                    mass / 12.0 * (ex * ex + ey * ey)));
 
-    auto add_box = [&](double sx, double sy, double sz, double cx, double cy, double cz) {
+    const chrono::ChColor bed_color(0.75f, 0.5f, 0.5f);
+
+    auto add_box = [&](const std::shared_ptr<chrono::ChBody>& body,
+                       double sx,
+                       double sy,
+                       double sz,
+                       double cx,
+                       double cy,
+                       double cz) {
         const chrono::ChFramed frame(chrono::ChVector3d(cx, cy, cz), chrono::QUNIT);
 
-        m_trailer_bed->AddCollisionShape(
+        body->AddCollisionShape(
             chrono_types::make_shared<chrono::ChCollisionShapeBox>(bed_mat, sx, sy, sz),
             frame);
 
         auto visual = chrono_types::make_shared<chrono::ChVisualShapeBox>(sx, sy, sz);
-        visual->SetColor(chrono::ChColor(0.75f, 0.5f, 0.5f));
-        m_trailer_bed->AddVisualShape(visual, frame);
+        visual->SetColor(bed_color);
+        body->AddVisualShape(visual, frame);
     };
-    add_box(ex, ey, t, 0.0, 0.0, 0.0);                       // floor
-    add_box(t, ey, wall_h, ex / 2.0, 0.0, wall_h / 2.0);     // +x front wall
-    add_box(ex, t, wall_h, 0.0, ey / 2.0, wall_h / 2.0);     // +y left wall
-    add_box(ex, t, wall_h, 0.0, -ey / 2.0, wall_h / 2.0);    // -y right wall
+    add_box(m_trailer_bed, ex, ey, t, 0.0, 0.0, 0.0);                       // floor
+    add_box(m_trailer_bed, t, ey, wall_h, ex / 2.0, 0.0, wall_h / 2.0);     // +x front wall
+    add_box(m_trailer_bed, ex, t, wall_h, 0.0, ey / 2.0, wall_h / 2.0);     // +y left wall
+    add_box(m_trailer_bed, ex, t, wall_h, 0.0, -ey / 2.0, wall_h / 2.0);    // -y right wall
     m_trailer_bed->EnableCollision(true);
     GetSystem()->AddBody(m_trailer_bed);
+
+    // Hinged rear tailgate (-x): a separate dynamic body, connected to the bed
+    // with a revolute joint about the trailer lateral (Y) axis.
+    const chrono::ChVector3d tailgate_center_local(-ex / 2.0 - t / 2.0, 0.0, t / 2.0 + wall_h / 2.0);
+    const chrono::ChVector3d tailgate_hinge_local(-ex / 2.0 - t / 2.0, 0.0, t / 2.0);
+    const chrono::ChVector3d tailgate_pos = bed_pos + chassis->GetRot().Rotate(tailgate_center_local);
+
+    m_trailer_tailgate = chrono_types::make_shared<chrono::ChBody>();
+    m_trailer_tailgate->SetName("trailer_tailgate");
+    m_trailer_tailgate->SetPos(tailgate_pos);
+    m_trailer_tailgate->SetRot(chassis->GetRot());
+    const double tailgate_mass = 5.0;
+    m_trailer_tailgate->SetMass(tailgate_mass);
+    m_trailer_tailgate->SetInertiaXX(
+        chrono::ChVector3d(tailgate_mass / 12.0 * (ey * ey + wall_h * wall_h),
+                           tailgate_mass / 12.0 * (t * t + wall_h * wall_h),
+                           tailgate_mass / 12.0 * (t * t + ey * ey)));
+    add_box(m_trailer_tailgate, t, ey, wall_h, 0.0, 0.0, 0.0);
+    m_trailer_tailgate->EnableCollision(true);
+    GetSystem()->AddBody(m_trailer_tailgate);
+
+    const chrono::ChQuaternion<> tailgate_hinge_rot = chassis->GetRot() * chrono::QuatFromAngleX(chrono::CH_PI_2);
+    const chrono::ChVector3d tailgate_hinge_pos = bed_pos + chassis->GetRot().Rotate(tailgate_hinge_local);
+    m_trailer_tailgate_hinge = chrono_types::make_shared<chrono::ChLinkLockRevolute>();
+    m_trailer_tailgate_hinge->SetName("trailer_tailgate_hinge");
+    m_trailer_tailgate_hinge->Initialize(m_trailer_tailgate, m_trailer_bed,
+                                         chrono::ChFramed(tailgate_hinge_pos, tailgate_hinge_rot));
+    GetSystem()->AddLink(m_trailer_tailgate_hinge);
 
     // Revolute motor about the chassis lateral (Y) axis. A rotation motor turns
     // about its frame Z, so rotate the frame +90 deg about X to land Z on the

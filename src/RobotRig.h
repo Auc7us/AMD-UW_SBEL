@@ -9,6 +9,7 @@
 #include "chrono/physics/ChBodyAuxRef.h"
 #include "chrono/physics/ChBodyEasy.h"
 #include "chrono/physics/ChContactMaterial.h"
+#include "chrono/physics/ChLinkLock.h"
 #include "chrono/physics/ChLinkMotorRotationAngle.h"
 #include "chrono/physics/ChSystem.h"
 #include "chrono_vehicle/ChDriver.h"
@@ -87,6 +88,8 @@ class RobotRig {
     std::unique_ptr<chrono::vehicle::WheeledVehicle> m_vehicle;
     std::shared_ptr<chrono::vehicle::WheeledTrailer> m_trailer;
     std::shared_ptr<chrono::ChBody> m_trailer_bed;
+    std::shared_ptr<chrono::ChBody> m_trailer_tailgate;
+    std::shared_ptr<chrono::ChLinkLockRevolute> m_trailer_tailgate_hinge;
     std::shared_ptr<chrono::ChLinkMotorRotationAngle> m_trailer_bed_motor;
     std::unique_ptr<chrono::vehicle::ChDriver> m_driver;
     std::shared_ptr<chrono::vehicle::ChInteractiveDriver> m_irr_driver;
