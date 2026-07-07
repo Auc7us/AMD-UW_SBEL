@@ -150,8 +150,14 @@ void RobotRig::InitializeOnTerrain(chrono::vehicle::RigidTerrain& terrain,
     InitializeVehicle(chrono::ChCoordsys<>(init_loc, init_rot));
     InitializeTrailer();
     ReseatRig(terrain, preexisting_bodies, height_probe_z, seat_clearance);
-    InitializeArm(amd_uw_data_path);
+    // Create the trailer bed BEFORE the arm. InitializeArm runs the SolidWorks
+    // importer (ImportSolidWorksSystem, embedded Python), which disrupts the
+    // collision system so that bodies added AFTER it never register contacts:
+    // in the importer build rocks fell straight through the bed, while the
+    // non-importer build caught them on the identical bed. Bodies created before
+    // the import (the rocks, and now the bed) bind normally and collide.
     InitializeTrailerBed();
+    InitializeArm(amd_uw_data_path);
     for (const auto& body : GetSystem()->GetBodies())
         body->SetSleepingAllowed(false);
     for (const auto& rock : m_rocks)

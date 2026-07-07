@@ -467,7 +467,12 @@ void LrvArm::Update(double time) {
         const double place_err = (GripperCenter() - m_place_target_world).Length();
         const double gripper_speed = (0.5 * (m_finger_1->GetPosDt() + m_finger_2->GetPosDt())).Length();
         const bool settled = gripper_speed < settle_speed_tol;
-        if (place_err < place_tol || (elapsed >= place_min_settle && settled) || elapsed > place_timeout) {
+        // Release ONLY once the arm has actually come to rest at the place pose.
+        // The rigid single-shot motors snap fast through the place pose (~1.4 m/s),
+        // so releasing on proximity (place_err < place_tol) fires mid-swing and
+        // FLINGS the rock off the bed (seen as |rock-place|~1.8 with the rock
+        // launched a meter away). Waiting for `settled` drops it straight down.
+        if ((elapsed >= place_min_settle && settled) || elapsed > place_timeout) {
             std::cout << "[LrvArm] PLACING->RELEASING t=" << time << " elapsed=" << elapsed
                       << " |gripper-place|=" << place_err << " gripper_speed=" << gripper_speed
                       << (elapsed > place_timeout ? " (timeout)" : "") << "\n";
