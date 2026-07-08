@@ -5,6 +5,17 @@
 
 namespace amd_uw {
 
+std::shared_ptr<chrono::ChContactMaterial> MakeContactMaterial(chrono::ChContactMethod method,
+                                                               float friction,
+                                                               float restitution,
+                                                               float young) {
+    chrono::ChContactMaterialData data;
+    data.mu = friction;
+    data.cr = restitution;
+    data.Y = young;
+    return data.CreateMaterial(method);
+}
+
 std::shared_ptr<chrono::ChVisualMaterial> CreateLunarHapkeMaterial() {
     auto material = chrono_types::make_shared<chrono::ChVisualMaterial>();
     material->SetAmbientColor({0.0f, 0.0f, 0.0f});

@@ -19,6 +19,7 @@
 #include "chrono_vehicle/utils/ChVehicleUtilsJSON.h"
 
 #include "LrvArm.h"
+#include "MaterialUtils.h"
 #include "RobotLayout.h"
 
 #ifdef AMD_UW_ENABLE_ROS2
@@ -264,8 +265,7 @@ void RobotRig::ReseatRig(chrono::vehicle::RigidTerrain& terrain,
 }
 
 void RobotRig::InitializeTrailerBed() {
-    auto bed_mat = chrono::ChContactMaterial::DefaultMaterial(m_contact_method);
-    bed_mat->SetFriction(0.9f);
+    auto bed_mat = MakeContactMaterial(m_contact_method, 0.9f);
 
     const auto chassis = m_trailer->GetChassis()->GetBody();
     const chrono::ChVector3d offset(0.0, 0.0, 0.03);  // bed floor just above the trailer chassis

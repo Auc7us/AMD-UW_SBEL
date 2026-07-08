@@ -14,7 +14,7 @@
 #include "chrono/core/ChTypes.h"
 #include "chrono/physics/ChBody.h"
 #include "chrono/physics/ChContactMaterial.h"
-#include "chrono/physics/ChSystemNSC.h"
+#include "chrono/physics/ChSystemSMC.h"
 
 #include "chrono_vehicle/ChVehicleDataPath.h"
 #include "chrono_vehicle/terrain/RigidTerrain.h"
@@ -46,10 +46,12 @@ using namespace amd_uw;
 namespace {
 
 // Simulation defaults shared by all MPI ranks.
-const ChContactMethod contact_method = ChContactMethod::NSC;
+const ChContactMethod contact_method = ChContactMethod::SMC;
 
-double step_size = 2e-3;
-double tire_step_size = 1e-3;
+// SMC penalty contact integrates stiff normal forces, so it needs a finer step
+// than NSC (which used 2e-3 / 1e-3). Mirrors the Python demo's 5e-4 SMC step.
+double step_size = 5e-4;
+double tire_step_size = 2.5e-4;
 double end_time = 1000.0;
 double heartbeat = 1e-2;
 double render_step_size = 1.0 / 50.0;
@@ -183,7 +185,7 @@ int main(int argc, char* argv[]) {
     const bool owns_robot = (rank > 0);
     const int num_robot_ranks = std::max(0, num_ranks - 1);
 
-    ChSystemNSC sensor_system;
+    ChSystemSMC sensor_system;
     sensor_system.SetCollisionSystemType(ChCollisionSystem::Type::BULLET);
 
     std::unique_ptr<RobotRig> robot;
@@ -197,9 +199,7 @@ int main(int argc, char* argv[]) {
 
     // Apollo-site height-map terrain. Each BMP pixel maps to an integer-sized terrain cell.
     RigidTerrain terrain(system);
-    auto ground_mat = ChContactMaterial::DefaultMaterial(contact_method);
-    ground_mat->SetFriction(0.9f);
-    ground_mat->SetRestitution(0.0f);
+    auto ground_mat = MakeContactMaterial(contact_method, 0.9f, 0.0f);
     const ChCoordsys<> terrain_csys(ChVector3d(0.0, 0.0, terrain_height_offset), QUNIT);
     auto ground = terrain.AddPatch(ground_mat, terrain_csys, amd_uw_data_path + terrain_heightmap_file,
                                    terrain_length, terrain_width, terrain_min_height, terrain_max_height);
@@ -220,9 +220,7 @@ int main(int argc, char* argv[]) {
     const double start_spacing = 50.0;
     // Probe from above the tallest possible terrain so the downward ray cast hits.
     const double height_probe_z = terrain_height_offset + terrain_max_height + terrain_height_probe_clearance;
-    auto rock_mat = ChContactMaterial::DefaultMaterial(contact_method);
-    rock_mat->SetFriction(0.9f);
-    rock_mat->SetRestitution(0.0f);
+    auto rock_mat = MakeContactMaterial(contact_method, 0.9f, 0.0f);
     VsgAppWrapper app;
 
     if (owns_robot) {

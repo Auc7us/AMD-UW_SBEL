@@ -17,6 +17,8 @@
 #include "chrono_parsers/ChParserPython.h"
 #endif
 
+#include "MaterialUtils.h"
+
 namespace amd_uw {
 
 namespace {
@@ -132,7 +134,10 @@ std::shared_ptr<chrono::ChBodyAuxRef> CreateBody(chrono::ChSystem* system,
     body->AddVisualShape(visual, chrono::ChFramed(chrono::VNULL, chrono::QUNIT));
 
     if (spec.finger) {
-        auto mat = chrono::ChContactMaterial::DefaultMaterial(chrono::ChContactMethod::NSC);
+        // Match the system's contact method: an NSC pad in an SMC system (or vice
+        // versa) silently fails the finger-vs-rock contact. High friction so the
+        // position-driven pads grip the rock instead of sliding.
+        auto mat = MakeContactMaterial(system->GetContactMethod(), 0.9f);
         mat->SetRollingFriction(0.5f);
         body->AddCollisionShape(chrono_types::make_shared<chrono::ChCollisionShapeBox>(mat, 0.005, 0.13, 0.01),
                                 chrono::ChFramed(chrono::ChVector3d(-0.106, 0.08, 0), chrono::QUNIT));
