@@ -8,7 +8,7 @@
 #include "chrono/physics/ChBodyAuxRef.h"
 #include "chrono/physics/ChContactMaterial.h"
 #include "chrono/physics/ChSystem.h"
-#include "chrono_vehicle/terrain/RigidTerrain.h"
+#include "chrono_vehicle/ChTerrain.h"
 
 namespace amd_uw {
 
@@ -17,7 +17,7 @@ struct RockFieldConfig {
     double mesh_scale = 0.2;
     double density = 2500.0;
     double first_distance = 30.0;
-    double distance_step = 30.0;
+    double distance_step = 45.0;
     double surface_clearance = 0.05;
 };
 
@@ -32,7 +32,7 @@ std::shared_ptr<chrono::ChTriangleMeshConnected> LoadRockMesh(const std::string&
 // hard-coded height that only fits one mesh.
 std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> AddRockFields(
     chrono::ChSystem* system,
-    chrono::vehicle::RigidTerrain& terrain,
+    chrono::vehicle::ChTerrain& terrain,
     const std::shared_ptr<chrono::ChContactMaterial>& rock_mat,
     const std::string& chrono_data_path,
     const std::string& amd_uw_data_path,

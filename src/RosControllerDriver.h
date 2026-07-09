@@ -33,6 +33,15 @@ class RosControllerDriver : public chrono::vehicle::ChDriver {
     const std::vector<std::shared_ptr<chrono::ChBodyAuxRef>>& m_rocks;
     bool m_command_received;
 
+    // Throttle rise-rate limiter: the commanded throttle (m_throttle_cmd) is
+    // applied to m_throttle no faster than m_throttle_rise_per_s per second, so a
+    // step full-throttle command ramps in gently instead of wheelie-ing / bouncing
+    // the front wheels. Throttle release is applied immediately (braking stays
+    // responsive). Full throttle takes ~1/m_throttle_rise_per_s seconds to reach.
+    double m_throttle_cmd = 0.0;
+    double m_throttle_rise_per_s = 0.35;  // ~2.9 s from 0 to full
+    double m_last_sync_time = -1.0;
+
     rclcpp::Node::SharedPtr m_node;
     std::unique_ptr<rclcpp::executors::SingleThreadedExecutor> m_executor;
     rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr m_command_sub;

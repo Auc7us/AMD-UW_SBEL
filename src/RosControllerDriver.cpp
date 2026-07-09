@@ -76,7 +76,9 @@ void RosControllerDriver::OnCommand(const std_msgs::msg::Float64MultiArray::Shar
 
     std::lock_guard<std::mutex> lock(m_command_mutex);
     m_steering = std::clamp(msg->data[0], -1.0, 1.0);
-    m_throttle = std::clamp(msg->data[1], 0.0, 1.0);
+    // Store commanded throttle as a target; the applied m_throttle is ramped
+    // toward it in Synchronize() so a step full-throttle command doesn't slam in.
+    m_throttle_cmd = std::clamp(msg->data[1], 0.0, 1.0);
     m_braking = std::clamp(msg->data[2], 0.0, 1.0);
     m_clutch = 0.0;
     m_command_received = true;
@@ -89,9 +91,20 @@ void RosControllerDriver::Synchronize(double time) {
         std::lock_guard<std::mutex> lock(m_command_mutex);
         if (!m_command_received) {
             m_steering = 0.0;
-            m_throttle = 0.0;
+            m_throttle_cmd = 0.0;
             m_braking = 1.0;
             m_clutch = 0.0;
+        }
+
+        // Rate-limit the throttle RISE (ramp up gently); apply any decrease
+        // immediately so lift-off / coasting stays responsive.
+        const double dt = (m_last_sync_time >= 0.0) ? (time - m_last_sync_time) : 0.0;
+        m_last_sync_time = time;
+        if (m_throttle_cmd > m_throttle) {
+            const double max_rise = m_throttle_rise_per_s * std::max(dt, 0.0);
+            m_throttle = std::min(m_throttle_cmd, m_throttle + max_rise);
+        } else {
+            m_throttle = m_throttle_cmd;
         }
     }
 

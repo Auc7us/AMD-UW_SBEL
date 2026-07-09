@@ -9,7 +9,7 @@
 #include "LrvArm.h"
 
 #include "chrono/physics/ChBodyAuxRef.h"
-#include "chrono_vehicle/terrain/RigidTerrain.h"
+#include "chrono_vehicle/ChTerrain.h"
 #include "chrono_vehicle/wheeled_vehicle/vehicle/WheeledTrailer.h"
 
 #include "rclcpp/rclcpp.hpp"
@@ -27,7 +27,7 @@ class RosArmBridge {
                  double height_probe_z);
     ~RosArmBridge();
 
-    void Synchronize(double time, chrono::vehicle::RigidTerrain& terrain);
+    void Synchronize(double time, chrono::vehicle::ChTerrain& terrain);
 
   private:
     struct ArmCommand {

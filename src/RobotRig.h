@@ -14,7 +14,7 @@
 #include "chrono/physics/ChSystem.h"
 #include "chrono_vehicle/ChDriver.h"
 #include "chrono_vehicle/driver/ChInteractiveDriver.h"
-#include "chrono_vehicle/terrain/RigidTerrain.h"
+#include "chrono_vehicle/ChTerrain.h"
 #include "chrono_vehicle/wheeled_vehicle/vehicle/WheeledTrailer.h"
 #include "chrono_vehicle/wheeled_vehicle/vehicle/WheeledVehicle.h"
 
@@ -42,7 +42,7 @@ class RobotRig {
     chrono::vehicle::ChDriver* GetDriver() const;
     const std::vector<std::shared_ptr<chrono::ChBodyAuxRef>>& GetRocks() const;
 
-    void InitializeOnTerrain(chrono::vehicle::RigidTerrain& terrain,
+    void InitializeOnTerrain(chrono::vehicle::ChTerrain& terrain,
                              const std::shared_ptr<chrono::ChContactMaterial>& rock_mat,
                              const std::string& chrono_data_path,
                              const std::string& amd_uw_data_path,
@@ -54,17 +54,17 @@ class RobotRig {
                              double step_size,
                              const RockFieldConfig& rock_field_config);
 
-    void Synchronize(double time, chrono::vehicle::RigidTerrain& terrain);
+    void Synchronize(double time, chrono::vehicle::ChTerrain& terrain);
     void Advance(double step);
     chrono::vehicle::DriverInputs GetDriverInputs() const;
     void LogMotionIfNeeded(int step_number,
                            int motion_log_steps,
-                           chrono::vehicle::RigidTerrain& terrain) const;
+                           chrono::vehicle::ChTerrain& terrain) const;
 
   private:
     void InitializeVehicle(const chrono::ChCoordsys<>& init_pos);
     void InitializeTrailer();
-    void ReseatRig(chrono::vehicle::RigidTerrain& terrain,
+    void ReseatRig(chrono::vehicle::ChTerrain& terrain,
                    const std::vector<chrono::ChBody*>& preexisting_bodies,
                    double height_probe_z,
                    double seat_clearance);
@@ -75,7 +75,7 @@ class RobotRig {
 #ifdef AMD_UW_ENABLE_ROS2
     void InitializeArmBridge(double height_probe_z);
 #endif
-    void Settle(chrono::vehicle::RigidTerrain& terrain, double settle_time, double step_size);
+    void Settle(chrono::vehicle::ChTerrain& terrain, double settle_time, double step_size);
     void UpdateRockCollisionActivation();
 
     int m_rank;
@@ -89,7 +89,7 @@ class RobotRig {
     std::shared_ptr<chrono::vehicle::WheeledTrailer> m_trailer;
     std::shared_ptr<chrono::ChBody> m_trailer_bed;
     std::shared_ptr<chrono::ChBody> m_trailer_tailgate;
-    std::shared_ptr<chrono::ChLinkLockRevolute> m_trailer_tailgate_hinge;
+    std::shared_ptr<chrono::ChLinkMotorRotationAngle> m_trailer_tailgate_hinge;
     std::shared_ptr<chrono::ChLinkMotorRotationAngle> m_trailer_bed_motor;
     std::unique_ptr<chrono::vehicle::ChDriver> m_driver;
     std::shared_ptr<chrono::vehicle::ChInteractiveDriver> m_irr_driver;

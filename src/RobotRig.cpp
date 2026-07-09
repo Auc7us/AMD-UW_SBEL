@@ -16,6 +16,7 @@
 #include "chrono/utils/ChConstants.h"
 #include "chrono_synchrono/utils/SynLog.h"
 #include "chrono_vehicle/ChVehicleDataPath.h"
+#include "chrono_vehicle/terrain/SCMTerrain.h"
 #include "chrono_vehicle/utils/ChVehicleUtilsJSON.h"
 
 #include "LrvArm.h"
@@ -121,7 +122,7 @@ const std::vector<std::shared_ptr<chrono::ChBodyAuxRef>>& RobotRig::GetRocks() c
     return m_rocks;
 }
 
-void RobotRig::InitializeOnTerrain(chrono::vehicle::RigidTerrain& terrain,
+void RobotRig::InitializeOnTerrain(chrono::vehicle::ChTerrain& terrain,
                                    const std::shared_ptr<chrono::ChContactMaterial>& rock_mat,
                                    const std::string& chrono_data_path,
                                    const std::string& amd_uw_data_path,
@@ -168,6 +169,25 @@ void RobotRig::InitializeOnTerrain(chrono::vehicle::RigidTerrain& terrain,
 #ifdef AMD_UW_ENABLE_ROS2
     InitializeArmBridge(height_probe_z);
 #endif
+    // If this is deformable SCM terrain, restrict soil computation to moving patches
+    // under each wheel BEFORE settling. Otherwise SCM makes the entire ~450k-node grid
+    // active and every settle step recomputes the whole grid -- which stalls startup
+    // for minutes. Must run before Settle() (which steps the sim 2000x).
+    if (auto* scm = dynamic_cast<chrono::vehicle::SCMTerrain*>(&terrain)) {
+        const chrono::ChVector3d wheel_domain(1.0, 0.7, 1.0);
+        for (auto& axle : m_vehicle->GetAxles())
+            for (auto& wheel : axle->GetWheels())
+                scm->AddActiveDomain(wheel->GetSpindle(), chrono::VNULL, wheel_domain);
+        for (auto& axle : m_trailer->GetAxles())
+            for (auto& wheel : axle->GetWheels())
+                scm->AddActiveDomain(wheel->GetSpindle(), chrono::VNULL, wheel_domain);
+        // A small active domain per rock so SCM actually supports them. Without it,
+        // rocks lie outside every active domain, get no soil reaction, and fall
+        // through the terrain during settle (spawning "under" the SCM surface).
+        const chrono::ChVector3d rock_domain(1.0, 1.0, 1.0);
+        for (auto& rock : m_rocks)
+            scm->AddActiveDomain(rock, chrono::ChVector3d(0.0, 0.0, 0.3), rock_domain);
+    }
     Settle(terrain, settle_time, step_size);
     if (settle_time > 0) {
         for (const auto& rock : m_rocks)
@@ -187,8 +207,12 @@ void RobotRig::InitializeVehicle(const chrono::ChCoordsys<>& init_pos) {
     m_vehicle->SetSteeringVisualizationType(chrono::VisualizationType::PRIMITIVES);
     m_vehicle->SetWheelVisualizationType(chrono::VisualizationType::MESH);
 
+    // Lunar-scaled engine torque (~1/5 of the Earth-tuned map). At 1.62 m/s^2 the
+    // rover weighs ~6x less, so the original ~397 Nm peak wheelie'd the front off
+    // the ground and killed steering grip. Tune the SCALE in the generator or edit
+    // Polaris_EngineSimpleMap_lunar.json directly.
     auto engine = chrono::vehicle::ReadEngineJSON(
-        chrono::vehicle::GetVehicleDataFile("LRV/Polaris_EngineSimpleMap.json"));
+        chrono::vehicle::GetVehicleDataFile("LRV/Polaris_EngineSimpleMap_lunar.json"));
     auto transmission = chrono::vehicle::ReadTransmissionJSON(
         chrono::vehicle::GetVehicleDataFile("LRV/Polaris_AutomaticTransmissionSimpleMap.json"));
     auto powertrain = chrono_types::make_shared<chrono::vehicle::ChPowertrainAssembly>(engine, transmission);
@@ -201,6 +225,37 @@ void RobotRig::InitializeVehicle(const chrono::ChCoordsys<>& init_pos) {
             m_vehicle->InitializeTire(tire, wheel, chrono::VisualizationType::MESH);
             tire->SetStepsize(m_tire_step_size);
         }
+    }
+
+    // Front ballast: a mass rigidly welded to the chassis over the front axle to
+    // keep the front tires loaded so they don't lift/bounce under acceleration and
+    // keep steering grip. Tune front_ballast_mass (and the height) to taste; set to
+    // 0 to disable.
+    const double front_ballast_mass = 250.0;
+    if (front_ballast_mass > 0.0) {
+        const auto chassis = m_vehicle->GetChassis()->GetBody();
+        const auto front_spindle = m_vehicle->GetAxles().front()->GetWheels().front()->GetSpindle();
+        // Place over the front axle (chassis-local x from the front spindle), at the
+        // chassis reference height (low, so it also drops the CG a little).
+        const chrono::ChVector3d front_local = chassis->TransformPointParentToLocal(front_spindle->GetPos());
+        const chrono::ChVector3d ballast_local(front_local.x(), 0.0, 0.0);
+        const chrono::ChVector3d ballast_world = chassis->TransformPointLocalToParent(ballast_local);
+
+        auto ballast = chrono_types::make_shared<chrono::ChBody>();
+        ballast->SetName("front_ballast");
+        ballast->SetPos(ballast_world);
+        ballast->SetRot(chassis->GetRot());
+        ballast->SetMass(front_ballast_mass);
+        const double r = 0.2;  // inertia of a compact lump
+        ballast->SetInertiaXX(chrono::ChVector3d(0.4 * front_ballast_mass * r * r,
+                                                 0.4 * front_ballast_mass * r * r,
+                                                 0.4 * front_ballast_mass * r * r));
+        GetSystem()->AddBody(ballast);
+
+        auto weld = chrono_types::make_shared<chrono::ChLinkLockLock>();
+        weld->SetName("front_ballast_weld");
+        weld->Initialize(ballast, chassis, chrono::ChFramed(ballast_world, chassis->GetRot()));
+        GetSystem()->AddLink(weld);
     }
 }
 
@@ -229,7 +284,7 @@ void RobotRig::InitializeArm(const std::string& amd_uw_data_path) {
     m_arm = std::make_unique<LrvArm>(GetSystem(), chassis, amd_uw_data_path, mount_pos, chassis->GetRot());
 }
 
-void RobotRig::ReseatRig(chrono::vehicle::RigidTerrain& terrain,
+void RobotRig::ReseatRig(chrono::vehicle::ChTerrain& terrain,
                          const std::vector<chrono::ChBody*>& preexisting_bodies,
                          double height_probe_z,
                          double seat_clearance) {
@@ -335,12 +390,18 @@ void RobotRig::InitializeTrailerBed() {
     m_trailer_tailgate->EnableCollision(true);
     GetSystem()->AddBody(m_trailer_tailgate);
 
+    // Tailgate hinge as a rotation motor held at angle 0 -> the gate stays CLOSED
+    // (a free revolute here just dangled open, since a bottom-hinged flap is
+    // unstable upright under gravity). Same pattern as the bed motor; drive this
+    // angle later to swing the gate open for a dump. Motor turns about frame Z, so
+    // rotate +90 deg about X to put Z on the trailer lateral (Y) axis.
     const chrono::ChQuaternion<> tailgate_hinge_rot = chassis->GetRot() * chrono::QuatFromAngleX(chrono::CH_PI_2);
     const chrono::ChVector3d tailgate_hinge_pos = bed_pos + chassis->GetRot().Rotate(tailgate_hinge_local);
-    m_trailer_tailgate_hinge = chrono_types::make_shared<chrono::ChLinkLockRevolute>();
+    m_trailer_tailgate_hinge = chrono_types::make_shared<chrono::ChLinkMotorRotationAngle>();
     m_trailer_tailgate_hinge->SetName("trailer_tailgate_hinge");
     m_trailer_tailgate_hinge->Initialize(m_trailer_tailgate, m_trailer_bed,
                                          chrono::ChFramed(tailgate_hinge_pos, tailgate_hinge_rot));
+    m_trailer_tailgate_hinge->SetAngleFunction(chrono_types::make_shared<chrono::ChFunctionConst>(0.0));
     GetSystem()->AddLink(m_trailer_tailgate_hinge);
 
     // Revolute motor about the chassis lateral (Y) axis. A rotation motor turns
@@ -382,7 +443,7 @@ void RobotRig::InitializeArmBridge(double height_probe_z) {
 }
 #endif
 
-void RobotRig::Settle(chrono::vehicle::RigidTerrain& terrain, double settle_time, double step_size) {
+void RobotRig::Settle(chrono::vehicle::ChTerrain& terrain, double settle_time, double step_size) {
     if (settle_time <= 0)
         return;
 
@@ -408,7 +469,7 @@ void RobotRig::Settle(chrono::vehicle::RigidTerrain& terrain, double settle_time
     GetSystem()->SetChTime(0.0);
 }
 
-void RobotRig::Synchronize(double time, chrono::vehicle::RigidTerrain& terrain) {
+void RobotRig::Synchronize(double time, chrono::vehicle::ChTerrain& terrain) {
     UpdateRockCollisionActivation();
     m_driver->Synchronize(time);
 #ifdef AMD_UW_ENABLE_ROS2
@@ -465,7 +526,7 @@ void RobotRig::UpdateRockCollisionActivation() {
 
 void RobotRig::LogMotionIfNeeded(int step_number,
                                  int motion_log_steps,
-                                 chrono::vehicle::RigidTerrain& terrain) const {
+                                 chrono::vehicle::ChTerrain& terrain) const {
     if (motion_log_steps <= 0 || step_number % motion_log_steps != 0)
         return;
 

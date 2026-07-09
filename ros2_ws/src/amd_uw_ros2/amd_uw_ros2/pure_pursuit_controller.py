@@ -63,7 +63,13 @@ class PurePursuitController(Node):
         self.declare_parameter("rear_reference_offset_m", 1.25)
         self.declare_parameter("pickup_angle_min_deg", 60.0)
         self.declare_parameter("pickup_angle_max_deg", 100.0)
-        self.declare_parameter("pickup_slowdown_offset_m", 10.0)
+        # Distance over which target speed ramps linearly down to the boundary
+        # speed. On deformable SCM soil the rover decelerates much more slowly than
+        # on rigid ground, so a 10 m band left it still hot at the boundary -> the
+        # speed controller slammed the brake, spiking the front axle and locking the
+        # steering. Widened so it actually reaches ~boundary speed by the boundary
+        # without hard braking. Increase further if it still enters too fast.
+        self.declare_parameter("pickup_slowdown_offset_m", 25.0)
         # Crawl into the pickup zone so a real full stop is reachable: on low-traction
         # lunar terrain a rover entering at 2 m/s just slides with the wheels locked
         # and never settles. Ramp down to a slow boundary speed and allow it to reach

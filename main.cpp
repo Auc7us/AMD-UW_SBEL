@@ -17,7 +17,7 @@
 #include "chrono/physics/ChSystemSMC.h"
 
 #include "chrono_vehicle/ChVehicleDataPath.h"
-#include "chrono_vehicle/terrain/RigidTerrain.h"
+#include "chrono_vehicle/terrain/SCMTerrain.h"
 #include "chrono_vehicle/wheeled_vehicle/ChWheeledVehicleVisualSystemVSG.h"
 
 #include "chrono_sensor/ChSensorManager.h"
@@ -197,25 +197,53 @@ int main(int argc, char* argv[]) {
         system = robot->GetSystem();
     }
 
-    // Apollo-site height-map terrain. Each BMP pixel maps to an integer-sized terrain cell.
-    RigidTerrain terrain(system);
-    auto ground_mat = MakeContactMaterial(contact_method, 0.9f, 0.0f);
-    const ChCoordsys<> terrain_csys(ChVector3d(0.0, 0.0, terrain_height_offset), QUNIT);
-    auto ground = terrain.AddPatch(ground_mat, terrain_csys, amd_uw_data_path + terrain_heightmap_file,
-                                   terrain_length, terrain_width, terrain_min_height, terrain_max_height);
-    ground->SetColor(ChColor(0.55f, 0.55f, 0.52f));
-    terrain.Initialize();
-    ApplyMaterialToVisualShapes(ground->GetGroundBody(), CreateLunarHapkeMaterial());
+    // Lunar gravity. ChVehicle's constructor sets Earth gravity (-9.81) on the
+    // system; at that pull the rover's tires bog deep into the soft SCM regolith
+    // and it can't drive. This is a lunar rover, so use 1.62 m/s^2 -- ~6x less
+    // normal load -> far less sinkage while keeping the traction/weight ratio. Set
+    // here (after the vehicle ctor, before terrain + settle) so settling and the
+    // whole run use lunar gravity, on every rank.
+    const double lunar_gravity = 1.62;
+    system->SetGravitationalAcceleration(ChVector3d(0.0, 0.0, -lunar_gravity));
 
-    // RigidTerrain::GetHeight() works by casting a vertical ray into the patch
-    // collision model. That model is only inserted into the Bullet collision
-    // world when the system is initialized on the first DoStepDynamics(), so a
-    // probe issued here (before any step) would always miss and return 0 -- which
-    // is the bug that forced the large manual spawn offset. Bind the collision
-    // models now so the height probe below hits the real terrain surface. The
-    // call is idempotent: already-bound models are skipped, and the vehicle/
-    // trailer models added later are still bound on the first step.
-    system->GetCollisionSystem()->BindAll();
+    // Deformable SCM (Soil Contact Model) terrain: a 30 m (across) x 150 m (along)
+    // lunar-regolith lane laid over robot 1's driving corridor -- heading 330 deg
+    // from its spawn at (0,-25). The height profile is cropped from terrain2.bmp
+    // along that corridor (see tools/make_scm_crop.py -> data/terrain/terrain_scm.bmp).
+    // On SCM the tire traction/braking force comes from the soil shear model
+    // (Bekker/Janosi), NOT the SMC penalty friction that fails on rigid ground --
+    // this is the test of whether the rover can brake/stop on soft soil.
+    SCMTerrain terrain(system);
+    terrain.SetReferenceFrame(
+        ChCoordsys<>(ChVector3d(60.622, -60.0, terrain_height_offset), QuatFromAngleZ(330.0 * CH_DEG_TO_RAD)));
+    // Lunar regolith (soft): low frictional modulus, ~0 cohesion, ~30 deg internal
+    // friction, small Janosi shear -> tires sink slightly and develop shear traction.
+    terrain.SetSoilParameters(0.2e6,  // Bekker Kphi (frictional modulus)
+                              0,      // Bekker Kc (cohesive modulus)
+                              1.1,    // Bekker n exponent
+                              0,      // Mohr cohesive limit (Pa)
+                              30,     // Mohr internal friction angle (deg)
+                              0.01,   // Janosi shear coefficient (m)
+                              4e7,    // elastic stiffness before yield (Pa/m)
+                              3e4);   // damping (Pa*s/m)
+    terrain.SetPlotType(SCMTerrain::PLOT_SINKAGE, 0.0, 0.10);
+    // Register a user active domain BEFORE Initialize. SCM otherwise creates a
+    // null-body "default" domain during the first system setup (when no user
+    // domains exist yet); once the per-wheel domains are added during robot init
+    // that stale null domain remains and crashes UpdateActiveDomain. A small fixed
+    // marker at the lane center avoids that and also bounds SCM cost on the sensor
+    // rank (rank 0 has no wheels but still steps the terrain every frame).
+    auto scm_marker = chrono_types::make_shared<ChBody>();
+    scm_marker->SetFixed(true);
+    scm_marker->SetPos(ChVector3d(60.622, -60.0, terrain_height_offset));
+    system->AddBody(scm_marker);
+    terrain.AddActiveDomain(scm_marker, VNULL, ChVector3d(4.0, 4.0, 4.0));
+    terrain.Initialize(amd_uw_data_path + "terrain/terrain_scm.bmp",
+                       150.0,  // sizeX (along heading)
+                       30.0,   // sizeY (across heading)
+                       2.451,  // hMin (black pixel)
+                       7.816,  // hMax (white pixel)
+                       0.1);   // grid resolution
 
     const double start_spacing = 50.0;
     // Probe from above the tallest possible terrain so the downward ray cast hits.
@@ -226,6 +254,7 @@ int main(int argc, char* argv[]) {
     if (owns_robot) {
         robot->InitializeOnTerrain(terrain, rock_mat, chrono_data_path, amd_uw_data_path, start_spacing, height_probe_z,
                                    vehicle_start_clearance, seat_clearance, settle_time, step_size, rock_field_config);
+        // (SCM per-wheel active domains are set inside InitializeOnTerrain, before settle.)
 
         auto vehicle_agent = chrono_types::make_shared<SynWheeledVehicleAgent>(robot->GetVehicle());
         vehicle_agent->SetZombieVisualizationFiles("LRV/meshes/Polaris_chassis.obj",

@@ -78,7 +78,7 @@ RosArmBridge::~RosArmBridge() {
         m_executor->remove_node(m_node);
 }
 
-void RosArmBridge::Synchronize(double time, chrono::vehicle::RigidTerrain& terrain) {
+void RosArmBridge::Synchronize(double time, chrono::vehicle::ChTerrain& terrain) {
     m_executor->spin_some();
     PublishArmBasePose();
     PublishPlaceTarget();

@@ -43,7 +43,7 @@ std::shared_ptr<chrono::ChTriangleMeshConnected> LoadRockMesh(const std::string&
 
 std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> AddRockFields(
     chrono::ChSystem* system,
-    chrono::vehicle::RigidTerrain& terrain,
+    chrono::vehicle::ChTerrain& terrain,
     const std::shared_ptr<chrono::ChContactMaterial>& rock_mat,
     const std::string& chrono_data_path,
     const std::string& amd_uw_data_path,
