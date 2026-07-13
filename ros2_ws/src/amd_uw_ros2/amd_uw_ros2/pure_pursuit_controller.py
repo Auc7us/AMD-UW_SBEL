@@ -55,6 +55,10 @@ class PurePursuitController(Node):
         self.declare_parameter("target_speed_ramp_mps2", 10.0)
         self.declare_parameter("throttle_ramp_per_s", 10.0)
         self.declare_parameter("brake_ramp_per_s", 10.0)
+        # Steering slew-rate limit (units/s of the [-1,1] command). Caps how fast the
+        # commanded steer angle can change so pure-pursuit corrections come in smoothly
+        # instead of snapping. 2.5 => full lock in ~0.4 s. Lower = gentler/slower.
+        self.declare_parameter("steering_ramp_per_s", 2.5)
         self.declare_parameter("switch_radius_m", 1.0)
         self.declare_parameter("lookahead_min_m", 2.0)
         self.declare_parameter("wheelbase_m", 2.5)
@@ -378,9 +382,10 @@ class PurePursuitController(Node):
     def ramp_command(self, target: VehicleCommand) -> VehicleCommand:
         throttle_delta = max(0.0, float(self.get_parameter("throttle_ramp_per_s").value)) * self.dt
         brake_delta = max(0.0, float(self.get_parameter("brake_ramp_per_s").value)) * self.dt
+        steering_delta = max(0.0, float(self.get_parameter("steering_ramp_per_s").value)) * self.dt
 
         return VehicleCommand(
-            steering=target.steering,
+            steering=approach(self.command.steering, target.steering, steering_delta),
             throttle=approach(self.command.throttle, target.throttle, throttle_delta),
             brake=approach(self.command.brake, target.brake, brake_delta),
         )

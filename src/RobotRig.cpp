@@ -193,6 +193,8 @@ void RobotRig::InitializeOnTerrain(chrono::vehicle::ChTerrain& terrain,
         for (const auto& rock : m_rocks)
             rock->SetSleeping(true);
     }
+    // Reference front-axle load at rest for the load-aware traction guard.
+    m_front_static_load = FrontAxleNormalLoad(terrain);
     UpdateRockCollisionActivation();
 
     chrono::synchrono::SynLog() << "Rank " << m_rank << " owns robot index " << m_robot_index << " and "
@@ -469,6 +471,72 @@ void RobotRig::Settle(chrono::vehicle::ChTerrain& terrain, double settle_time, d
     GetSystem()->SetChTime(0.0);
 }
 
+double RobotRig::FrontAxleNormalLoad(chrono::vehicle::ChTerrain& terrain) const {
+    const auto& axles = m_vehicle->GetAxles();
+    if (axles.empty())
+        return 0.0;
+    double fz = 0.0;
+    for (auto& wheel : axles.front()->GetWheels()) {
+        const auto& tire = wheel->GetTire();
+        if (tire)
+            fz += std::abs(tire->ReportTireForce(&terrain).force.z());
+    }
+    return fz;
+}
+
+void RobotRig::ApplyTractionGuard(chrono::vehicle::DriverInputs& in, chrono::vehicle::ChTerrain& terrain) const {
+    // --- Tunables ---
+    constexpr double mu = 0.8;          // tire-terrain friction used for the limit
+    constexpr double wheelbase = 2.5;   // m
+    constexpr double max_steer = 0.6;   // road-wheel angle (rad) at |steering|=1 (matches controller)
+    constexpr double brake_gain = 0.5;  // how hard to brake when over the lateral limit
+    constexpr double brake_cap = 0.6;   // max auto-brake the guard will add
+
+    // Lateral acceleration the front can sustain = mu * g, scaled by how loaded the
+    // front currently is vs. at rest (weight transfer under accel, bumps, and SCM
+    // unloading all drop the front's grip). Open-loop (ratio=1) when no reference.
+    const double g = GetSystem()->GetGravitationalAcceleration().Length();
+    double load_ratio = 1.0;
+    if (m_front_static_load > 1e-3) {
+        load_ratio = FrontAxleNormalLoad(terrain) / m_front_static_load;
+        load_ratio = std::clamp(load_ratio, 0.0, 1.5);
+    }
+    const double a_lat_max = mu * g * load_ratio;
+
+    // Lateral acceleration demanded by the commanded steering at the current speed.
+    const double v = m_vehicle->GetSpeed();
+    const double delta = in.m_steering * max_steer;
+    const double kappa = std::tan(delta) / wheelbase;  // path curvature
+    const double a_lat = v * v * std::abs(kappa);
+
+    if (a_lat_max <= 1e-6) {
+        // Front essentially unloaded (e.g. wheelie): no cornering force available.
+        in.m_throttle = 0.0;
+        in.m_braking = std::max(in.m_braking, 0.3);
+        return;
+    }
+
+    if (a_lat > a_lat_max) {
+        // Over the friction limit: too fast to make this turn. Cut throttle, add brake
+        // to shed speed, and clamp steering to the sharpest arc the front can hold
+        // (steering past it just plows/understeers). This makes it slow down to turn.
+        in.m_throttle = 0.0;
+        const double over = a_lat / a_lat_max - 1.0;
+        in.m_braking = std::max(in.m_braking, std::clamp(brake_gain * over, 0.0, brake_cap));
+
+        const double kappa_feasible = a_lat_max / std::max(v * v, 1e-3);
+        const double steer_feasible = std::atan(wheelbase * kappa_feasible) / max_steer;
+        in.m_steering = std::clamp(in.m_steering, -steer_feasible, steer_feasible);
+    } else {
+        // Within the lateral limit: share the friction circle with longitudinal force.
+        // The more of the lateral budget the turn uses, the less throttle is allowed,
+        // so the front stays planted through the turn. rho in [0,1]; cap = sqrt(1-rho^2).
+        const double rho = a_lat / a_lat_max;
+        const double throttle_cap = std::sqrt(std::max(0.0, 1.0 - rho * rho));
+        in.m_throttle = std::min(in.m_throttle, throttle_cap);
+    }
+}
+
 void RobotRig::Synchronize(double time, chrono::vehicle::ChTerrain& terrain) {
     UpdateRockCollisionActivation();
     m_driver->Synchronize(time);
@@ -479,7 +547,8 @@ void RobotRig::Synchronize(double time, chrono::vehicle::ChTerrain& terrain) {
     if (m_arm)
         m_arm->Update(time);
 #endif
-    const auto driver_inputs = m_driver->GetInputs();
+    auto driver_inputs = m_driver->GetInputs();
+    ApplyTractionGuard(driver_inputs, terrain);
     m_vehicle->Synchronize(time, driver_inputs, terrain);
     m_trailer->Synchronize(time, driver_inputs, terrain);
 }

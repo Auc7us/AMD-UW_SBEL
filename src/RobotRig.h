@@ -78,6 +78,14 @@ class RobotRig {
     void Settle(chrono::vehicle::ChTerrain& terrain, double settle_time, double step_size);
     void UpdateRockCollisionActivation();
 
+    // Friction-circle traction guard: clamps the driver's (steering, throttle,
+    // braking) to what the front tires can actually deliver, so the rover slows to
+    // turn (instead of plowing straight past) and doesn't accelerate out of grip.
+    // Load-aware via the measured front-axle normal force; open-loop (mu*g) when the
+    // static reference isn't available.
+    void ApplyTractionGuard(chrono::vehicle::DriverInputs& inputs, chrono::vehicle::ChTerrain& terrain) const;
+    double FrontAxleNormalLoad(chrono::vehicle::ChTerrain& terrain) const;
+
     int m_rank;
     int m_robot_index;
     int m_num_robots;
@@ -99,6 +107,10 @@ class RobotRig {
 #endif
     std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> m_rocks;
     std::vector<double> m_rock_top_heights;
+
+    // Front-axle normal load at rest (captured after settle), used as the reference
+    // for the load-aware traction guard. 0 => guard runs open-loop (assumes full load).
+    double m_front_static_load = 0.0;
 };
 
 }  // namespace amd_uw
