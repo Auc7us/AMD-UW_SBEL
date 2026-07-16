@@ -64,6 +64,10 @@ class RobotRig {
   private:
     void InitializeVehicle(const chrono::ChCoordsys<>& init_pos);
     void InitializeTrailer();
+    // Add radial box "grousers" around a wheel spindle, on top of the RigidTire
+    // cylinder (one compound/union collision). Primitives only -> cheap and stable;
+    // the bricks imprint tread marks / catch soil once the SCM grid is fine enough.
+    void AddGrouserBricks(const std::shared_ptr<chrono::ChBody>& spindle);
     void ReseatRig(chrono::vehicle::ChTerrain& terrain,
                    const std::vector<chrono::ChBody*>& preexisting_bodies,
                    double height_probe_z,

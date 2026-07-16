@@ -68,8 +68,9 @@ cd ~/mountdir/amd-uw/ros2_ws
 source install/setup.bash
 ros2 launch amd_uw_ros2 robot_controllers.launch.py \
   robot_ids:=1,2 \
-  target_speed_mps:=7.0 \
-  switch_radius_m:=2.0
+  target_speed_mps:=3.0 \
+  switch_radius_m:=2.0 \
+  rock_side_offset_m:=2.0
 ```
 
 Terminal 2, start the C++ sim:

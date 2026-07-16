@@ -226,6 +226,7 @@ void RobotRig::InitializeVehicle(const chrono::ChCoordsys<>& init_pos) {
                 chrono::vehicle::GetVehicleDataFile("LRV/Polaris_RigidTire.json"));
             m_vehicle->InitializeTire(tire, wheel, chrono::VisualizationType::MESH);
             tire->SetStepsize(m_tire_step_size);
+            AddGrouserBricks(wheel->GetSpindle());
         }
     }
 
@@ -275,7 +276,32 @@ void RobotRig::InitializeTrailer() {
                 chrono::vehicle::GetVehicleDataFile("LRV/Polaris_RigidTire.json"));
             m_trailer->InitializeTire(tire, wheel, chrono::VisualizationType::MESH);
             tire->SetStepsize(m_tire_step_size);
+            AddGrouserBricks(wheel->GetSpindle());
         }
+    }
+}
+
+void RobotRig::AddGrouserBricks(const std::shared_ptr<chrono::ChBody>& spindle) {
+    // Approximate grousers as radial box "bricks" spaced around the tire. They attach
+    // to the same spindle as the RigidTire cylinder, so the wheel's collision is the
+    // union of cylinder + bricks -- all primitives, so contact stays cheap and stable.
+    // The bricks imprint tread marks / catch soil once the SCM grid resolves them.
+    constexpr int n_grousers = 10;
+    constexpr double carcass_r = 0.4089;  // = RigidTire cylinder Radius (carcass)
+    constexpr double height = 0.02;       // radial protrusion (grouser tips ~0.429)
+    constexpr double axial = 0.26;        // length along the axle (< tire width)
+    constexpr double tangential = 0.05;   // thickness around the circumference
+    const auto mat = MakeContactMaterial(m_contact_method, 0.9f);
+    for (int i = 0; i < n_grousers; ++i) {
+        // Spindle spins about its local Y; the wheel lies in the local X-Z plane. Place
+        // each brick at radius carcass_r+height/2 in direction (cos,0,sin) and rotate
+        // about Y so the box's local X points radially outward.
+        const double th = i * 2.0 * chrono::CH_PI / n_grousers;
+        const chrono::ChVector3d pos(std::cos(th) * (carcass_r + height / 2.0), 0.0,
+                                     std::sin(th) * (carcass_r + height / 2.0));
+        spindle->AddCollisionShape(
+            chrono_types::make_shared<chrono::ChCollisionShapeBox>(mat, height, axial, tangential),
+            chrono::ChFramed(pos, chrono::QuatFromAngleY(-th)));
     }
 }
 

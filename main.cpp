@@ -206,44 +206,52 @@ int main(int argc, char* argv[]) {
     const double lunar_gravity = 1.62;
     system->SetGravitationalAcceleration(ChVector3d(0.0, 0.0, -lunar_gravity));
 
-    // Deformable SCM (Soil Contact Model) terrain: a 30 m (across) x 150 m (along)
-    // lunar-regolith lane laid over robot 1's driving corridor -- heading 330 deg
-    // from its spawn at (0,-25). The height profile is cropped from terrain2.bmp
-    // along that corridor (see tools/make_scm_crop.py -> data/terrain/terrain_scm.bmp).
-    // On SCM the tire traction/braking force comes from the soil shear model
-    // (Bekker/Janosi), NOT the SMC penalty friction that fails on rigid ground --
-    // this is the test of whether the rover can brake/stop on soft soil.
+    // Deformable SCM (Soil Contact Model) terrain: a per-robot lunar-regolith lane
+    // (30 m across x 450 m along) laid over that robot's driving corridor, so each
+    // robot drives its whole mission on SCM and gets a genuinely different chunk of
+    // the map. The height profile is cropped from terrain2.bmp along each corridor
+    // (see tools/make_scm_crop.py -> data/terrain/terrain_scm_r{i}.bmp). On SCM the
+    // tire traction/braking comes from the soil shear model (Bekker/Janosi), not the
+    // SMC penalty friction that fails on rigid ground. Rank 0 (sensor/viz, no robot)
+    // shows robot 1's lane so the overhead camera sees the action.
+    struct ScmLane {
+        const char* file;
+        double ox, oy, yaw_deg, hmin, hmax;
+    };
+    static const ScmLane scm_lanes[] = {
+        {"terrain/terrain_scm_r0.bmp", 190.526, -135.000, 330.0, -10.458, 8.961},  // robot 1 (rank 1)
+        {"terrain/terrain_scm_r1.bmp", 110.000, 215.526, 60.0, -12.028, 3.597},    // robot 2 (rank 2)
+    };
+    constexpr int num_lanes = static_cast<int>(sizeof(scm_lanes) / sizeof(scm_lanes[0]));
+    const int lane_idx = std::min(owns_robot ? (rank - 1) : 0, num_lanes - 1);
+    const ScmLane& lane = scm_lanes[lane_idx];
+    // 2 cm SCM so the grouser bricks actually bite the soil (cures the front-wheel slip
+    // seen at 0.1 m, where the grid can't feel the grousers). A fine grid can't cover
+    // the 450 m lane (OOM), so this is a short flat patch centered on each rank's robot
+    // spawn. To restore the 450 m mission lane: scm_length=450, scm_width=30, delta=0.1,
+    // SetReferenceFrame(lane...) + Initialize(amd_uw_data_path+lane.file, ..., lane.hmin, lane.hmax, 0.1).
+    const int lane_ridx = owns_robot ? (rank - 1) : 0;
+    const double scm_length = 40.0;   // along heading
+    const double scm_width = 16.0;    // across heading
+    const double scm_delta = 0.02;    // fine grid: grousers imprint / catch soil
+    const double lane_hdg = lane.yaw_deg * CH_DEG_TO_RAD;
+    const double lane_spawn_y = (lane_ridx - 0.5 * (num_robot_ranks - 1)) * 50.0;
+    const double lane_ox = std::cos(lane_hdg) * (scm_length / 2.0 - 4.0);
+    const double lane_oy = lane_spawn_y + std::sin(lane_hdg) * (scm_length / 2.0 - 4.0);
+
     SCMTerrain terrain(system);
-    terrain.SetReferenceFrame(
-        ChCoordsys<>(ChVector3d(60.622, -60.0, terrain_height_offset), QuatFromAngleZ(330.0 * CH_DEG_TO_RAD)));
-    // Lunar regolith (soft): low frictional modulus, ~0 cohesion, ~30 deg internal
-    // friction, small Janosi shear -> tires sink slightly and develop shear traction.
-    terrain.SetSoilParameters(0.2e6,  // Bekker Kphi (frictional modulus)
-                              0,      // Bekker Kc (cohesive modulus)
-                              1.1,    // Bekker n exponent
-                              0,      // Mohr cohesive limit (Pa)
-                              30,     // Mohr internal friction angle (deg)
-                              0.01,   // Janosi shear coefficient (m)
-                              4e7,    // elastic stiffness before yield (Pa/m)
-                              3e4);   // damping (Pa*s/m)
+    terrain.SetReferenceFrame(ChCoordsys<>(ChVector3d(lane_ox, lane_oy, terrain_height_offset), QuatFromAngleZ(lane_hdg)));
+    // Chrono's validated VIPER/Curiosity lunar regolith (grouser-equivalent shear).
+    terrain.SetSoilParameters(0.82e6, 0.14e4, 1.0, 0.017e4, 35.0, 1.78e-2, 2e8, 3e4);
     terrain.SetPlotType(SCMTerrain::PLOT_SINKAGE, 0.0, 0.10);
-    // Register a user active domain BEFORE Initialize. SCM otherwise creates a
-    // null-body "default" domain during the first system setup (when no user
-    // domains exist yet); once the per-wheel domains are added during robot init
-    // that stale null domain remains and crashes UpdateActiveDomain. A small fixed
-    // marker at the lane center avoids that and also bounds SCM cost on the sensor
-    // rank (rank 0 has no wheels but still steps the terrain every frame).
+    // Small marker domain registered BEFORE Initialize so SCM doesn't build a null-body
+    // default domain that later crashes; kept tiny since active nodes scale as 1/delta^2.
     auto scm_marker = chrono_types::make_shared<ChBody>();
     scm_marker->SetFixed(true);
-    scm_marker->SetPos(ChVector3d(60.622, -60.0, terrain_height_offset));
+    scm_marker->SetPos(ChVector3d(lane_ox, lane_oy, terrain_height_offset));
     system->AddBody(scm_marker);
-    terrain.AddActiveDomain(scm_marker, VNULL, ChVector3d(4.0, 4.0, 4.0));
-    terrain.Initialize(amd_uw_data_path + "terrain/terrain_scm.bmp",
-                       150.0,  // sizeX (along heading)
-                       30.0,   // sizeY (across heading)
-                       2.451,  // hMin (black pixel)
-                       7.816,  // hMax (white pixel)
-                       0.1);   // grid resolution
+    terrain.AddActiveDomain(scm_marker, VNULL, ChVector3d(0.6, 0.6, 0.6));
+    terrain.Initialize(scm_length, scm_width, scm_delta);  // flat fine patch
 
     const double start_spacing = 50.0;
     // Probe from above the tallest possible terrain so the downward ray cast hits.
@@ -259,14 +267,14 @@ int main(int argc, char* argv[]) {
         auto vehicle_agent = chrono_types::make_shared<SynWheeledVehicleAgent>(robot->GetVehicle());
         vehicle_agent->SetZombieVisualizationFiles("LRV/meshes/Polaris_chassis.obj",
                                                    "LRV/meshes/Polaris_wheel.obj",
-                                                   "LRV/meshes/Polaris_tire.obj");
+                                                   "LRV/meshes/LRVtire_red_m.obj");
         vehicle_agent->SetNumWheels(4);
         syn_manager.AddAgent(vehicle_agent);
 
         auto trailer_agent = chrono_types::make_shared<SynTrailerAgent>(robot->GetTrailer());
         trailer_agent->SetZombieVisualizationFiles("LRV_Wagon/trailer_chassis.obj",
                                                    "LRV/meshes/Polaris_wheel.obj",
-                                                   "LRV/meshes/Polaris_tire.obj");
+                                                   "LRV/meshes/LRVtire_red_m.obj");
         trailer_agent->SetNumWheels(2);
         syn_manager.AddAgent(trailer_agent);
 
