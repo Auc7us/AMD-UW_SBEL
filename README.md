@@ -35,8 +35,14 @@ Build the C++ sim with ROS2 support from a ROS2 Humble environment:
 ```bash
 source /opt/ros/humble/setup.bash
 cd ~/mountdir/amd-uw
-cmake -S . -B build -DAMD_UW_ENABLE_ROS2=ON
-ninja 
+cmake -S . -B build -G Ninja -DAMD_UW_ENABLE_ROS2=ON   # configure once (or after a fresh container)
+ninja -C build                                          # build the whole project
+```
+
+After editing sources, just rebuild (no reconfigure needed):
+
+```bash
+ninja -C build
 ```
 
 Build the ROS2 Python controllers:
@@ -129,8 +135,8 @@ Arm status error codes:
 
 1. [x] Add ROS controller integration.
 2. [x] Stop at rock.
-3. [ ] Integrate with Harry.
-4. [ ] Move to SCM terrain.
+3. [x] Integrate with Harry.
+4. [ ] [WIP] Move to SCM terrain. 
 5. [x] ~~Explore a PyChrono wrapper for SynChrono~~. Scrapped.
 6. [ ] Scale to many vehicles and rocks.
 

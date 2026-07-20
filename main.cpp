@@ -133,6 +133,8 @@ void AddCommandLineOptions(ChCLI& cli) {
                           "Rank-local chassis and tire-force log rate in Hz (0 disables logging)",
                           std::to_string(motion_log_rate));
     cli.AddOption<std::vector<int>>("VSG", "vsg", "MPI ranks that should open VSG visualization", "-1");
+    cli.AddOption<bool>("Simulation", "no_sensor",
+                        "Disable the sensor/render rank 0 (it just syncs) -- measure physics without rendering");
 }
 
 }  // namespace
@@ -155,6 +157,7 @@ int main(int argc, char* argv[]) {
     heartbeat = cli.GetAsType<double>("heartbeat");
     settle_time = cli.GetAsType<double>("settle_time");
     motion_log_rate = cli.GetAsType<double>("motion_log_rate");
+    const bool no_sensor = cli.CheckOption("no_sensor");
     syn_manager.SetHeartbeat(heartbeat);
 
     // Use AMD-UW data as the Chrono data root and its vehicle subfolder for vehicle JSON assets.
@@ -307,7 +310,7 @@ int main(int argc, char* argv[]) {
     syn_manager.Initialize(system);
 
     std::shared_ptr<ChSensorManager> sensor_manager;
-    if (is_sensor_rank) {
+    if (is_sensor_rank && !no_sensor) {
         sensor_manager = chrono_types::make_shared<ChSensorManager>(system);
         sensor_manager->scene->AddPointLight({-100, 0, 25}, {5.0f, 5.0f, 5.0f}, 1000);
         sensor_manager->SetVerbose(false);
