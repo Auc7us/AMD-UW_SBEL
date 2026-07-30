@@ -18,7 +18,7 @@
   },
 
   "Zombie": {
-    "Chassis Visualization File": "M113/meshes/Chassis.obj",
+    "Chassis Visualization File": "M113/meshes/Chassis_Squashed_Z.obj",
     "Track Shoe Visualization File": "M113/meshes/TrackShoeSinglePin.obj",
     "Left Sprocket Visualization File": "M113/meshes/SprocketSinglePin_L.obj",
     "Right Sprocket Visualization File": "M113/meshes/SprocketSinglePin_R.obj",
