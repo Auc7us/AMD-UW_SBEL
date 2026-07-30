@@ -3,6 +3,7 @@
 #include <array>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "chrono/core/ChQuaternion.h"
 #include "chrono/core/ChVector3.h"
@@ -23,13 +24,25 @@ struct ArmStatusSnapshot {
     int error_code = 0;
 };
 
+struct ArmActuatorSnapshot {
+    std::array<double, 4> joint_angles = {0.0, 0.0, 0.0, 0.0};
+    std::array<double, 2> finger_positions = {0.0, 0.0};
+    chrono::ChVector3d end_effector_position;
+};
+
 class LrvArm {
   public:
     LrvArm(chrono::ChSystem* system,
            std::shared_ptr<chrono::ChBody> chassis_body,
            const std::string& amd_uw_data_path,
            const chrono::ChVector3d& mount_pos,
-           const chrono::ChQuaternion<>& mount_rot);
+           const chrono::ChQuaternion<>& mount_rot,
+           bool import_solidworks = true,
+           const std::string& name_prefix = "",
+           const std::string& arm_model_relative_path = "lrv_robotarm/lrv_arm.py",
+           const std::string& shapes_relative_path = "lrv_robotarm/lrv_arm_shapes/",
+           bool parked_rigid = false,
+           double geometry_scale = 1.0);
 
     bool StartPickPlace(double command_seq,
                         int target_index,
@@ -44,6 +57,14 @@ class LrvArm {
     ArmStatusSnapshot GetStatus() const;
     chrono::ChVector3d GetIkFramePos() const;
     chrono::ChQuaternion<> GetIkFrameRot() const;
+
+    // Direct actuator interface used by the builder arm bridge and its
+    // deterministic actuation test. Angles follow the same theta convention as
+    // the Python IK output consumed by StartPickPlace.
+    void SetJointTargets(const std::array<double, 4>& theta);
+    void SetFingerClosure(double close_pos);
+    ArmActuatorSnapshot GetActuatorSnapshot() const;
+    std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> GetBodies() const;
 
     // The rock the arm is currently positioning onto / holding, if any. While
     // non-null the arm owns this rock's fixed/collision state (it is frozen so
@@ -64,6 +85,8 @@ class LrvArm {
 
     chrono::ChSystem* m_system;
     std::shared_ptr<chrono::ChBody> m_chassis_body;
+    chrono::ChQuaternion<> m_mount_rot_chassis = chrono::QUNIT;
+    double m_geometry_scale = 1.0;
     std::shared_ptr<chrono::ChBodyAuxRef> m_base;
     std::shared_ptr<chrono::ChBodyAuxRef> m_shoulder;
     std::shared_ptr<chrono::ChBodyAuxRef> m_biceps;

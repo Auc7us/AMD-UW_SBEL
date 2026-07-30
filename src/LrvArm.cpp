@@ -8,10 +8,13 @@
 #include <string>
 
 #include "chrono/assets/ChVisualShapeModelFile.h"
+#include "chrono/assets/ChVisualShapeTriangleMesh.h"
 #include "chrono/collision/ChCollisionShapeBox.h"
 #include "chrono/core/ChFrame.h"
+#include "chrono/core/ChMatrix33.h"
 #include "chrono/core/ChTypes.h"
 #include "chrono/functions/ChFunctionConst.h"
+#include "chrono/geometry/ChTriangleMeshConnected.h"
 #include "chrono/physics/ChContactMaterial.h"
 #ifdef AMD_UW_USE_SOLIDWORKS_IMPORTER
 #include "chrono_parsers/ChParserPython.h"
@@ -110,28 +113,56 @@ const std::array<BodySpec, 8> arm_bodies = {{
 
 chrono::ChFramed TransformFrame(const FrameSpec& frame,
                                 const chrono::ChVector3d& mount_pos,
-                                const chrono::ChQuaternion<>& mount_rot) {
-    return chrono::ChFramed(mount_pos + mount_rot.Rotate(frame.pos), mount_rot * frame.rot);
+                                const chrono::ChQuaternion<>& mount_rot,
+                                double geometry_scale) {
+    return chrono::ChFramed(mount_pos + mount_rot.Rotate(frame.pos * geometry_scale), mount_rot * frame.rot);
 }
 
 std::shared_ptr<chrono::ChBodyAuxRef> CreateBody(chrono::ChSystem* system,
                                                  const BodySpec& spec,
                                                  const std::string& shapes_dir,
                                                  const chrono::ChVector3d& mount_pos,
-                                                 const chrono::ChQuaternion<>& mount_rot) {
+                                                 const chrono::ChQuaternion<>& mount_rot,
+                                                 const std::string& name_prefix,
+                                                 double geometry_scale) {
     auto body = chrono_types::make_shared<chrono::ChBodyAuxRef>();
-    body->SetName(spec.name);
-    body->SetPos(spec.name == std::string("base-1") ? mount_pos : mount_pos + mount_rot.Rotate(spec.pos));
-    body->SetRot(mount_rot * spec.rot);
+    body->SetName(name_prefix + spec.name);
     body->SetMass(spec.mass);
     body->SetInertiaXX(spec.inertia_xx);
     body->SetInertiaXY(spec.inertia_xy);
-    body->SetFrameCOMToRef(chrono::ChFramed(spec.com, chrono::QUNIT));
+    const chrono::ChVector3d com = spec.finger ? spec.com : spec.com * geometry_scale;
+    body->SetFrameCOMToRef(chrono::ChFramed(com, chrono::QUNIT));
+
+    // Match arm_model.py::_apply_scale exactly. Link bodies and their reference
+    // positions scale about the model origin. The two fingers stay 1x but their
+    // midpoint is carried to the scaled gripper tip.
+    const chrono::ChVector3d finger_mid =
+        0.5 * (arm_bodies[6].pos + arm_bodies[7].pos);
+    chrono::ChVector3d model_pos = spec.pos;
+    if (spec.finger)
+        model_pos += finger_mid * (geometry_scale - 1.0);
+    else
+        model_pos *= geometry_scale;
+    const chrono::ChVector3d ref_pos =
+        spec.name == std::string("base-1") ? mount_pos : mount_pos + mount_rot.Rotate(model_pos);
+    body->SetFrameRefToAbs(chrono::ChFramed(ref_pos, mount_rot * spec.rot));
     body->SetFixed(false);
 
-    auto visual = chrono_types::make_shared<chrono::ChVisualShapeModelFile>();
-    visual->SetFilename(shapes_dir + spec.mesh);
-    body->AddVisualShape(visual, chrono::ChFramed(chrono::VNULL, chrono::QUNIT));
+    if (!spec.finger && geometry_scale != 1.0) {
+        auto mesh = chrono::ChTriangleMeshConnected::CreateFromWavefrontFile(
+            shapes_dir + spec.mesh, true, true);
+        if (!mesh)
+            throw std::runtime_error("Cannot load scaled arm mesh: " + shapes_dir + spec.mesh);
+        mesh->Transform(chrono::VNULL, chrono::ChMatrix33<>(geometry_scale));
+        auto visual = chrono_types::make_shared<chrono::ChVisualShapeTriangleMesh>();
+        visual->SetMesh(mesh);
+        visual->SetMutable(false);
+        body->AddVisualShape(visual, chrono::ChFramed(chrono::VNULL, chrono::QUNIT));
+    } else {
+        auto visual = chrono_types::make_shared<chrono::ChVisualShapeModelFile>();
+        visual->SetFilename(shapes_dir + spec.mesh);
+        body->AddVisualShape(visual, chrono::ChFramed(chrono::VNULL, chrono::QUNIT));
+    }
 
     if (spec.finger) {
         // Match the system's contact method: an NSC pad in an SMC system (or vice
@@ -172,93 +203,122 @@ LrvArm::LrvArm(chrono::ChSystem* system,
                std::shared_ptr<chrono::ChBody> chassis_body,
                const std::string& amd_uw_data_path,
                const chrono::ChVector3d& mount_pos,
-               const chrono::ChQuaternion<>& mount_rot)
-    : m_system(system), m_chassis_body(std::move(chassis_body)) {
+               const chrono::ChQuaternion<>& mount_rot,
+               bool import_solidworks,
+               const std::string& name_prefix,
+               const std::string& arm_model_relative_path,
+               const std::string& shapes_relative_path,
+               bool parked_rigid,
+               double geometry_scale)
+    : m_system(system),
+      m_chassis_body(std::move(chassis_body)),
+      m_geometry_scale(geometry_scale) {
+    if (m_geometry_scale <= 0.0)
+        throw std::invalid_argument("Arm geometry scale must be positive.");
+    if (m_chassis_body)
+        m_mount_rot_chassis = m_chassis_body->GetRot().GetConjugate() * mount_rot;
+
     std::string data_path = amd_uw_data_path;
     if (!data_path.empty() && data_path.back() != '/')
         data_path += "/";
+    const std::string shapes_dir = data_path + shapes_relative_path;
+    bool imported = false;
 #ifdef AMD_UW_USE_SOLIDWORKS_IMPORTER
-    const std::string arm_file = data_path + "lrv_robotarm/lrv_arm.py";
+    std::string arm_file;
+    if (import_solidworks && m_geometry_scale == 1.0) {
+        arm_file = data_path + arm_model_relative_path;
 
-    {
-        chrono::parsers::ChPythonEngine importer;
+        {
+            chrono::parsers::ChPythonEngine importer;
 #ifdef PYCHRONO_MODULE_DIR
-        // The exported SolidWorks file does `import pychrono`. The embedded
-        // interpreter only finds it if the Chrono build's python bindings are on
-        // sys.path, so add the build-configured location (idempotent if the
-        // environment already exports it via PYTHONPATH).
-        importer.Run(std::string("import sys\n"
-                                 "p = r'") + PYCHRONO_MODULE_DIR + "'\n"
-                     "if p not in sys.path:\n"
-                     "    sys.path.insert(0, p)\n");
+            // The exported SolidWorks file does `import pychrono`. The embedded
+            // interpreter only finds it if the Chrono build's python bindings are on
+            // sys.path, so add the build-configured location (idempotent if the
+            // environment already exports it via PYTHONPATH).
+            importer.Run(std::string("import sys\n"
+                                     "p = r'") + PYCHRONO_MODULE_DIR + "'\n"
+                         "if p not in sys.path:\n"
+                         "    sys.path.insert(0, p)\n");
 #endif
-        importer.ImportSolidWorksSystem(arm_file, *system);
-    }
-
-    m_end_effector = RequireBody(system, "endeffector-1");
-    m_biceps = RequireBody(system, "bicep-1");
-    m_base = RequireBody(system, "base-1");
-    m_shoulder = RequireBody(system, "shoulder-1");
-    m_elbow = RequireBody(system, "elbow-1");
-    m_wrist = RequireBody(system, "wrist-1");
-    m_finger_2 = RequireBody(system, "finger-2");
-    m_finger_1 = RequireBody(system, "finger-1");
-
-    // Place the imported bodies at EXACTLY the manual-construction poses before the
-    // joints are built, then build the joints from the same mount-based frames the
-    // manual arm uses. Each imported body already carries its COM-to-REF offset, so
-    // pinning its REF to (P, R) -- P = mount_pos(+mount_rot*spec.pos), R =
-    // mount_rot*spec.rot -- reproduces the manual arm's COM positions bit-for-bit
-    // (base REF at mount_pos, COM ~3.8 cm below). This is what makes GetIkFramePos()
-    // and the settled gripper match the calibrated manual build. (The older
-    // approach built joints at raw frames then shifted the assembly, which pinned
-    // the base COM at mount_pos and left the base<->shoulder motor violated, so the
-    // solver dragged the whole arm ~3.8 cm low.)
-    {
-        const std::array<std::shared_ptr<chrono::ChBodyAuxRef>, 8> imported = {
-            m_end_effector, m_biceps, m_base, m_shoulder, m_elbow, m_wrist, m_finger_2, m_finger_1};
-        for (size_t i = 0; i < imported.size(); ++i) {
-            const auto& spec = arm_bodies[i];
-            const chrono::ChVector3d P =
-                (std::string(spec.name) == "base-1") ? mount_pos : mount_pos + mount_rot.Rotate(spec.pos);
-            const chrono::ChQuaternion<> R = mount_rot * spec.rot;
-            imported[i]->SetFixed(false);
-            imported[i]->SetFrameRefToAbs(chrono::ChFramed(P, R));
+            importer.ImportSolidWorksSystem(arm_file, *system);
         }
-    }
-#else
-    const std::string shapes_dir = data_path + "lrv_robotarm/lrv_arm_shapes/";
 
-    m_end_effector = CreateBody(system, arm_bodies[0], shapes_dir, mount_pos, mount_rot);
-    m_biceps = CreateBody(system, arm_bodies[1], shapes_dir, mount_pos, mount_rot);
-    m_base = CreateBody(system, arm_bodies[2], shapes_dir, mount_pos, mount_rot);
-    m_shoulder = CreateBody(system, arm_bodies[3], shapes_dir, mount_pos, mount_rot);
-    m_elbow = CreateBody(system, arm_bodies[4], shapes_dir, mount_pos, mount_rot);
-    m_wrist = CreateBody(system, arm_bodies[5], shapes_dir, mount_pos, mount_rot);
-    m_finger_2 = CreateBody(system, arm_bodies[6], shapes_dir, mount_pos, mount_rot);
-    m_finger_1 = CreateBody(system, arm_bodies[7], shapes_dir, mount_pos, mount_rot);
+        m_end_effector = RequireBody(system, "endeffector-1");
+        m_biceps = RequireBody(system, "bicep-1");
+        m_base = RequireBody(system, "base-1");
+        m_shoulder = RequireBody(system, "shoulder-1");
+        m_elbow = RequireBody(system, "elbow-1");
+        m_wrist = RequireBody(system, "wrist-1");
+        m_finger_2 = RequireBody(system, "finger-2");
+        m_finger_1 = RequireBody(system, "finger-1");
+
+        // Place imported bodies at exactly the manual-construction poses before
+        // building joints from the shared mount-based frames below.
+        {
+            const std::array<std::shared_ptr<chrono::ChBodyAuxRef>, 8> imported_bodies = {
+                m_end_effector, m_biceps, m_base, m_shoulder, m_elbow, m_wrist, m_finger_2, m_finger_1};
+            for (size_t i = 0; i < imported_bodies.size(); ++i) {
+                const auto& spec = arm_bodies[i];
+                const chrono::ChVector3d P =
+                    (std::string(spec.name) == "base-1") ? mount_pos : mount_pos + mount_rot.Rotate(spec.pos);
+                const chrono::ChQuaternion<> R = mount_rot * spec.rot;
+                imported_bodies[i]->SetFixed(false);
+                imported_bodies[i]->SetFrameRefToAbs(chrono::ChFramed(P, R));
+            }
+        }
+        imported = true;
+    }
 #endif
+    if (!imported) {
+        m_end_effector =
+            CreateBody(system, arm_bodies[0], shapes_dir, mount_pos, mount_rot, name_prefix, m_geometry_scale);
+        m_biceps =
+            CreateBody(system, arm_bodies[1], shapes_dir, mount_pos, mount_rot, name_prefix, m_geometry_scale);
+        m_base =
+            CreateBody(system, arm_bodies[2], shapes_dir, mount_pos, mount_rot, name_prefix, m_geometry_scale);
+        m_shoulder =
+            CreateBody(system, arm_bodies[3], shapes_dir, mount_pos, mount_rot, name_prefix, m_geometry_scale);
+        m_elbow =
+            CreateBody(system, arm_bodies[4], shapes_dir, mount_pos, mount_rot, name_prefix, m_geometry_scale);
+        m_wrist =
+            CreateBody(system, arm_bodies[5], shapes_dir, mount_pos, mount_rot, name_prefix, m_geometry_scale);
+        m_finger_2 =
+            CreateBody(system, arm_bodies[6], shapes_dir, mount_pos, mount_rot, name_prefix, m_geometry_scale);
+        m_finger_1 =
+            CreateBody(system, arm_bodies[7], shapes_dir, mount_pos, mount_rot, name_prefix, m_geometry_scale);
+    }
+
+    if (parked_rigid) {
+        const std::array<std::shared_ptr<chrono::ChBodyAuxRef>, 8> parked_bodies = {
+            m_end_effector, m_biceps, m_base, m_shoulder, m_elbow, m_wrist, m_finger_2, m_finger_1};
+        for (const auto& body : parked_bodies) {
+            body->EnableCollision(false);
+            body->SetFixed(true);
+        }
+        return;
+    }
 
     // Both builds now place the arm bodies at the same mount-based poses before
     // this point, so the joints use identical mount-based frames.
     const auto joint_base_shoulder =
-        TransformFrame({{-5.74189588383473e-19, 7.96390791413929e-18, 0.127}, chrono::QUNIT}, mount_pos, mount_rot);
+        TransformFrame({{-5.74189588383473e-19, 7.96390791413929e-18, 0.127}, chrono::QUNIT},
+                       mount_pos, mount_rot, m_geometry_scale);
     const auto joint_shoulder_biceps =
         TransformFrame({{-8.07010409222406e-17, 1.5234866438078e-16, 0.325155513123522},
                         {1.17756934401283e-16, -1.17756934401283e-16, 0.707106781186548, -0.707106781186547}},
-                       mount_pos, mount_rot);
+                       mount_pos, mount_rot, m_geometry_scale);
     const auto joint_biceps_elbow =
         TransformFrame({{-1.27, -2.66188598930217e-16, 0.325155513123522},
                         {0.707106781186548, -0.707106781186547, -1.17756934401283e-16, 1.17756934401283e-16}},
-                       mount_pos, mount_rot);
+                       mount_pos, mount_rot, m_geometry_scale);
     const auto joint_elbow_effector =
         TransformFrame({{-2.413, -0.0190500000000001, 0.325155513123522},
                         {0.707106781186548, -0.707106781186547, -2.17894099802631e-33, 2.17894099802631e-33}},
-                       mount_pos, mount_rot);
+                       mount_pos, mount_rot, m_geometry_scale);
     const auto joint_effector =
         TransformFrame({{-2.6924, -9.00811551237124e-16, 0.325155513123523},
                         {-3.92523114670944e-17, 3.92523114670943e-17, -0.707106781186547, 0.707106781186548}},
-                       mount_pos, mount_rot);
+                       mount_pos, mount_rot, m_geometry_scale);
 
     m_wrist_lock = AddLink<chrono::ChLinkLockLock>(system, m_end_effector, m_wrist, joint_effector);
     m_motor_base_shoulder =
@@ -280,7 +340,8 @@ LrvArm::LrvArm(chrono::ChSystem* system,
         AddLink<chrono::ChLinkLockLock>(system, m_chassis_body, m_base, chrono::ChFramed(mount_pos, mount_rot));
 
 #ifdef AMD_UW_USE_SOLIDWORKS_IMPORTER
-    std::cout << "[LrvArm] imported SolidWorks arm via ChPythonEngine: " << arm_file << "\n";
+    if (imported)
+        std::cout << "[LrvArm] imported SolidWorks arm via ChPythonEngine: " << arm_file << "\n";
 #endif
 }
 
@@ -516,7 +577,7 @@ chrono::ChVector3d LrvArm::GetIkFramePos() const {
 }
 
 chrono::ChQuaternion<> LrvArm::GetIkFrameRot() const {
-    return m_chassis_body ? m_chassis_body->GetRot() : chrono::QUNIT;
+    return m_chassis_body ? m_chassis_body->GetRot() * m_mount_rot_chassis : m_mount_rot_chassis;
 }
 
 std::shared_ptr<chrono::ChBodyAuxRef> LrvArm::GetActiveRock() const {
@@ -527,6 +588,42 @@ std::shared_ptr<chrono::ChBodyAuxRef> LrvArm::GetActiveRock() const {
         return m_target_rock;
     }
     return nullptr;
+}
+
+void LrvArm::SetJointTargets(const std::array<double, 4>& theta) {
+    CommandJointAngles(theta);
+}
+
+void LrvArm::SetFingerClosure(double close_pos) {
+    m_close_pos = std::clamp(close_pos, 0.0, finger_close_pos);
+    CommandFingerPosition(m_close_pos);
+}
+
+ArmActuatorSnapshot LrvArm::GetActuatorSnapshot() const {
+    ArmActuatorSnapshot snapshot;
+    snapshot.joint_angles = {
+        -m_motor_base_shoulder->GetMotorAngle() - chrono::CH_PI,
+        m_motor_shoulder_biceps->GetMotorAngle(),
+        -m_motor_biceps_elbow->GetMotorAngle(),
+        -m_motor_elbow_effector->GetMotorAngle()};
+    snapshot.finger_positions = {
+        m_motor_finger_1->GetMotorPos(),
+        m_motor_finger_2->GetMotorPos()};
+    snapshot.end_effector_position = m_end_effector->GetPos();
+    return snapshot;
+}
+
+std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> LrvArm::GetBodies() const {
+    return {
+        m_end_effector,
+        m_biceps,
+        m_base,
+        m_shoulder,
+        m_elbow,
+        m_wrist,
+        m_finger_2,
+        m_finger_1,
+    };
 }
 
 void LrvArm::CommandJointAngles(const std::array<double, 4>& theta) {
