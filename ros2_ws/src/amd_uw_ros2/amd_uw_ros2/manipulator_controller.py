@@ -1,7 +1,5 @@
 from dataclasses import dataclass
 import math
-from pathlib import Path
-import sys
 import time
 from typing import Optional, Set, Tuple
 
@@ -18,12 +16,8 @@ ARM_STATE_FAILED = 3
 
 GRAB_HEIGHT_M = 0.22
 
-lunar_model_path = Path(__file__).resolve().parents[2] / "lunar-manip" / "model"
-if str(lunar_model_path) not in sys.path:
-    sys.path.insert(0, str(lunar_model_path))
-
 try:
-    from inverseKin import RobotArmInverseKinematicsSolver
+    from .inverse_kinematics import RobotArmInverseKinematicsSolver
 except Exception:
     RobotArmInverseKinematicsSolver = None
 
@@ -85,6 +79,9 @@ class ManipulatorController(Node):
         self.declare_parameter("grab_z_offset_m", 0.05)
         # Fallback gripper height (above ground) only if the sim doesn't report rock_z.
         self.declare_parameter("grab_height_m", GRAB_HEIGHT_M)
+        # Must match the physical LrvArm geometry scale. LRVs use 1.0; the M113
+        # tracked-builder reference uses 2.0.
+        self.declare_parameter("arm_scale", 1.0)
 
         self.robot_id = int(self.get_parameter("robot_id").value)
         self.pickup_request_topic = f"/robot_{self.robot_id}/pickup_request"
@@ -104,7 +101,12 @@ class ManipulatorController(Node):
         self.arm_base_pose: Optional[ArmBasePose] = None
         self.place_target: Optional[Tuple[float, float, float]] = None
         self.completed_targets: Set[int] = set()
-        self.ik_solver = RobotArmInverseKinematicsSolver() if RobotArmInverseKinematicsSolver is not None else None
+        self.arm_scale = float(self.get_parameter("arm_scale").value)
+        self.ik_solver = (
+            RobotArmInverseKinematicsSolver(scale=self.arm_scale)
+            if RobotArmInverseKinematicsSolver is not None
+            else None
+        )
 
         self.arm_cmd_pub = self.create_publisher(Float64MultiArray, self.arm_cmd_topic, 10)
         self.target_done_pub = self.create_publisher(Bool, self.target_done_topic, 10)

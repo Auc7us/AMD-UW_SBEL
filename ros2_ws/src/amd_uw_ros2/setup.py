@@ -11,7 +11,10 @@ setup(
         ("share/" + package_name, ["package.xml"]),
         (
             "share/" + package_name + "/launch",
-            ["launch/robot_controllers.launch.py"],
+            [
+                "launch/builder_orbit_controllers.launch.py",
+                "launch/robot_controllers.launch.py",
+            ],
         ),
     ],
     install_requires=["setuptools"],
@@ -23,6 +26,9 @@ setup(
     tests_require=["pytest"],
     entry_points={
         "console_scripts": [
+            "builder_arm_controller = amd_uw_ros2.builder_arm_controller:main",
+            "builder_drive_controller = amd_uw_ros2.builder_drive_controller:main",
+            "builder_orbit_controller = amd_uw_ros2.builder_orbit_controller:main",
             "constant_speed_controller = amd_uw_ros2.constant_speed_controller:main",
             "manipulator_controller = amd_uw_ros2.manipulator_controller:main",
             "pure_pursuit_controller = amd_uw_ros2.pure_pursuit_controller:main",
