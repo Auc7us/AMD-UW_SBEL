@@ -49,7 +49,6 @@ std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> AddRockFields(
     const std::string& amd_uw_data_path,
     int robot_index,
     int num_robots,
-    double start_spacing,
     double height_probe_z,
     const RockFieldConfig& config,
     std::vector<double>* rock_top_heights) {
@@ -88,8 +87,8 @@ std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> AddRockFields(
 
     std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> rocks;
     std::mt19937 rng(20260621 + 4099 * robot_index);
-    const chrono::ChVector3d origin = InitialGroundPositionForRobot(robot_index, num_robots, start_spacing);
-    const double heading = InitialHeadingDegForRobot(robot_index) * chrono::CH_DEG_TO_RAD;
+    const chrono::ChVector3d origin = InitialGroundPositionForRobot(robot_index, num_robots);
+    const double heading = InitialHeadingRadForRobot(robot_index, num_robots);
     const chrono::ChVector3d forward(std::cos(heading), std::sin(heading), 0.0);
     const chrono::ChVector3d left(-std::sin(heading), std::cos(heading), 0.0);
 

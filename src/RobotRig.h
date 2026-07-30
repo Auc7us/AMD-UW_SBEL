@@ -38,6 +38,7 @@ class RobotRig {
 
     chrono::ChSystem* GetSystem() const;
     chrono::vehicle::WheeledVehicle* GetVehicle() const;
+    int GetRobotIndex() const { return m_robot_index; }
     std::shared_ptr<chrono::vehicle::WheeledTrailer> GetTrailer() const;
     chrono::vehicle::ChDriver* GetDriver() const;
     const std::vector<std::shared_ptr<chrono::ChBodyAuxRef>>& GetRocks() const;
@@ -46,7 +47,6 @@ class RobotRig {
                              const std::shared_ptr<chrono::ChContactMaterial>& rock_mat,
                              const std::string& chrono_data_path,
                              const std::string& amd_uw_data_path,
-                             double start_spacing,
                              double height_probe_z,
                              double vehicle_start_clearance,
                              double seat_clearance,
@@ -64,10 +64,6 @@ class RobotRig {
   private:
     void InitializeVehicle(const chrono::ChCoordsys<>& init_pos);
     void InitializeTrailer();
-    // Add radial box "grousers" around a wheel spindle, on top of the RigidTire
-    // cylinder (one compound/union collision). Primitives only -> cheap and stable;
-    // the bricks imprint tread marks / catch soil once the SCM grid is fine enough.
-    void AddGrouserBricks(const std::shared_ptr<chrono::ChBody>& spindle);
     void ReseatRig(chrono::vehicle::ChTerrain& terrain,
                    const std::vector<chrono::ChBody*>& preexisting_bodies,
                    double height_probe_z,

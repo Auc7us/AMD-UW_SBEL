@@ -38,7 +38,6 @@ std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> AddRockFields(
     const std::string& amd_uw_data_path,
     int robot_index,
     int num_robots,
-    double start_spacing,
     double height_probe_z,
     const RockFieldConfig& config,
     std::vector<double>* rock_top_heights = nullptr);

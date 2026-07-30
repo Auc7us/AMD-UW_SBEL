@@ -126,7 +126,6 @@ void RobotRig::InitializeOnTerrain(chrono::vehicle::ChTerrain& terrain,
                                    const std::shared_ptr<chrono::ChContactMaterial>& rock_mat,
                                    const std::string& chrono_data_path,
                                    const std::string& amd_uw_data_path,
-                                   double start_spacing,
                                    double height_probe_z,
                                    double vehicle_start_clearance,
                                    double seat_clearance,
@@ -135,16 +134,16 @@ void RobotRig::InitializeOnTerrain(chrono::vehicle::ChTerrain& terrain,
                                    const RockFieldConfig& rock_field_config) {
     m_rock_top_heights.clear();
     m_rocks = AddRockFields(GetSystem(), terrain, rock_mat, chrono_data_path, amd_uw_data_path, m_robot_index,
-                            m_num_robots, start_spacing, height_probe_z, rock_field_config, &m_rock_top_heights);
+                            m_num_robots, height_probe_z, rock_field_config, &m_rock_top_heights);
 
-    const chrono::ChVector3d start_ground = InitialGroundPositionForRobot(m_robot_index, m_num_robots, start_spacing);
+    const chrono::ChVector3d start_ground = InitialGroundPositionForRobot(m_robot_index, m_num_robots);
     const double start_x = start_ground.x();
     const double start_y = start_ground.y();
     const double start_z = terrain.GetHeight(chrono::ChVector3d(start_x, start_y, height_probe_z)) +
                            vehicle_start_clearance;
     const chrono::ChVector3d init_loc(start_x, start_y, start_z);
-    const double init_heading_deg = InitialHeadingDegForRobot(m_robot_index);
-    const chrono::ChQuaternion<> init_rot = chrono::QuatFromAngleZ(init_heading_deg * chrono::CH_DEG_TO_RAD);
+    const chrono::ChQuaternion<> init_rot =
+        chrono::QuatFromAngleZ(InitialHeadingRadForRobot(m_robot_index, m_num_robots));
 
     std::vector<chrono::ChBody*> preexisting_bodies;
     for (const auto& body : GetSystem()->GetBodies())
@@ -223,10 +222,11 @@ void RobotRig::InitializeVehicle(const chrono::ChCoordsys<>& init_pos) {
     for (auto& axle : m_vehicle->GetAxles()) {
         for (auto& wheel : axle->GetWheels()) {
             auto tire = chrono::vehicle::ReadTireJSON(
-                chrono::vehicle::GetVehicleDataFile("LRV/Polaris_RigidTire.json"));
+                chrono::vehicle::GetVehicleDataFile("LRV/Polaris_TMeasyTire.json"));
+            // Render the configured tire OBJ while keeping TMeasy force-element
+            // dynamics for tire-terrain interaction.
             m_vehicle->InitializeTire(tire, wheel, chrono::VisualizationType::MESH);
             tire->SetStepsize(m_tire_step_size);
-            AddGrouserBricks(wheel->GetSpindle());
         }
     }
 
@@ -273,35 +273,10 @@ void RobotRig::InitializeTrailer() {
     for (auto& axle : m_trailer->GetAxles()) {
         for (auto& wheel : axle->GetWheels()) {
             auto tire = chrono::vehicle::ReadTireJSON(
-                chrono::vehicle::GetVehicleDataFile("LRV/Polaris_RigidTire.json"));
+                chrono::vehicle::GetVehicleDataFile("LRV/Polaris_TMeasyTire.json"));
             m_trailer->InitializeTire(tire, wheel, chrono::VisualizationType::MESH);
             tire->SetStepsize(m_tire_step_size);
-            AddGrouserBricks(wheel->GetSpindle());
         }
-    }
-}
-
-void RobotRig::AddGrouserBricks(const std::shared_ptr<chrono::ChBody>& spindle) {
-    // Approximate grousers as radial box "bricks" spaced around the tire. They attach
-    // to the same spindle as the RigidTire cylinder, so the wheel's collision is the
-    // union of cylinder + bricks -- all primitives, so contact stays cheap and stable.
-    // The bricks imprint tread marks / catch soil once the SCM grid resolves them.
-    constexpr int n_grousers = 10;
-    constexpr double carcass_r = 0.4089;  // = RigidTire cylinder Radius (carcass)
-    constexpr double height = 0.02;       // radial protrusion (grouser tips ~0.429)
-    constexpr double axial = 0.26;        // length along the axle (< tire width)
-    constexpr double tangential = 0.05;   // thickness around the circumference
-    const auto mat = MakeContactMaterial(m_contact_method, 0.9f);
-    for (int i = 0; i < n_grousers; ++i) {
-        // Spindle spins about its local Y; the wheel lies in the local X-Z plane. Place
-        // each brick at radius carcass_r+height/2 in direction (cos,0,sin) and rotate
-        // about Y so the box's local X points radially outward.
-        const double th = i * 2.0 * chrono::CH_PI / n_grousers;
-        const chrono::ChVector3d pos(std::cos(th) * (carcass_r + height / 2.0), 0.0,
-                                     std::sin(th) * (carcass_r + height / 2.0));
-        spindle->AddCollisionShape(
-            chrono_types::make_shared<chrono::ChCollisionShapeBox>(mat, height, axial, tangential),
-            chrono::ChFramed(pos, chrono::QuatFromAngleY(-th)));
     }
 }
 
@@ -649,7 +624,8 @@ void RobotRig::LogMotionIfNeeded(int step_number,
                                 << p.x() << "," << p.y() << "," << p.z() << ") speed=" << VecNorm(v)
                                 << " accel=" << VecNorm(a) << " ang_speed=" << VecNorm(w)
                                 << " chassis_contact=" << VecNorm(chassis_contact)
-                                << " tire_force_sum=" << tire_force_sum << " tire_force_z=" << tire_force_z << "\n";
+                                << " tire_force_sum=" << tire_force_sum << " tire_force_z=" << tire_force_z
+                                << " step_rtf=" << m_vehicle->GetStepRTF() << "\n";
 }
 
 }  // namespace amd_uw
