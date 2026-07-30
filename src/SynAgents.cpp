@@ -1,12 +1,15 @@
 #include "SynAgents.h"
 
 #include <array>
+#include <stdexcept>
 #include <utility>
 
 #include "MaterialUtils.h"
 
 #include "chrono/assets/ChVisualShapeTriangleMesh.h"
+#include "chrono/core/ChMatrix33.h"
 #include "chrono/core/ChTypes.h"
+#include "chrono/geometry/ChTriangleMeshConnected.h"
 #include "chrono_synchrono/flatbuffer/message/SynApproachMessage.h"
 #include "chrono_synchrono/flatbuffer/message/SynMAPMessage.h"
 #include "chrono_synchrono/flatbuffer/message/SynMessageUtils.h"
@@ -144,6 +147,138 @@ void SynRockAgent::GatherMessages(chrono::synchrono::SynMessageList& messages) {
 void SynRockAgent::GatherDescriptionMessages(chrono::synchrono::SynMessageList& messages) {}
 
 void SynRockAgent::SetKey(chrono::synchrono::AgentKey agent_key) {
+    m_agent_key = agent_key;
+    m_state->SetSourceKey(agent_key);
+}
+
+SynBuilderArmAgent::SynBuilderArmAgent(
+    std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> arm_bodies,
+    std::string amd_uw_data_path,
+    bool visualize_zombies)
+    : chrono::synchrono::SynAgent(),
+      m_arm_bodies(std::move(arm_bodies)),
+      m_amd_uw_data_path(std::move(amd_uw_data_path)),
+      m_visualize_zombies(visualize_zombies),
+      m_state(chrono_types::make_shared<chrono::synchrono::SynMAPMessage>()) {}
+
+void SynBuilderArmAgent::InitializeZombie(chrono::ChSystem* system) {
+    if (!m_visualize_zombies || m_agent_key.GetNodeID() <= 0)
+        return;
+
+    // This ordering matches LrvArm::GetBodies(). The first six link meshes use
+    // the Python reference's 2x geometry scale; the two fingers intentionally
+    // retain their original 1x geometry.
+    const std::array<std::string, 8> mesh_files = {
+        "body_1_1.obj",
+        "body_2_1.obj",
+        "body_3_1.obj",
+        "body_4_1.obj",
+        "body_5_1.obj",
+        "body_6_1.obj",
+        "body_7_1.obj",
+        "body_7_1.obj",
+    };
+    constexpr double arm_geometry_scale = 2.0;
+    const std::string shapes_dir =
+        m_amd_uw_data_path + "m113_builder_arm/m113_builder_arm_shapes/";
+
+    for (size_t i = 0; i < mesh_files.size(); ++i) {
+        auto mesh = chrono::ChTriangleMeshConnected::CreateFromWavefrontFile(
+            shapes_dir + mesh_files[i], true, true);
+        if (!mesh)
+            throw std::runtime_error("Cannot load rank-0 builder arm mesh: " +
+                                     shapes_dir + mesh_files[i]);
+        if (i < 6) {
+            mesh->Transform(
+                chrono::VNULL,
+                chrono::ChMatrix33<>(arm_geometry_scale));
+        }
+
+        auto visual =
+            chrono_types::make_shared<chrono::ChVisualShapeTriangleMesh>();
+        visual->SetMesh(mesh);
+        visual->SetName("Builder_Arm_Zombie_" + std::to_string(i));
+        visual->SetMutable(false);
+
+        auto body = chrono_types::make_shared<chrono::ChBodyAuxRef>();
+        body->SetName("builder_arm_zombie_" +
+                      std::to_string(m_agent_key.GetNodeID()) + "_" +
+                      std::to_string(i));
+        body->SetFixed(true);
+        body->EnableCollision(false);
+        body->AddVisualShape(visual);
+        system->AddBody(body);
+        m_zombie_arm_bodies.push_back(body);
+    }
+}
+
+void SynBuilderArmAgent::SynchronizeZombie(
+    std::shared_ptr<chrono::synchrono::SynMessage> message) {
+    auto state =
+        std::dynamic_pointer_cast<chrono::synchrono::SynMAPMessage>(message);
+    if (!state || m_zombie_arm_bodies.empty() ||
+        state->intersections.empty() ||
+        state->intersections[0].approaches.empty())
+        return;
+
+    const auto& lanes = state->intersections[0].approaches[0]->lanes;
+    for (size_t i = 0;
+         i < lanes.size() && i < m_zombie_arm_bodies.size(); ++i) {
+        if (lanes[i].controlPoints.size() < 3)
+            continue;
+
+        const auto& p = lanes[i].controlPoints[0];
+        const auto& q0q1q2 = lanes[i].controlPoints[1];
+        const auto& q3 = lanes[i].controlPoints[2];
+        m_zombie_arm_bodies[i]->SetFrameRefToAbs(chrono::ChFrame<>(
+            p, chrono::ChQuaternion<>(q0q1q2.x(), q0q1q2.y(),
+                                      q0q1q2.z(), q3.x())));
+    }
+}
+
+void SynBuilderArmAgent::Update() {
+    if (m_arm_bodies.empty())
+        return;
+
+    m_state =
+        chrono_types::make_shared<chrono::synchrono::SynMAPMessage>(
+            m_agent_key, chrono::synchrono::AgentKey());
+    m_state->time = m_arm_bodies[0]->GetSystem()->GetChTime();
+
+    chrono::synchrono::Intersection arm_intersection;
+    auto arm_approach =
+        chrono_types::make_shared<chrono::synchrono::SynApproachMessage>(
+            m_agent_key, chrono::synchrono::AgentKey());
+    arm_approach->time = m_state->time;
+
+    for (const auto& body : m_arm_bodies) {
+        const auto frame = body->GetFrameRefToAbs();
+        const auto p = frame.GetPos();
+        const auto q = frame.GetRot();
+        arm_approach->lanes.emplace_back(
+            0.0,
+            std::vector<chrono::ChVector3d>{
+                chrono::ChVector3d(p.x(), p.y(), p.z()),
+                chrono::ChVector3d(q.e0(), q.e1(), q.e2()),
+                chrono::ChVector3d(q.e3(), 0.0, 0.0),
+            });
+    }
+
+    arm_intersection.approaches.push_back(arm_approach);
+    m_state->intersections.push_back(arm_intersection);
+}
+
+void SynBuilderArmAgent::GatherMessages(
+    chrono::synchrono::SynMessageList& messages) {
+    if (!m_arm_bodies.empty())
+        messages.push_back(m_state);
+}
+
+void SynBuilderArmAgent::GatherDescriptionMessages(
+    chrono::synchrono::SynMessageList& messages) {}
+
+void SynBuilderArmAgent::SetKey(
+    chrono::synchrono::AgentKey agent_key) {
     m_agent_key = agent_key;
     m_state->SetSourceKey(agent_key);
 }

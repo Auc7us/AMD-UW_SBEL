@@ -47,4 +47,28 @@ class SynRockAgent : public chrono::synchrono::SynAgent {
     std::shared_ptr<chrono::synchrono::SynMAPMessage> m_state;
 };
 
+// Synchronizes the eight independently articulated builder-arm bodies. Remote
+// ranks keep only message-routing zombies; rank 0 creates visual-only bodies so
+// the central Chrono Sensor camera sees the arm move with its builder.
+class SynBuilderArmAgent : public chrono::synchrono::SynAgent {
+  public:
+    SynBuilderArmAgent(std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> arm_bodies,
+                       std::string amd_uw_data_path,
+                       bool visualize_zombies);
+
+    void InitializeZombie(chrono::ChSystem* system) override;
+    void SynchronizeZombie(std::shared_ptr<chrono::synchrono::SynMessage> message) override;
+    void Update() override;
+    void GatherMessages(chrono::synchrono::SynMessageList& messages) override;
+    void GatherDescriptionMessages(chrono::synchrono::SynMessageList& messages) override;
+    void SetKey(chrono::synchrono::AgentKey agent_key) override;
+
+  private:
+    std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> m_arm_bodies;
+    std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> m_zombie_arm_bodies;
+    std::string m_amd_uw_data_path;
+    bool m_visualize_zombies;
+    std::shared_ptr<chrono::synchrono::SynMAPMessage> m_state;
+};
+
 }  // namespace amd_uw
