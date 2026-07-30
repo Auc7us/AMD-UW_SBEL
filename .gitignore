@@ -4,3 +4,11 @@ build/
 install/
 log/
 build_importer/
+
+# Reference-only checkout of the lunar-manip Python scenarios, and its own git
+# repo. It is here to read and compare against, never to load from: this project
+# resolves every runtime asset under data/, and nothing in src/, main.cpp,
+# CMakeLists.txt or the ROS 2 package refers to it. The one IK module that used
+# to be imported from it at runtime now lives at
+# ros2_ws/src/amd_uw_ros2/amd_uw_ros2/inverse_kinematics.py.
+ros2_ws/src/lunar-manip/
