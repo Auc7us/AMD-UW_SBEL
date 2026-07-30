@@ -87,6 +87,105 @@ cd ~/mountdir/amd-uw
 mpirun -np 3 ./build/demo_SYN_polaris_flat --vsg 1,2
 ```
 
+### Site layout
+
+Everything is concentric about `(0, 0)`, and each rank owns one ray out from the
+centre, evenly spaced (`2*pi*rank/N`). On that ray:
+
+```text
+centre ---- work circle (30 m) ---- builder orbit (40 m) ---- collector (50 m) ----> rock line
+              yellow ring                cyan ring                green ring
+```
+
+So a rank's collector starts directly outside its own builder, on the line joining
+the site centre to it, faces radially outward, and its rock line runs away from
+the site — the collector drives out to fetch and back inward to the builder it
+feeds, and no rock line crosses the build area. Builders sit tangent to their
+orbit, so their radial footprint is only the hull width and there is ~3.5 m of
+clearance between a collector's trailer and its builder at spawn.
+
+All of this lives in `src/RobotLayout.h` as one source of truth. Note this also
+scales past two ranks: the previous layout hard-coded two headings (330 deg and
+60 deg) and silently gave every rank after the second the same heading as rank 2.
+
+The rock line runs 30 m to 660 m out from each collector, so its outer end leaves
+the 1024 m heightmap; those last few rocks rest on the flat extension strips that
+`AddRockLineTerrainExtensions` lays along each ray, not on mapped terrain.
+
+Start the builder orbit controllers with:
+
+```bash
+source /opt/ros/humble/setup.bash
+cd ~/mountdir/amd-uw/ros2_ws
+source install/setup.bash
+ros2 launch amd_uw_ros2 builder_orbit_controllers.launch.py \
+  builder_ids:=1,2 \
+  work_circle_radius_m:=30.0 \
+  path_radius_m:=40.0 \
+  target_speed_mps:=1.0 \
+  lookahead_m:=8.0 \
+  counter_clockwise:=true
+```
+
+Each controller reads `/builder_N/vehicle_state` (`[x, y, yaw, speed]`) and
+publishes `/builder_N/vehicle_cmd` (`[steering, throttle, braking]`). A builder
+starts braked and holds until its first valid ROS command arrives.
+
+Its hull is **not** pinned while parked, and must not be. Pinning it is
+self-consistent only on flat ground; on this heightmap the hull is placed level
+over ground that pitches and rolls a few degrees, the suspension then has no way
+to absorb the mismatch, and the single-pin track throws shoes and goes NaN within
+about a second on every rank. That was invisible for a long time because the orbit
+controller releases the hull within ~50 ms — it only showed up on a rank whose
+controller was never started. A free hull with brakes on settles onto the real
+surface and holds to within a few cm.
+
+### One system per rank
+
+Each physics rank has exactly **one** `ChSystem`, holding that rank's rover,
+trailer, rocks, terrain, and builder. This is a hard requirement, not a
+preference: Chrono only generates contacts between bodies of the same system, so
+a builder in its own system could never touch the rocks it exists to place.
+
+The consequence is that the whole system runs the solver the single-pin track
+needs — `ChSolverBB` at 100 iterations with `EULER_IMPLICIT_LINEARIZED`, set once
+in `main.cpp` (the default solver lets track shoes drift off the road wheels).
+`BuilderRig` deliberately does not touch gravity, solver, timestepper, or terrain:
+it does not own that world.
+
+Two ordering rules follow, and breaking either is silent:
+
+- Every `Synchronize` runs before any `Advance`, and the system is stepped exactly
+  once per loop iteration. `BuilderRig::Advance` only advances its own subsystems;
+  `robot->Advance` is what issues the `DoStepDynamics`.
+- The builder is constructed *after* the rover's SolidWorks arm import, which
+  leaves the collision system in a state where later bodies never register
+  contacts. `BuilderRig` calls `BindAll()` on the shared system to repair that —
+  without it the tracks sink through the ground and the gripper passes through
+  rocks.
+
+Watch the terrain cost when changing the field map. The rover's mission needs the
+full 1024 m `terrain2.bmp`, which is a ~130k-triangle collision mesh, and the
+M113's ~130 track shoes query it every step; that narrowphase is ~7.6 of the ~17.9
+wall/sim. If it ever needs to come down, the builder only ever occupies the orbit,
+so a second smaller patch plus collision families would let its shoes skip the
+big mesh.
+
+### Cost diagnostics
+
+`--perf_log <seconds>` prints a per-rank breakdown every N sim seconds: the
+*instantaneous* wall/sim for the window (the plain `wall/sim` line is a cumulative
+average, which hides when a cost starts growing — it is why an early slowdown here
+read as unbounded growth when it had actually plateaued), the wall time in each
+loop section, Chrono's per-step timers, and the builder's drive command / speed /
+orbit radius / track-shoe spread.
+
+```bash
+mpirun -np 3 ./build/demo_SYN_polaris_flat --no_sensor -e 10 --perf_log 0.5
+```
+
+`--builder_no_arm` drops the manipulator, to separate arm cost from vehicle cost.
+
 Rank layout:
 
 ```text
