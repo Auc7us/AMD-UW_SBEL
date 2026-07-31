@@ -28,11 +28,13 @@ class RosControllerDriver : public chrono::vehicle::ChDriver {
 
   private:
     void OnCommand(const std_msgs::msg::Float64MultiArray::SharedPtr msg);
-    void PublishTelemetry();
+    void PublishTelemetry(double time);
 
     int m_robot_id;
     const std::vector<std::shared_ptr<chrono::ChBodyAuxRef>>& m_rocks;
     bool m_command_received;
+    bool m_no_command_warned = false;
+    bool m_multi_publisher_warned = false;
 
     // Throttle rise-rate limiter: the commanded throttle (m_throttle_cmd) is
     // applied to m_throttle no faster than m_throttle_rise_per_s per second, so a
@@ -42,6 +44,9 @@ class RosControllerDriver : public chrono::vehicle::ChDriver {
     double m_throttle_cmd = 0.0;
     double m_throttle_rise_per_s = 0.35;  // ~2.9 s from 0 to full
     double m_last_sync_time = -1.0;
+    // Telemetry publish throttles; see PublishTelemetry.
+    double m_last_ego_pub_time = -1.0;
+    double m_last_static_pub_time = -1.0;
 
     rclcpp::Node::SharedPtr m_node;
     std::unique_ptr<rclcpp::executors::SingleThreadedExecutor> m_executor;

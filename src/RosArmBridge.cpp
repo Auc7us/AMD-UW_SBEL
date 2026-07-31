@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iostream>
 #include <string>
 #include <utility>
 
@@ -80,7 +81,23 @@ RosArmBridge::~RosArmBridge() {
 
 void RosArmBridge::Synchronize(double time, chrono::vehicle::ChTerrain& terrain) {
     m_executor->spin_some();
-    PublishArmBasePose();
+
+    // Duplicate manipulator nodes are worse here than on the drive topic. Each one
+    // caches its own arm_base_pose and solves its own IK, so the same rock yields
+    // several different answers arriving under different sequence numbers -- which
+    // reads as an arm that cannot solve a rock it is parked next to, or that reaches
+    // for empty ground. `ros2 launch` children outlive a kill of the launch process,
+    // so this happens whenever a previous run was not torn down by process group.
+    if (!m_multi_publisher_warned && m_arm_cmd_sub->get_publisher_count() > 1) {
+        m_multi_publisher_warned = true;
+        RCLCPP_WARN(m_node->get_logger(),
+                    "%zu publishers on %s -- expected 1. Leftover manipulator nodes each solve IK in their "
+                    "own stale frame; results here are not trustworthy until they are gone. Kill strays "
+                    "with: pkill -9 -f manipulator_controller",
+                    m_arm_cmd_sub->get_publisher_count(), TopicForRobot(m_robot_id, "arm_cmd").c_str());
+    }
+
+    PublishArmBasePose(time);
     PublishPlaceTarget();
 
     std::optional<ArmCommand> command;
@@ -181,7 +198,28 @@ void RosArmBridge::OnArmCommand(const std_msgs::msg::Float64MultiArray::SharedPt
     m_pending_command = command;
 }
 
-void RosArmBridge::PublishArmBasePose() {
+void RosArmBridge::PublishArmBasePose(double time) {
+    // The arm base body is the IK frame origin. Its offset from the chassis is fixed
+    // by a rigid mount, so any change means the base drifted -- and since every rock
+    // is transformed into this frame, a drift of d moves every IK target by d and the
+    // solver reports "unreachable" for a rock the arm is parked next to.
+    const double offset = m_arm.BaseOffsetFromChassis();
+    if (m_base_offset_reference < 0.0) {
+        m_base_offset_reference = offset;
+    } else if (std::abs(offset - m_base_offset_reference) > 0.25 && m_base_drift_reports < 10) {
+        ++m_base_drift_reports;
+        std::cout << "[RosArmBridge] robot " << m_robot_id << " arm base DRIFT at t=" << time << ": offset "
+                  << m_base_offset_reference << " -> " << offset << " m from chassis\n";
+    }
+
+    // Throttle: the consumer is a 10 Hz Python node doing a blocking IK solve, and
+    // this used to publish every 5e-4 s step. 50 Hz of sim time is far more than it
+    // can use and 40x less traffic to wade through.
+    constexpr double base_pose_period = 0.02;
+    if (m_last_base_pose_pub_time >= 0.0 && time - m_last_base_pose_pub_time < base_pose_period)
+        return;
+    m_last_base_pose_pub_time = time;
+
     const auto pos = m_arm.GetIkFramePos();
     const auto rot = m_arm.GetIkFrameRot();
     std_msgs::msg::Float64MultiArray msg;

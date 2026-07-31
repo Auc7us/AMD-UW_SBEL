@@ -58,6 +58,12 @@ class LrvArm {
     chrono::ChVector3d GetIkFramePos() const;
     chrono::ChQuaternion<> GetIkFrameRot() const;
 
+    // Distance from the arm base body to the chassis it is mounted on. The mount is
+    // rigid, so this is a constant; a change means the base body has drifted, and
+    // the base body IS the IK frame origin published to the Python solver, so any
+    // drift silently moves every IK target by the same amount.
+    double BaseOffsetFromChassis() const;
+
     // Direct actuator interface used by the builder arm bridge and its
     // deterministic actuation test. Angles follow the same theta convention as
     // the Python IK output consumed by StartPickPlace.

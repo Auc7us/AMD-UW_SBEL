@@ -380,9 +380,24 @@ class ManipulatorController(Node):
         try:
             theta = self.ik_solver.inverse_kinematics_solver(local_target, elbow_up=True)
         except ValueError as exc:
+            # Log the arm-base frame and the ego pose alongside the local target. A
+            # local target 10+ m out for a rock the rover is parked beside means the
+            # frame is wrong, not the reach -- and only the frame's own numbers tell
+            # the two apart. ego_dist is how far the base is from the vehicle origin;
+            # they are metres apart on the same chassis, so a large value is the bug.
+            base = self.arm_base_pose
+            ego_text = ""
+            if self.ego_state is not None and base is not None:
+                ego_dist = math.hypot(base.x - self.ego_state.x, base.y - self.ego_state.y)
+                ego_text = (
+                    f", ego=({self.ego_state.x:.3f}, {self.ego_state.y:.3f}), base_to_ego={ego_dist:.3f} m"
+                )
             self.get_logger().warn(
                 f"Python IK failed for target {request.target_index}: {exc}; "
-                f"local_target=({local_target[0]:.3f}, {local_target[1]:.3f}, {local_target[2]:.3f})"
+                f"local_target=({local_target[0]:.3f}, {local_target[1]:.3f}, {local_target[2]:.3f}), "
+                f"rock=({request.rock_x:.3f}, {request.rock_y:.3f})"
+                f"{f', base=({base.x:.3f}, {base.y:.3f}, {base.z:.3f})' if base else ''}"
+                f"{ego_text}"
             )
             return None
         fk = self.ik_solver.forward_kinematics(theta)

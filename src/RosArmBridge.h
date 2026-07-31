@@ -41,7 +41,7 @@ class RosArmBridge {
     };
 
     void OnArmCommand(const std_msgs::msg::Float64MultiArray::SharedPtr msg);
-    void PublishArmBasePose();
+    void PublishArmBasePose(double time);
     void PublishPlaceTarget();
     void PublishStatus();
     chrono::ChVector3d PlacePoint(int slot) const;
@@ -56,6 +56,15 @@ class RosArmBridge {
     int m_place_count = 0;  // rocks dispatched to placement so far (grid slot index)
     std::shared_ptr<chrono::ChBodyAuxRef> m_inflight_rock;     // rock of the active pick/place
     double m_placed_seq = -2.0;                                // command_seq whose drop was handled
+
+    // arm_base_pose is the IK frame origin the Python solver transforms every rock
+    // into, so it must be both fresh and correct. Publishing it every physics step
+    // (2 kHz) buries a 10 Hz Python consumer, and a drifting base body corrupts it
+    // silently; throttle the one and watch for the other.
+    bool m_multi_publisher_warned = false;
+    double m_last_base_pose_pub_time = -1.0;
+    double m_base_offset_reference = -1.0;
+    int m_base_drift_reports = 0;
 
     rclcpp::Node::SharedPtr m_node;
     std::unique_ptr<rclcpp::executors::SingleThreadedExecutor> m_executor;

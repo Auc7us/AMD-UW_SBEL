@@ -576,6 +576,12 @@ chrono::ChVector3d LrvArm::GetIkFramePos() const {
     return m_base ? m_base->GetPos() : chrono::VNULL;
 }
 
+double LrvArm::BaseOffsetFromChassis() const {
+    if (!m_base || !m_chassis_body)
+        return 0.0;
+    return (m_base->GetPos() - m_chassis_body->GetPos()).Length();
+}
+
 chrono::ChQuaternion<> LrvArm::GetIkFrameRot() const {
     return m_chassis_body ? m_chassis_body->GetRot() * m_mount_rot_chassis : m_mount_rot_chassis;
 }
