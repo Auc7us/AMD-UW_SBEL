@@ -17,7 +17,8 @@ class RosControllerDriver : public chrono::vehicle::ChDriver {
   public:
     RosControllerDriver(chrono::vehicle::ChVehicle& vehicle,
                         int robot_id,
-                        const std::vector<std::shared_ptr<chrono::ChBodyAuxRef>>& rocks);
+                        const std::vector<std::shared_ptr<chrono::ChBodyAuxRef>>& rocks,
+                        const chrono::ChVector3d& home_position);
     ~RosControllerDriver() override;
 
     void Synchronize(double time) override;
@@ -47,6 +48,10 @@ class RosControllerDriver : public chrono::vehicle::ChDriver {
     rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr m_command_sub;
     rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr m_ego_state_pub;
     rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr m_target_pos_pub;
+    // Spawn pose, so the drive controller can return here at end of mission
+    // instead of duplicating the site-layout maths in Python.
+    rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr m_home_pos_pub;
+    chrono::ChVector3d m_home_position;
 
     std::mutex m_command_mutex;
 };

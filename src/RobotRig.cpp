@@ -25,6 +25,7 @@
 
 #ifdef AMD_UW_ENABLE_ROS2
 #include "RosArmBridge.h"
+#include "RosTrailerBridge.h"
 #include "RosControllerDriver.h"
 #endif
 
@@ -417,16 +418,127 @@ void RobotRig::InitializeTrailerBed() {
     GetSystem()->AddLink(m_trailer_bed_motor);
 }
 
+namespace {
+
+// Dump cycle geometry and timing.
+//
+// The bed is hinged about the trailer lateral axis and open at the rear, so a
+// positive tilt of this size drops the rear lip well below the front and the load
+// slides out under lunar gravity. Kept modest because the rocks only need to
+// overcome mu=0.9 static friction on a 0.15 m-walled tub, and a steeper tilt buys
+// nothing but a harder landing.
+constexpr double dump_bed_angle = 40.0 * chrono::CH_DEG_TO_RAD;
+constexpr double dump_tailgate_angle = 95.0 * chrono::CH_DEG_TO_RAD;
+// Slew rates. Slow enough that the bed and gate carry the load rather than
+// launching it: at these rates the rear lip descends at well under 0.2 m/s.
+constexpr double bed_slew_rate = 12.0 * chrono::CH_DEG_TO_RAD;       // ~3.3 s to full tilt
+constexpr double tailgate_slew_rate = 60.0 * chrono::CH_DEG_TO_RAD;  // ~1.6 s to full swing
+// Hold at full tilt so rocks have time to actually leave the tub.
+constexpr double dump_dwell_time = 3.0;
+// A stage is finished when its angle is this close to target.
+constexpr double dump_angle_tol = 0.5 * chrono::CH_DEG_TO_RAD;
+
+// Move `angle` toward `target` by at most `rate * dt`. Returns true once there.
+bool SlewAngle(double& angle, double target, double rate, double dt) {
+    const double step = rate * dt;
+    if (std::abs(target - angle) <= std::max(step, dump_angle_tol)) {
+        angle = target;
+        return true;
+    }
+    angle += (target > angle) ? step : -step;
+    return false;
+}
+
+}  // namespace
+
+bool RobotRig::RequestTrailerDump() {
+    if (!m_trailer_bed_motor || !m_trailer_tailgate_hinge)
+        return false;
+    if (m_dump_state != DumpState::IDLE && m_dump_state != DumpState::DONE)
+        return false;
+
+    m_dump_state = DumpState::OPENING_GATE;
+    m_dump_stage_time = 0.0;
+    return true;
+}
+
+void RobotRig::AdvanceDumpCycle(double time) {
+    if (!m_trailer_bed_motor || !m_trailer_tailgate_hinge)
+        return;
+    if (m_dump_state == DumpState::IDLE || m_dump_state == DumpState::DONE)
+        return;
+
+    // Slew against the real elapsed time so the cycle takes the same wall of sim
+    // time regardless of step size.
+    const double dt = (m_last_dump_time < 0.0) ? 0.0 : time - m_last_dump_time;
+    m_last_dump_time = time;
+    if (dt <= 0.0)
+        return;
+
+    switch (m_dump_state) {
+        case DumpState::OPENING_GATE:
+            // Gate first: tilting into a closed tailgate would just press the load
+            // against it and then release it all at once when it finally opened.
+            if (SlewAngle(m_tailgate_angle, dump_tailgate_angle, tailgate_slew_rate, dt)) {
+                m_dump_state = DumpState::TILTING;
+                m_dump_stage_time = 0.0;
+            }
+            break;
+        case DumpState::TILTING:
+            if (SlewAngle(m_bed_angle, dump_bed_angle, bed_slew_rate, dt)) {
+                m_dump_state = DumpState::DWELL;
+                m_dump_stage_time = 0.0;
+                // Confirm the tilt actually drops the OPEN rear lip rather than the
+                // closed front wall. Getting the motor axis sign wrong here does not
+                // fail loudly -- it just presses the load against the front wall and
+                // silently dumps nothing -- so report the two lip heights.
+                const double half_x = 0.5;  // bed floor is 1.0 m along the trailer
+                const auto& bed_rot = m_trailer_bed->GetRot();
+                const double front_z = (m_trailer_bed->GetPos() + bed_rot.Rotate({half_x, 0.0, 0.0})).z();
+                const double rear_z = (m_trailer_bed->GetPos() + bed_rot.Rotate({-half_x, 0.0, 0.0})).z();
+                std::cout << "[RobotRig] rank " << m_rank << " bed at full tilt: front_lip_z=" << front_z
+                          << " rear_lip_z=" << rear_z << " drop=" << (front_z - rear_z)
+                          << " m (positive means the open rear is lower, which is correct)\n";
+            }
+            break;
+        case DumpState::DWELL:
+            m_dump_stage_time += dt;
+            if (m_dump_stage_time >= dump_dwell_time) {
+                m_dump_state = DumpState::LEVELING;
+                m_dump_stage_time = 0.0;
+            }
+            break;
+        case DumpState::LEVELING:
+            if (SlewAngle(m_bed_angle, 0.0, bed_slew_rate, dt)) {
+                m_dump_state = DumpState::CLOSING_GATE;
+                m_dump_stage_time = 0.0;
+            }
+            break;
+        case DumpState::CLOSING_GATE:
+            // Gate last, so it latches against a level bed.
+            if (SlewAngle(m_tailgate_angle, 0.0, tailgate_slew_rate, dt)) {
+                m_dump_state = DumpState::DONE;
+                m_dump_stage_time = 0.0;
+                std::cout << "[RobotRig] rank " << m_rank << " dump cycle complete at t=" << time << "\n";
+            }
+            break;
+        default:
+            break;
+    }
+
+    m_trailer_bed_motor->SetAngleFunction(chrono_types::make_shared<chrono::ChFunctionConst>(m_bed_angle));
+    m_trailer_tailgate_hinge->SetAngleFunction(chrono_types::make_shared<chrono::ChFunctionConst>(m_tailgate_angle));
+}
+
 void RobotRig::DumpTrailerBed() {
-    // Placeholder for a future dump cycle: ramp the motor angle up to tip the bed
-    // and slide the load off the open rear, then return to flat. Not wired to ROS.
-    if (m_trailer_bed_motor)
-        m_trailer_bed_motor->SetAngleFunction(chrono_types::make_shared<chrono::ChFunctionConst>(0.0));
+    RequestTrailerDump();
 }
 
 void RobotRig::InitializeDriver() {
 #ifdef AMD_UW_ENABLE_ROS2
-    m_driver = std::make_unique<RosControllerDriver>(*m_vehicle, m_rank, m_rocks);
+    m_driver = std::make_unique<RosControllerDriver>(
+        *m_vehicle, m_rank, m_rocks,
+        InitialGroundPositionForRobot(m_robot_index, m_num_robots));
 #else
     auto interactive_driver = std::make_unique<DriverWrapper>(*m_vehicle);
     m_irr_driver = chrono_types::make_shared<chrono::vehicle::ChInteractiveDriver>(*m_vehicle);
@@ -443,6 +555,7 @@ void RobotRig::InitializeDriver() {
 void RobotRig::InitializeArmBridge(double height_probe_z) {
     m_arm_bridge =
         std::make_unique<RosArmBridge>(m_rank, *m_arm, m_rocks, m_rock_top_heights, m_trailer, height_probe_z);
+    m_trailer_bridge = std::make_unique<RosTrailerBridge>(m_rank, *this);
 }
 #endif
 
@@ -540,8 +653,11 @@ void RobotRig::ApplyTractionGuard(chrono::vehicle::DriverInputs& in, chrono::veh
 
 void RobotRig::Synchronize(double time, chrono::vehicle::ChTerrain& terrain) {
     UpdateRockCollisionActivation();
+    AdvanceDumpCycle(time);
     m_driver->Synchronize(time);
 #ifdef AMD_UW_ENABLE_ROS2
+    if (m_trailer_bridge)
+        m_trailer_bridge->Synchronize();
     if (m_arm_bridge)
         m_arm_bridge->Synchronize(time, terrain);
 #else

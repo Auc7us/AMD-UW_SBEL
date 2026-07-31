@@ -27,11 +27,13 @@ std::string TopicForRobot(int robot_id, const std::string& suffix) {
 
 RosControllerDriver::RosControllerDriver(chrono::vehicle::ChVehicle& vehicle,
                                          int robot_id,
-                                         const std::vector<std::shared_ptr<chrono::ChBodyAuxRef>>& rocks)
+                                         const std::vector<std::shared_ptr<chrono::ChBodyAuxRef>>& rocks,
+                                         const chrono::ChVector3d& home_position)
     : chrono::vehicle::ChDriver(vehicle),
       m_robot_id(robot_id),
       m_rocks(rocks),
-      m_command_received(false) {
+      m_command_received(false),
+      m_home_position(home_position) {
     EnsureRosInitialized();
 
     m_steering = 0.0;
@@ -45,6 +47,8 @@ RosControllerDriver::RosControllerDriver(chrono::vehicle::ChVehicle& vehicle,
         m_node->create_publisher<std_msgs::msg::Float64MultiArray>(TopicForRobot(m_robot_id, "egoState"), 10);
     m_target_pos_pub =
         m_node->create_publisher<std_msgs::msg::Float64MultiArray>(TopicForRobot(m_robot_id, "targetPos"), 10);
+    m_home_pos_pub =
+        m_node->create_publisher<std_msgs::msg::Float64MultiArray>(TopicForRobot(m_robot_id, "homePos"), 10);
     m_command_sub = m_node->create_subscription<std_msgs::msg::Float64MultiArray>(
         TopicForRobot(m_robot_id, "vehicle_cmd"),
         10,
@@ -140,6 +144,10 @@ void RosControllerDriver::PublishTelemetry() {
         target_pos.data.push_back(rock_pos.z());
     }
     m_target_pos_pub->publish(target_pos);
+
+    std_msgs::msg::Float64MultiArray home_pos;
+    home_pos.data = {m_home_position.x(), m_home_position.y(), m_home_position.z()};
+    m_home_pos_pub->publish(home_pos);
 }
 
 }  // namespace amd_uw

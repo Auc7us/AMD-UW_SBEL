@@ -24,6 +24,7 @@ class DriverWrapper;
 class LrvArm;
 #ifdef AMD_UW_ENABLE_ROS2
 class RosArmBridge;
+class RosTrailerBridge;
 #endif
 
 class RobotRig {
@@ -57,6 +58,20 @@ class RobotRig {
     void Synchronize(double time, chrono::vehicle::ChTerrain& terrain);
     void Advance(double step);
     chrono::vehicle::DriverInputs GetDriverInputs() const;
+
+    // Trailer dump cycle. The stages run in order and each one finishes before the
+    // next starts, so the tailgate is never fighting the tilting bed.
+    enum class DumpState { IDLE, OPENING_GATE, TILTING, DWELL, LEVELING, CLOSING_GATE, DONE };
+
+    // Request one dump cycle. Ignored unless idle or already finished, so a
+    // controller republishing the request at its control rate cannot restart the
+    // cycle midway. Returns whether the request started a cycle.
+    bool RequestTrailerDump();
+    DumpState GetDumpState() const { return m_dump_state; }
+    // Current commanded angles, radians. Bed angle is the tilt about the trailer
+    // lateral axis; gate angle is 0 closed.
+    double GetBedAngle() const { return m_bed_angle; }
+    double GetTailgateAngle() const { return m_tailgate_angle; }
     void LogMotionIfNeeded(int step_number,
                            int motion_log_steps,
                            chrono::vehicle::ChTerrain& terrain) const;
@@ -99,11 +114,24 @@ class RobotRig {
     std::shared_ptr<chrono::ChBody> m_trailer_tailgate;
     std::shared_ptr<chrono::ChLinkMotorRotationAngle> m_trailer_tailgate_hinge;
     std::shared_ptr<chrono::ChLinkMotorRotationAngle> m_trailer_bed_motor;
+
+    // Dump cycle state. Both motors are angle motors, so their commanded angle is
+    // slewed toward its target at a bounded rate every step rather than stepped:
+    // re-setting an angle motor's constant is a position discontinuity, i.e. an
+    // instantaneous velocity, which throws the load out of the bed instead of
+    // letting it slide.
+    DumpState m_dump_state = DumpState::IDLE;
+    double m_bed_angle = 0.0;
+    double m_tailgate_angle = 0.0;
+    double m_dump_stage_time = 0.0;
+    double m_last_dump_time = -1.0;
+    void AdvanceDumpCycle(double time);
     std::unique_ptr<chrono::vehicle::ChDriver> m_driver;
     std::shared_ptr<chrono::vehicle::ChInteractiveDriver> m_irr_driver;
     std::unique_ptr<LrvArm> m_arm;
 #ifdef AMD_UW_ENABLE_ROS2
     std::unique_ptr<RosArmBridge> m_arm_bridge;
+    std::unique_ptr<RosTrailerBridge> m_trailer_bridge;
 #endif
     std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> m_rocks;
     std::vector<double> m_rock_top_heights;

@@ -52,6 +52,7 @@ if(AMD_UW_ENABLE_ROS2)
         src/BuilderArmRosBridge.cpp
         src/BuilderVehicleRosBridge.cpp
         src/RosArmBridge.cpp
+        src/RosTrailerBridge.cpp
         src/RosControllerDriver.cpp)
     target_compile_definitions(demo_SYN_polaris_flat PRIVATE AMD_UW_ENABLE_ROS2)
     message(STATUS "ROS2 bridge enabled")
