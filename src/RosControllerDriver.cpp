@@ -19,6 +19,13 @@ void EnsureRosInitialized() {
     rclcpp::init(argc, argv);
 }
 
+// Duplicate-publisher detection: ignore the first seconds (DDS discovery, plus
+// phantom publishers left behind by hard-killed nodes) and require the count to stay
+// high across several spaced samples before believing it.
+constexpr double dup_check_start_time = 3.0;
+constexpr double dup_check_interval = 1.0;
+constexpr int dup_check_confirmations = 3;
+
 std::string TopicForRobot(int robot_id, const std::string& suffix) {
     return "/robot_" + std::to_string(robot_id) + "/" + suffix;
 }
@@ -96,13 +103,28 @@ void RosControllerDriver::Synchronize(double time) {
     // left over from an earlier run can drive the arm at rock positions that no
     // longer exist. It looks like a broken vehicle, not a duplicated controller, so
     // say so explicitly.
-    if (!m_multi_publisher_warned && m_command_sub->get_publisher_count() > 1) {
-        m_multi_publisher_warned = true;
-        RCLCPP_WARN(m_node->get_logger(),
-                    "%zu publishers on %s -- expected 1. A leftover controller from a previous run will "
-                    "fight this one (flickering brake, no throttle, stale targets). Kill strays with: "
-                    "pkill -f pure_pursuit_controller",
-                    m_command_sub->get_publisher_count(), TopicForRobot(m_robot_id, "vehicle_cmd").c_str());
+    //
+    // Sampled over several seconds, not on the first reading: a pkill -9 leaves the
+    // dead node's publisher in DDS discovery for a lease period, so a clean graph
+    // looks duplicated for the first moments of the very next run.
+    if (!m_multi_publisher_warned && time > dup_check_start_time &&
+        time - m_dup_check_last_time >= dup_check_interval) {
+        m_dup_check_last_time = time;
+        if (m_command_sub->get_publisher_count() > 1) {
+            if (++m_dup_confirmations >= dup_check_confirmations) {
+                m_multi_publisher_warned = true;
+                RCLCPP_WARN(m_node->get_logger(),
+                            "%zu publishers on %s for %.0f s -- expected 1. They fight each other: commands "
+                            "alternate, so braking flickers 0/1, throttle never sticks, and the rover sits "
+                            "still. Check for a leftover controller AND for a second sim on this ROS graph: "
+                            "pgrep -af 'pure_pursuit_controller|demo_SYN'",
+                            m_command_sub->get_publisher_count(),
+                            TopicForRobot(m_robot_id, "vehicle_cmd").c_str(),
+                            dup_check_confirmations * dup_check_interval);
+            }
+        } else {
+            m_dup_confirmations = 0;
+        }
     }
 
     {

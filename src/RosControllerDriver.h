@@ -35,6 +35,8 @@ class RosControllerDriver : public chrono::vehicle::ChDriver {
     bool m_command_received;
     bool m_no_command_warned = false;
     bool m_multi_publisher_warned = false;
+    double m_dup_check_last_time = -1.0;
+    int m_dup_confirmations = 0;
 
     // Throttle rise-rate limiter: the commanded throttle (m_throttle_cmd) is
     // applied to m_throttle no faster than m_throttle_rise_per_s per second, so a

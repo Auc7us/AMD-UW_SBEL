@@ -62,6 +62,8 @@ class RosArmBridge {
     // (2 kHz) buries a 10 Hz Python consumer, and a drifting base body corrupts it
     // silently; throttle the one and watch for the other.
     bool m_multi_publisher_warned = false;
+    double m_dup_check_last_time = -1.0;
+    int m_dup_confirmations = 0;
     double m_last_base_pose_pub_time = -1.0;
     double m_base_offset_reference = -1.0;
     int m_base_drift_reports = 0;

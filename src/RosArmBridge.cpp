@@ -25,6 +25,13 @@ constexpr int place_rows = 4;         // longitudinal slots (along the bed, x)
 constexpr double place_step_y = 0.25;
 constexpr double place_step_x = 0.25;
 
+// Duplicate-publisher detection: ignore the first seconds (DDS discovery, plus
+// phantom publishers left by hard-killed nodes) and require the count to stay high
+// across several spaced samples before believing it.
+constexpr double dup_check_start_time = 3.0;
+constexpr double dup_check_interval = 1.0;
+constexpr int dup_check_confirmations = 3;
+
 void EnsureRosInitialized() {
     if (rclcpp::ok())
         return;
@@ -88,13 +95,29 @@ void RosArmBridge::Synchronize(double time, chrono::vehicle::ChTerrain& terrain)
     // reads as an arm that cannot solve a rock it is parked next to, or that reaches
     // for empty ground. `ros2 launch` children outlive a kill of the launch process,
     // so this happens whenever a previous run was not torn down by process group.
-    if (!m_multi_publisher_warned && m_arm_cmd_sub->get_publisher_count() > 1) {
-        m_multi_publisher_warned = true;
-        RCLCPP_WARN(m_node->get_logger(),
-                    "%zu publishers on %s -- expected 1. Leftover manipulator nodes each solve IK in their "
-                    "own stale frame; results here are not trustworthy until they are gone. Kill strays "
-                    "with: pkill -9 -f manipulator_controller",
-                    m_arm_cmd_sub->get_publisher_count(), TopicForRobot(m_robot_id, "arm_cmd").c_str());
+    //
+    // Must be a SUSTAINED count, not the first reading. A pkill -9 never lets a node
+    // unregister from DDS discovery, so its publisher lingers in the graph for a lease
+    // period after the process is gone -- and the first steps of the run are exactly
+    // when that phantom is still visible. Warning on one sample cried wolf on a clean
+    // graph right after a hard kill, which is precisely when this check is consulted.
+    if (!m_multi_publisher_warned && time > dup_check_start_time &&
+        time - m_dup_check_last_time >= dup_check_interval) {
+        m_dup_check_last_time = time;
+        if (m_arm_cmd_sub->get_publisher_count() > 1) {
+            if (++m_dup_confirmations >= dup_check_confirmations) {
+                m_multi_publisher_warned = true;
+                RCLCPP_WARN(m_node->get_logger(),
+                            "%zu publishers on %s for %.0f s -- expected 1. Leftover manipulator nodes each "
+                            "solve IK in their own stale frame, and a second SIM on this ROS graph does the "
+                            "same, so results are not trustworthy until it is gone. Check for both: "
+                            "pgrep -af 'manipulator_controller|demo_SYN'",
+                            m_arm_cmd_sub->get_publisher_count(), TopicForRobot(m_robot_id, "arm_cmd").c_str(),
+                            dup_check_confirmations * dup_check_interval);
+            }
+        } else {
+            m_dup_confirmations = 0;
+        }
     }
 
     PublishArmBasePose(time);
