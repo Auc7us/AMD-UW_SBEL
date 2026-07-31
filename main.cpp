@@ -18,6 +18,7 @@
 #include "chrono/physics/ChBody.h"
 #include "chrono/physics/ChContactMaterial.h"
 #include "chrono/physics/ChSystemSMC.h"
+#include "chrono/solver/ChSolverAPGD.h"
 #include "chrono/solver/ChSolverBB.h"
 #include "chrono/timestepper/ChTimestepper.h"
 
@@ -314,6 +315,8 @@ void AddCommandLineOptions(ChCLI& cli) {
                           "Sim-time period (s) of the per-rank instantaneous cost breakdown (0 disables it)",
                           std::to_string(perf_log_period));
     cli.AddOption<bool>("Diagnostics", "builder_no_arm", "Build the builder without its manipulator (cost bisection)");
+    cli.AddOption<std::string>("Diagnostics", "solver", "Robot-rank solver: bb, apgd, or default", "bb");
+    cli.AddOption<int>("Diagnostics", "solver_iterations", "Max solver iterations for the robot ranks", "100");
     cli.AddOption<std::vector<int>>("VSG", "vsg", "MPI ranks that should open VSG visualization", "-1");
     cli.AddOption<bool>("Simulation", "no_sensor",
                         "Disable the sensor/render rank 0 (it just syncs) -- measure physics without rendering");
@@ -343,6 +346,8 @@ int main(int argc, char* argv[]) {
     BuilderRig::Options builder_options;
     builder_options.with_arm = !cli.CheckOption("builder_no_arm");
     const bool no_sensor = cli.CheckOption("no_sensor");
+    const std::string solver_name = cli.GetAsType<std::string>("solver");
+    const int solver_iterations = cli.GetAsType<int>("solver_iterations");
     syn_manager.SetHeartbeat(heartbeat);
 
     // Use AMD-UW data as the Chrono data root and its vehicle subfolder for vehicle JSON assets.
@@ -440,12 +445,37 @@ int main(int argc, char* argv[]) {
         // shares the rank's system, this is a system-wide choice and is made here
         // rather than inside BuilderRig, which must not reconfigure a world it does
         // not own. Mirrors demo_VEH_M113's SetChronoSolver(BARZILAIBORWEIN, ...).
-        auto solver = chrono_types::make_shared<ChSolverBB>();
-        solver->SetMaxIterations(100);
-        solver->SetOmega(0.8);
-        solver->SetSharpnessLambda(1.0);
-        system->SetSolver(solver);
-        system->SetTimestepperType(ChTimestepper::Type::EULER_IMPLICIT_LINEARIZED);
+        //
+        // It is also a system-wide RISK: the rover's arm is a serial chain of
+        // ChLinkMotorRotationAngle joints on a ChLinkLockLock weld, and it now shares
+        // one iteration budget with ~130 track shoes. --solver selects it so that a
+        // divergence can be attributed instead of guessed at; solver_iterations tunes
+        // the budget without a rebuild.
+        if (solver_name == "bb") {
+            auto solver = chrono_types::make_shared<ChSolverBB>();
+            solver->SetMaxIterations(solver_iterations);
+            solver->SetOmega(0.8);
+            solver->SetSharpnessLambda(1.0);
+            system->SetSolver(solver);
+            system->SetTimestepperType(ChTimestepper::Type::EULER_IMPLICIT_LINEARIZED);
+        } else if (solver_name == "apgd") {
+            auto solver = chrono_types::make_shared<ChSolverAPGD>();
+            solver->SetMaxIterations(solver_iterations);
+            system->SetSolver(solver);
+            system->SetTimestepperType(ChTimestepper::Type::EULER_IMPLICIT_LINEARIZED);
+        } else if (solver_name != "default") {
+            if (rank == 1)
+                std::cout << "[main] unknown --solver '" << solver_name
+                          << "'; expected bb, apgd, or default. Using bb.\n";
+            auto solver = chrono_types::make_shared<ChSolverBB>();
+            solver->SetMaxIterations(solver_iterations);
+            solver->SetOmega(0.8);
+            solver->SetSharpnessLambda(1.0);
+            system->SetSolver(solver);
+            system->SetTimestepperType(ChTimestepper::Type::EULER_IMPLICIT_LINEARIZED);
+        }
+        if (rank == 1)
+            std::cout << "[main] solver=" << solver_name << " iterations=" << solver_iterations << "\n";
     }
 
     if (owns_robot) {
