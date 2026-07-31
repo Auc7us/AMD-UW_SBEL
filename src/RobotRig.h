@@ -70,6 +70,9 @@ class RobotRig {
     }
     void ResetGuardStats() { m_guard_steps = m_guard_limited_steps = 0; }
     double GetSpeed() const { return m_vehicle->GetSpeed(); }
+    // Current harvest cycle. The rank's lane angle is
+    // RankRayAngleRad(robot_index, num_robots, GetHarvestCycle()).
+    int GetHarvestCycle() const { return m_harvest_cycle; }
 
     // Trailer dump cycle. The stages run in order and each one finishes before the
     // next starts, so the tailgate is never fighting the tilting bed.
@@ -145,6 +148,9 @@ class RobotRig {
     void ReportDumpOutcome(double time);
     void CheckWheelSinkage(double time, chrono::vehicle::ChTerrain& terrain);
     void CheckStuck(double time, chrono::vehicle::ChTerrain& terrain);
+    // Rotate this rank's lane one step and spawn its next set of rocks. Called on the
+    // dump-complete edge; see the definition for why it must rebind collision.
+    void StartNextHarvestCycle(double time);
     bool RockIsInBed(const std::shared_ptr<chrono::ChBodyAuxRef>& rock) const;
     std::unique_ptr<chrono::vehicle::ChDriver> m_driver;
     std::shared_ptr<chrono::vehicle::ChInteractiveDriver> m_irr_driver;
@@ -167,6 +173,17 @@ class RobotRig {
     // Per-trailer-wheel anomaly probe state: last terrain height seen under each
     // wheel, and that wheel's settled vertical tire force as the spike reference.
     double m_height_probe_z = 0.0;
+
+    // Retained from InitializeOnTerrain so a later harvest cycle can spawn rocks
+    // exactly as the first one did. The terrain outlives the rig (main owns it).
+    chrono::vehicle::ChTerrain* m_terrain = nullptr;
+    std::shared_ptr<chrono::ChContactMaterial> m_rock_mat;
+    std::string m_chrono_data_path;
+    std::string m_amd_uw_data_path;
+    RockFieldConfig m_rock_field_config;
+    // Harvest cycle index. 0 is the initial lane; each completed dump advances it and
+    // rotates the lane cycle_rotation_rad counter-clockwise about the site centre.
+    int m_harvest_cycle = 0;
     std::vector<double> m_trailer_wheel_last_height;
     std::vector<double> m_trailer_wheel_static_fz;
     int m_trailer_anomaly_reports = 0;

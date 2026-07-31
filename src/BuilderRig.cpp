@@ -232,6 +232,15 @@ void BuilderRig::Synchronize(double time) {
     m_m113->Synchronize(time, m_driver_inputs);
 }
 
+void BuilderRig::SetStationAngle(double angle_rad) {
+#ifdef AMD_UW_ENABLE_ROS2
+    if (m_vehicle_ros_bridge)
+        m_vehicle_ros_bridge->SetStationAngle(angle_rad);
+#else
+    (void)angle_rad;
+#endif
+}
+
 void BuilderRig::Advance(double step) {
     // Subsystems only. The shared system's DoStepDynamics is issued once, by the
     // rig that owns the system.

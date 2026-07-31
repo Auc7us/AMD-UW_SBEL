@@ -64,6 +64,10 @@ class BuilderRig {
     // The shared system itself is stepped once by the rover rig.
     void Advance(double step);
 
+    // Where on its orbit this builder should wait. The rank's lane rotates each
+    // harvest cycle and the builder stays inboard of the collector's drop point.
+    void SetStationAngle(double angle_rad);
+
     // Diagnostics used by the rank-local performance probe.
     const chrono::vehicle::DriverInputs& GetDriverInputs() const { return m_driver_inputs; }
     double GetSpeed() const;

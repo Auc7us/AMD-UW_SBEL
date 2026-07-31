@@ -30,6 +30,14 @@ class RosControllerDriver : public chrono::vehicle::ChDriver {
     void OnCommand(const std_msgs::msg::Float64MultiArray::SharedPtr msg);
     void PublishTelemetry(double time);
 
+  public:
+    // The drop point moves each harvest cycle, so home is not fixed at construction.
+    // Published on /robot_N/homePos, which the drive controller already re-reads every
+    // message, so a change propagates without any handshake.
+    void SetHomePosition(const chrono::ChVector3d& home) { m_home_position = home; }
+
+  private:
+
     int m_robot_id;
     const std::vector<std::shared_ptr<chrono::ChBodyAuxRef>>& m_rocks;
     bool m_command_received;

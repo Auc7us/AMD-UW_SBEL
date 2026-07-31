@@ -13,11 +13,11 @@
 namespace amd_uw {
 
 struct RockFieldConfig {
-    int rocks_per_rank = 15;
+    int rocks_per_rank = 1;
     double mesh_scale = 0.2;
     double density = 2500.0;
-    double first_distance = 30.0;
-    double distance_step = 45.0;
+    double first_distance = 20.0;
+    double distance_step = 30.0;
     double surface_clearance = 0.05;
 };
 
@@ -40,6 +40,11 @@ std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> AddRockFields(
     int num_robots,
     double height_probe_z,
     const RockFieldConfig& config,
-    std::vector<double>* rock_top_heights = nullptr);
+    std::vector<double>* rock_top_heights = nullptr,
+    // Harvest cycle. The rank's whole lane rotates cycle * 30 deg counter-clockwise
+    // about the site centre each time its collector dumps a load, so a later cycle
+    // spawns its rocks on a fresh line. The RNG is seeded from it too, so each cycle
+    // gets a different scatter instead of replaying the same one on a new bearing.
+    int cycle = 0);
 
 }  // namespace amd_uw

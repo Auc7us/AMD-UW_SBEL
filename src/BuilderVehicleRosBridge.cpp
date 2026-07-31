@@ -36,6 +36,8 @@ BuilderVehicleRosBridge::BuilderVehicleRosBridge(
         "chrono_builder_" + std::to_string(m_builder_id) + "_driver");
     m_state_pub = m_node->create_publisher<std_msgs::msg::Float64MultiArray>(
         TopicForBuilder(m_builder_id, "vehicle_state"), 10);
+    m_station_pub = m_node->create_publisher<std_msgs::msg::Float64MultiArray>(
+        TopicForBuilder(m_builder_id, "station_angle"), 10);
     m_command_sub =
         m_node->create_subscription<std_msgs::msg::Float64MultiArray>(
             TopicForBuilder(m_builder_id, "vehicle_cmd"),
@@ -100,6 +102,10 @@ void BuilderVehicleRosBridge::PublishState() {
     std_msgs::msg::Float64MultiArray msg;
     msg.data = {pos.x(), pos.y(), yaw, m_vehicle.GetSpeed()};
     m_state_pub->publish(msg);
+
+    std_msgs::msg::Float64MultiArray station;
+    station.data = {m_station_angle};
+    m_station_pub->publish(station);
 }
 
 }  // namespace amd_uw

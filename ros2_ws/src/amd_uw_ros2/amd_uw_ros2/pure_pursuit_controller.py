@@ -202,7 +202,21 @@ class PurePursuitController(Node):
         if not targets:
             return
 
+        # A GROWING target list means the sim spawned a new harvest cycle: this rank's
+        # lane rotated and fresh rocks were put out. End-of-mission state is latched
+        # (returning_home / parked_at_home stay set once home is reached), so without
+        # clearing it here the rover would sit at the old drop point forever with new
+        # rocks on the ground. Indices are stable because the sim APPENDS, so
+        # completed_targets stays valid and the new rocks are simply unfinished ones.
+        grew = len(targets) > len(self.targets)
         self.targets = targets
+        if grew and self.have_targets:
+            self.get_logger().info(
+                f"targetPos grew to {len(self.targets)}; new harvest cycle -- resuming collection."
+            )
+            self.returning_home = False
+            self.parked_at_home = False
+            self.straighten_until_time_s = None
         if not self.have_targets:
             self.have_targets = True
             self.get_logger().info(f"Received {len(self.targets)} targetPos points.")

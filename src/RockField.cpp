@@ -51,7 +51,8 @@ std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> AddRockFields(
     int num_robots,
     double height_probe_z,
     const RockFieldConfig& config,
-    std::vector<double>* rock_top_heights) {
+    std::vector<double>* rock_top_heights,
+    int cycle) {
     const std::array<std::string, 3> rock_visual_obj_files = {
         chrono_data_path + "robot/curiosity/rocks/rock1.obj",
         chrono_data_path + "robot/curiosity/rocks/rock2.obj",
@@ -86,9 +87,9 @@ std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> AddRockFields(
     std::uniform_real_distribution<double> yaw_offset(-chrono::CH_PI, chrono::CH_PI);
 
     std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> rocks;
-    std::mt19937 rng(20260621 + 4099 * robot_index);
-    const chrono::ChVector3d origin = InitialGroundPositionForRobot(robot_index, num_robots);
-    const double heading = InitialHeadingRadForRobot(robot_index, num_robots);
+    std::mt19937 rng(20260621 + 4099 * robot_index + 104729 * cycle);
+    const chrono::ChVector3d origin = InitialGroundPositionForRobot(robot_index, num_robots, cycle);
+    const double heading = InitialHeadingRadForRobot(robot_index, num_robots, cycle);
     const chrono::ChVector3d forward(std::cos(heading), std::sin(heading), 0.0);
     const chrono::ChVector3d left(-std::sin(heading), std::cos(heading), 0.0);
 

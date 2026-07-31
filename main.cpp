@@ -642,6 +642,12 @@ int main(int argc, char* argv[]) {
             }
             {
                 ScopedTimer timer(perf_accum.bldr_sync);
+                // Keep the builder stationed inboard of its collector's CURRENT drop
+                // point: both derive from the same rank lane angle, which advances one
+                // step per harvest cycle.
+                if (robot)
+                    builder->SetStationAngle(
+                        RankRayAngleRad(robot->GetRobotIndex(), num_robot_ranks, robot->GetHarvestCycle()));
                 builder->Synchronize(time);
             }
             const DriverInputs driver_inputs = robot->GetDriverInputs();

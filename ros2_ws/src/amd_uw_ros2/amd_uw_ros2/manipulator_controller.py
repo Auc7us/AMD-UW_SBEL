@@ -353,7 +353,21 @@ class ManipulatorController(Node):
     def on_target_pos(self, msg: Float64MultiArray) -> None:
         """Track how many rocks exist, so 'all of them resolved' is detectable."""
         stride = 3 if len(msg.data) % 3 == 0 else 2
-        self.num_targets = len(msg.data) // stride
+        count = len(msg.data) // stride
+        # A GROWING list means the sim started a new harvest cycle: the lane rotated
+        # and fresh rocks are out. The end-of-mission flags are one-shot latches, so
+        # they must be cleared or this node would never declare mission_done again and
+        # never request another dump -- the rover would collect the new rocks and then
+        # sit there holding them. Indices are stable (the sim appends), so
+        # completed_targets is deliberately left alone.
+        if count > self.num_targets and self.num_targets > 0:
+            self.get_logger().info(
+                f"targetPos grew {self.num_targets} -> {count}; new harvest cycle -- rearming mission state."
+            )
+            self.mission_done = False
+            self.dump_requested = False
+            self.dump_finished = False
+        self.num_targets = count
 
     def on_mission_done(self, msg: Bool) -> None:
         if msg.data:

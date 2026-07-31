@@ -134,8 +134,15 @@ void RobotRig::InitializeOnTerrain(chrono::vehicle::ChTerrain& terrain,
                                    double step_size,
                                    const RockFieldConfig& rock_field_config) {
     m_rock_top_heights.clear();
+    // Retained so a later harvest cycle can spawn its rocks the same way.
+    m_terrain = &terrain;
+    m_rock_mat = rock_mat;
+    m_chrono_data_path = chrono_data_path;
+    m_amd_uw_data_path = amd_uw_data_path;
+    m_rock_field_config = rock_field_config;
     m_rocks = AddRockFields(GetSystem(), terrain, rock_mat, chrono_data_path, amd_uw_data_path, m_robot_index,
-                            m_num_robots, height_probe_z, rock_field_config, &m_rock_top_heights);
+                            m_num_robots, height_probe_z, rock_field_config, &m_rock_top_heights,
+                            m_harvest_cycle);
 
     const chrono::ChVector3d start_ground = InitialGroundPositionForRobot(m_robot_index, m_num_robots);
     const double start_x = start_ground.x();
@@ -466,10 +473,18 @@ namespace {
 //
 // The bed is hinged about the trailer lateral axis and open at the rear, so a
 // positive tilt of this size drops the rear lip well below the front and the load
-// slides out under lunar gravity. Kept modest because the rocks only need to
-// overcome mu=0.9 static friction on a 0.15 m-walled tub, and a steeper tilt buys
-// nothing but a harder landing.
-constexpr double dump_bed_angle = 40.0 * chrono::CH_DEG_TO_RAD;
+// slides out. The angle MUST exceed the friction angle of the bed material, and the
+// previous 40 deg did not: the bed is mu = 0.9, a rock slides only when
+// tan(theta) > mu, and arctan(0.9) = 42.0 deg. At 40 deg (tan = 0.839) the load is
+// below the threshold and is not supposed to move at all -- a dump that worked was
+// a rock rolling or being nudged by the tilt, not sliding, which is why three ranks
+// emptied and the fourth kept its rock sitting 0.28 m from the bed centre.
+//
+// 55 deg gives tan = 1.43 against mu = 0.9, a comfortable margin. Note gravity
+// cancels out of tan(theta) > mu entirely, so lunar gravity never entered into it
+// and this failed exactly as it would on Earth. If the bed material's friction
+// changes, this angle has to be re-checked against arctan(mu).
+constexpr double dump_bed_angle = 55.0 * chrono::CH_DEG_TO_RAD;
 constexpr double dump_tailgate_angle = 95.0 * chrono::CH_DEG_TO_RAD;
 // Slew rates. Slow enough that the bed and gate carry the load rather than
 // launching it: at these rates the rear lip descends at well under 0.2 m/s.
@@ -619,6 +634,8 @@ void RobotRig::AdvanceDumpCycle(double time) {
                 m_dump_state = DumpState::DONE;
                 m_dump_stage_time = 0.0;
                 ReportDumpOutcome(time);
+                // The load is on the ground: rotate the lane and put out the next set.
+                StartNextHarvestCycle(time);
             }
             break;
         default:
@@ -627,6 +644,44 @@ void RobotRig::AdvanceDumpCycle(double time) {
 
     m_trailer_bed_motor->SetAngleFunction(chrono_types::make_shared<chrono::ChFunctionConst>(m_bed_angle));
     m_trailer_tailgate_hinge->SetAngleFunction(chrono_types::make_shared<chrono::ChFunctionConst>(m_tailgate_angle));
+}
+
+void RobotRig::StartNextHarvestCycle(double time) {
+    ++m_harvest_cycle;
+    if (!m_terrain)
+        return;
+
+    // Rotate this rank's whole lane one step counter-clockwise and spawn a fresh set
+    // of rocks on it. Everything -- rock line, drop point, builder station -- comes
+    // from RankRayAngleRad(rank, N, cycle), so rotating is just advancing the index.
+    const size_t first_new = m_rocks.size();
+    auto new_rocks = AddRockFields(GetSystem(), *m_terrain, m_rock_mat, m_chrono_data_path, m_amd_uw_data_path,
+                                   m_robot_index, m_num_robots, m_height_probe_z, m_rock_field_config,
+                                   &m_rock_top_heights, m_harvest_cycle);
+
+    // APPEND, never replace. The Python controllers track finished rocks by INDEX, so
+    // existing indices have to keep meaning what they meant; new rocks simply arrive as
+    // fresh indices the controllers have not completed yet. Rebuilding the vector would
+    // silently mark the new rocks as already done.
+    m_rocks.insert(m_rocks.end(), new_rocks.begin(), new_rocks.end());
+
+    // Bodies added after the SolidWorks arm import do not register contacts unless the
+    // collision system is rebound -- the same trap BuilderRig works around. Without
+    // this the new rocks fall through the terrain and the gripper passes through them.
+    GetSystem()->GetCollisionSystem()->BindAll();
+
+    // The drop point moves with the lane, so the rover must be told where home is now.
+    const chrono::ChVector3d home = InitialGroundPositionForRobot(m_robot_index, m_num_robots, m_harvest_cycle);
+#ifdef AMD_UW_ENABLE_ROS2
+    if (auto* ros_driver = dynamic_cast<RosControllerDriver*>(m_driver.get()))
+        ros_driver->SetHomePosition(home);
+#endif
+
+    const double angle_deg = RankRayAngleRad(m_robot_index, m_num_robots, m_harvest_cycle) * chrono::CH_RAD_TO_DEG;
+    std::cout << "[RobotRig] rank " << m_rank << " harvest cycle " << m_harvest_cycle << " at t=" << time
+              << ": lane rotated to " << angle_deg << " deg, spawned " << (m_rocks.size() - first_new)
+              << " rock(s), new drop point (" << home.x() << ", " << home.y() << "), "
+              << m_rocks.size() << " rock(s) total in this rank\n";
 }
 
 void RobotRig::ReportDumpOutcome(double time) {
@@ -882,6 +937,14 @@ void RobotRig::CheckStuck(double time, chrono::vehicle::ChTerrain& terrain) {
               << m_last_guarded_inputs.m_throttle << "/" << m_last_guarded_inputs.m_braking
               << " roll=" << (rpy.x() * chrono::CH_RAD_TO_DEG) << " pitch=" << (rpy.y() * chrono::CH_RAD_TO_DEG)
               << " deg\n";
+    // Driveline state: an engine at idle with the throttle open, or a transmission
+    // that never picked a gear, both present as "throttle applied, nothing happens".
+    if (auto powertrain = m_vehicle->GetPowertrainAssembly()) {
+        std::cout << "[RobotRig] rank " << m_rank << " STUCK   engine=" << powertrain->GetEngine()->GetMotorSpeed()
+                  << " rad/s torque=" << powertrain->GetEngine()->GetOutputMotorshaftTorque()
+                  << " Nm gear=" << powertrain->GetTransmission()->GetCurrentGear() << "\n";
+    }
+
     int index = 0;
     for (const auto& axle : m_vehicle->GetAxles()) {
         for (const auto& wheel : axle->GetWheels()) {
@@ -889,8 +952,15 @@ void RobotRig::CheckStuck(double time, chrono::vehicle::ChTerrain& terrain) {
             const double ground = terrain.GetHeight(chrono::ChVector3d(wpos.x(), wpos.y(), m_height_probe_z));
             const auto& tire = wheel->GetTire();
             const double fz = tire ? std::abs(tire->ReportTireForce(&terrain).force.z()) : 0.0;
+            // omega is the discriminator the first version of this report lacked. All
+            // wheels loaded, ground flat, brake off and guard idle still leaves two
+            // very different failures: wheels TURNING while the chassis does not move
+            // is a traction failure, wheels NOT turning is the driveline delivering no
+            // torque. The load and clearance numbers look identical either way.
+            const double omega = tire ? wheel->GetState().omega : 0.0;
             std::cout << "[RobotRig] rank " << m_rank << " STUCK   tractor wheel " << index << " Fz=" << fz
-                      << " N clearance=" << (wpos.z() - ground) << " m\n";
+                      << " N clearance=" << (wpos.z() - ground) << " m omega=" << omega << " rad/s (rim speed "
+                      << (omega * 0.4089) << " m/s)\n";
             ++index;
         }
     }

@@ -16,6 +16,13 @@ def approach(current: float, target: float, max_delta: float) -> float:
         return min(current + max_delta, target)
     return max(current - max_delta, target)
 
+def wrap_to_pi(angle: float) -> float:
+    while angle > math.pi:
+        angle -= 2.0 * math.pi
+    while angle < -math.pi:
+        angle += 2.0 * math.pi
+    return angle
+
 
 @dataclass
 class BuilderState:
@@ -91,18 +98,34 @@ class BuilderOrbitController(Node):
         self.declare_parameter("speed_kp", 0.6)
         self.declare_parameter("speed_tolerance_mps", 0.05)
         self.declare_parameter("max_throttle", 0.6)
+        # How close to the station angle counts as arrived, and how much further it
+        # must drift before setting off again. The gap between them is hysteresis: a
+        # tracked vehicle cannot stop on a point, so without it the builder would
+        # creep past, restart, and hunt around its station forever.
+        self.declare_parameter("station_tolerance_rad", 0.05)
+        self.declare_parameter("station_release_rad", 0.20)
 
         self.builder_id = int(self.get_parameter("builder_id").value)
         self.state_topic = f"/builder_{self.builder_id}/vehicle_state"
         self.command_topic = f"/builder_{self.builder_id}/vehicle_cmd"
+        self.station_topic = f"/builder_{self.builder_id}/station_angle"
         self.state: Optional[BuilderState] = None
         self.steering_command = 0.0
+        # Angle on the orbit this builder should wait at, published by the sim. It
+        # steps one harvest cycle each time this rank's collector dumps a load, so the
+        # builder stays radially inboard of the CURRENT drop point instead of circling
+        # forever past a pile that has moved on.
+        self.station_angle: Optional[float] = None
+        self.holding_station = False
 
         self.command_pub = self.create_publisher(
             Float64MultiArray, self.command_topic, 10
         )
         self.create_subscription(
             Float64MultiArray, self.state_topic, self.on_state, 10
+        )
+        self.create_subscription(
+            Float64MultiArray, self.station_topic, self.on_station_angle, 10
         )
 
         rate_hz = max(
@@ -130,6 +153,36 @@ class BuilderOrbitController(Node):
             yaw=float(msg.data[2]),
             speed=float(msg.data[3]),
         )
+
+    def on_station_angle(self, msg: Float64MultiArray) -> None:
+        if not msg.data:
+            return
+        angle = float(msg.data[0])
+        if self.station_angle is None or abs(wrap_to_pi(angle - self.station_angle)) > 1e-6:
+            self.station_angle = angle
+            if self.holding_station:
+                self.holding_station = False
+                self.get_logger().info(
+                    f"station moved to {math.degrees(angle):.1f} deg; driving to the new one."
+                )
+
+    def station_error(self) -> Optional[float]:
+        """Signed angle still to travel to the station, along the direction of travel.
+
+        Measured the way the builder actually moves: it can only go around its orbit,
+        so an error of -10 deg against counter-clockwise travel means nearly a full
+        lap, not a short reverse.
+        """
+        if self.state is None or self.station_angle is None:
+            return None
+        here = math.atan2(
+            self.state.y - float(self.get_parameter("center_y").value),
+            self.state.x - float(self.get_parameter("center_x").value),
+        )
+        error = wrap_to_pi(self.station_angle - here)
+        if not bool(self.get_parameter("counter_clockwise").value):
+            error = -error
+        return error
 
     def on_timer(self) -> None:
         if self.state is None:
@@ -160,6 +213,28 @@ class BuilderOrbitController(Node):
         self.steering_command = approach(
             self.steering_command, target_steering, steering_delta
         )
+
+        # Hold at the station once reached: brake and stop steering. Reaching it is
+        # judged on the ORBIT angle, not straight-line distance, because that is the
+        # only direction the builder can travel.
+        error = self.station_error()
+        if error is not None:
+            tolerance = abs(float(self.get_parameter("station_tolerance_rad").value))
+            release = max(tolerance, abs(float(self.get_parameter("station_release_rad").value)))
+            travel = error if error >= 0.0 else error + 2.0 * math.pi
+            if not self.holding_station and travel <= tolerance:
+                self.holding_station = True
+                self.get_logger().info(
+                    f"holding station at {math.degrees(self.station_angle):.1f} deg."
+                )
+            elif self.holding_station and abs(wrap_to_pi(error)) > release:
+                self.holding_station = False
+                self.get_logger().info("drifted off station; re-acquiring.")
+
+        if self.holding_station:
+            self.steering_command = approach(self.steering_command, 0.0, steering_delta)
+            self.publish_command(self.steering_command, 0.0, 1.0)
+            return
 
         target_speed = max(
             0.0, float(self.get_parameter("target_speed_mps").value)
