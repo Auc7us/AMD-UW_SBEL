@@ -263,6 +263,37 @@ sign wrong does not fail loudly — it would press the load against the closed
 front wall and dump nothing at all. A positive drop means the open rear is lower,
 which is correct.
 
+### Stray controllers: check this first
+
+`ros2 launch` spawns its nodes as children and does **not** take them down when
+the launch process itself is killed. Ctrl-C in the terminal is fine, but killing
+the launch PID (or a script doing `kill $!`) leaves a full set of controllers
+running. They are invisible until the next run, when they fight it:
+
+```bash
+# Before every run:
+pgrep -af "pure_pursuit_controller|manipulator_controller"   # expect nothing
+# Clean up:
+pkill -9 -f "pure_pursuit_controller|manipulator_controller"
+# From a script, launch in its own process group and kill the group:
+setsid ros2 launch amd_uw_ros2 robot_controllers.launch.py ... &
+kill -TERM -$!
+```
+
+Two duplicate controllers produce two distinct failures that look like anything
+but duplication:
+
+- **On `vehicle_cmd`**: commands alternate, so braking flickers between 0 and 1,
+  throttle never sticks, and the rover sits at spawn. Reads as a broken vehicle.
+- **On `arm_cmd`**: each manipulator node caches its own `arm_base_pose` and
+  solves its own IK, so one rock produces several different answers. The arm
+  grabs at the wrong place, or calls a rock it is parked beside unreachable. A
+  stale node also still holds rock positions from an *earlier* sim.
+
+Both are now reported by the sim on the first offending step, naming the `pkill`.
+If you see `N publishers on ... -- expected 1`, stop and clear strays; results
+until then are not trustworthy.
+
 Arm status error codes:
 
 ```text
