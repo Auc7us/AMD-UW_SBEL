@@ -220,6 +220,49 @@ on `/robot_N/arm_cmd`. The C++ arm publishes `/robot_N/arm_status`, and the
 manipulator controller publishes `/robot_N/target_done=true` after the arm
 reports completion or, by default, after a failed target is skipped.
 
+### End of mission: return home and dump
+
+Once every rock is either collected or skipped, the collector drives back to its
+spawn point, stops, tips its bed to drop the load, resets, and stays put. The
+chain is:
+
+```text
+manipulator_controller  all targets resolved   -> /robot_N/mission_done
+pure_pursuit_controller drives to /robot_N/homePos, stops
+                                               -> /robot_N/at_home
+manipulator_controller                         -> /robot_N/trailer_cmd [1]
+C++ RobotRig            runs the dump cycle    -> /robot_N/trailer_state
+```
+
+`/robot_N/trailer_state` is `[state, bed_angle_rad, tailgate_angle_rad]`, where
+state is `0` idle, `1` opening gate, `2` tilting, `3` dwell, `4` levelling,
+`5` closing gate, `6` done. `/robot_N/homePos` is published by the C++ drive
+bridge so the spawn point is not recomputed in Python.
+
+The cycle runs in C++ at the simulation step rate, and it has to. Both the bed and
+the tailgate are `ChLinkMotorRotationAngle`, so re-setting the commanded angle is
+a *position* discontinuity — an instantaneous velocity that throws the rocks out
+of the tub instead of tipping them out. The cycle therefore slews each angle at a
+bounded rate (bed 12 deg/s to 40 deg, gate 60 deg/s to 95 deg, 3 s dwell at full
+tilt), which cannot be driven from a 10 Hz controller. A controller only asks for
+a cycle; repeat requests during one are ignored.
+
+The gate opens before the bed tilts and closes after it levels, so the load is
+never pressed against a closed gate and then released all at once.
+
+To drive a cycle by hand:
+
+```bash
+ros2 topic pub --once /robot_1/trailer_cmd std_msgs/msg/Float64MultiArray "{data: [1.0]}"
+ros2 topic echo /robot_1/trailer_state
+```
+
+At full tilt the sim logs both bed lip heights, e.g. `front_lip_z=6.010
+rear_lip_z=5.355 drop=0.655`. That check exists because getting the motor axis
+sign wrong does not fail loudly — it would press the load against the closed
+front wall and dump nothing at all. A positive drop means the open rear is lower,
+which is correct.
+
 Arm status error codes:
 
 ```text

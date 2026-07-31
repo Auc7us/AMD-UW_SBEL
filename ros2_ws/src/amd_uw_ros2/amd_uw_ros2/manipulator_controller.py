@@ -91,6 +91,11 @@ class ManipulatorController(Node):
         self.arm_cmd_topic = f"/robot_{self.robot_id}/arm_cmd"
         self.arm_status_topic = f"/robot_{self.robot_id}/arm_status"
         self.target_done_topic = f"/robot_{self.robot_id}/target_done"
+        self.target_pos_topic = f"/robot_{self.robot_id}/targetPos"
+        self.mission_done_topic = f"/robot_{self.robot_id}/mission_done"
+        self.at_home_topic = f"/robot_{self.robot_id}/at_home"
+        self.trailer_cmd_topic = f"/robot_{self.robot_id}/trailer_cmd"
+        self.trailer_state_topic = f"/robot_{self.robot_id}/trailer_state"
 
         # Chrono ignores arm commands with old sequence numbers. Seed from a
         # monotonic clock so restarting this ROS node does not replay seq=1.
@@ -101,6 +106,14 @@ class ManipulatorController(Node):
         self.arm_base_pose: Optional[ArmBasePose] = None
         self.place_target: Optional[Tuple[float, float, float]] = None
         self.completed_targets: Set[int] = set()
+        # End-of-mission sequencing: all targets resolved -> drive home -> dump.
+        self.num_targets = 0
+        # Set when mission completion is seen on the topic, from ANY source -- this
+        # node's own detection, a supervisor, or a human. Gating on "did I publish
+        # it myself" meant an externally declared mission never dumped.
+        self.mission_done = False
+        self.dump_requested = False
+        self.dump_finished = False
         self.arm_scale = float(self.get_parameter("arm_scale").value)
         self.ik_solver = (
             RobotArmInverseKinematicsSolver(scale=self.arm_scale)
@@ -115,6 +128,12 @@ class ManipulatorController(Node):
         self.create_subscription(Float64MultiArray, self.arm_base_pose_topic, self.on_arm_base_pose, 10)
         self.create_subscription(Float64MultiArray, self.place_target_topic, self.on_place_target, 10)
         self.create_subscription(Float64MultiArray, self.arm_status_topic, self.on_arm_status, 10)
+        self.mission_done_pub = self.create_publisher(Bool, self.mission_done_topic, 10)
+        self.trailer_cmd_pub = self.create_publisher(Float64MultiArray, self.trailer_cmd_topic, 10)
+        self.create_subscription(Float64MultiArray, self.target_pos_topic, self.on_target_pos, 10)
+        self.create_subscription(Bool, self.mission_done_topic, self.on_mission_done, 10)
+        self.create_subscription(Bool, self.at_home_topic, self.on_at_home, 10)
+        self.create_subscription(Float64MultiArray, self.trailer_state_topic, self.on_trailer_state, 10)
         self.timer = self.create_timer(0.5, self.on_timer)
 
         self.get_logger().info(
@@ -281,11 +300,52 @@ class ManipulatorController(Node):
         if self.now_seconds() - self.active.last_publish_time_s >= 1.0 / rate_hz:
             self.publish_active_command()
 
+    def on_target_pos(self, msg: Float64MultiArray) -> None:
+        """Track how many rocks exist, so 'all of them resolved' is detectable."""
+        stride = 3 if len(msg.data) % 3 == 0 else 2
+        self.num_targets = len(msg.data) // stride
+
+    def on_mission_done(self, msg: Bool) -> None:
+        if msg.data:
+            self.mission_done = True
+
+    def maybe_publish_mission_done(self) -> None:
+        """Every rock either collected or skipped -> tell the driver to go home."""
+        if self.mission_done or self.num_targets <= 0:
+            return
+        if len(self.completed_targets) < self.num_targets:
+            return
+        self.mission_done = True
+        self.mission_done_pub.publish(Bool(data=True))
+        self.get_logger().info(
+            f"All {self.num_targets} targets resolved; published "
+            f"{self.mission_done_topic}=true to return home and dump."
+        )
+
+    def on_at_home(self, msg: Bool) -> None:
+        if not msg.data or self.dump_requested or not self.mission_done:
+            return
+        self.dump_requested = True
+        # The cycle itself (gate, tilt, dwell, level, gate) runs in the simulation at
+        # step rate, because its motors have to be slewed smoothly or the load is
+        # flung rather than tipped. One request is enough; repeats are ignored there.
+        self.trailer_cmd_pub.publish(Float64MultiArray(data=[1.0]))
+        self.get_logger().info(f"At spawn; requested a dump cycle on {self.trailer_cmd_topic}.")
+
+    def on_trailer_state(self, msg: Float64MultiArray) -> None:
+        if not msg.data or self.dump_finished or not self.dump_requested:
+            return
+        # 6 == RobotRig::DumpState::DONE: bed level again and tailgate closed.
+        if int(round(float(msg.data[0]))) == 6:
+            self.dump_finished = True
+            self.get_logger().info("Dump cycle finished: bed level, tailgate closed. Mission complete.")
+
     def publish_target_done(self, target_index: int) -> None:
         self.completed_targets.add(target_index)
         msg = Bool()
         msg.data = True
         self.target_done_pub.publish(msg)
+        self.maybe_publish_mission_done()
 
     def parse_pickup_request(self, msg: Float64MultiArray) -> Optional[PickupRequest]:
         if len(msg.data) < 3:

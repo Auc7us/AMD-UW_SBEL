@@ -81,6 +81,11 @@ class PurePursuitController(Node):
         self.declare_parameter("pickup_min_approach_speed_mps", 0.0)
         self.declare_parameter("pickup_boundary_speed_mps", 1.0)
         self.declare_parameter("pickup_request_rate_hz", 1.0)
+        # End-of-mission return leg: once every rock is collected or skipped, drive
+        # back to the spawn point and stop there so the load can be dumped.
+        self.declare_parameter("home_tolerance_m", 1.5)
+        self.declare_parameter("home_approach_speed_mps", 1.0)
+        self.declare_parameter("home_slowdown_distance_m", 8.0)
         # Only request a pickup once the chassis has actually come to a FULL STOP:
         # the arm IK is solved for the base pose at request time, and the rover
         # coasts after the wheels brake (low lunar traction), so requesting while
@@ -98,6 +103,9 @@ class PurePursuitController(Node):
         self.target_pos_topic = f"/robot_{self.robot_id}/targetPos"
         self.target_done_topic = f"/robot_{self.robot_id}/target_done"
         self.pickup_request_topic = f"/robot_{self.robot_id}/pickup_request"
+        self.home_pos_topic = f"/robot_{self.robot_id}/homePos"
+        self.mission_done_topic = f"/robot_{self.robot_id}/mission_done"
+        self.at_home_topic = f"/robot_{self.robot_id}/at_home"
         self.command_topic = f"/robot_{self.robot_id}/vehicle_cmd"
 
         self.state: Optional[RobotState] = None
@@ -113,6 +121,11 @@ class PurePursuitController(Node):
         self.straighten_until_time_s: Optional[float] = None
         self.last_pickup_request_time_s: Optional[float] = None
         self.last_pickup_request_index = -1
+        # Spawn point, published by the C++ drive bridge so the site-layout maths
+        # is not duplicated here.
+        self.home: Optional[Tuple[float, float]] = None
+        self.returning_home = False
+        self.parked_at_home = False
         self.command = VehicleCommand()
         self.ramped_target_speed = 0.0
 
@@ -121,6 +134,9 @@ class PurePursuitController(Node):
         self.create_subscription(Float64MultiArray, self.ego_state_topic, self.on_ego_state, 10)
         self.create_subscription(Float64MultiArray, self.target_pos_topic, self.on_target_pos, 10)
         self.create_subscription(Bool, self.target_done_topic, self.on_target_done, 10)
+        self.at_home_pub = self.create_publisher(Bool, self.at_home_topic, 10)
+        self.create_subscription(Float64MultiArray, self.home_pos_topic, self.on_home_pos, 10)
+        self.create_subscription(Bool, self.mission_done_topic, self.on_mission_done, 10)
 
         rate_hz = max(1e-6, float(self.get_parameter("control_rate_hz").value))
         self.dt = 1.0 / rate_hz
@@ -201,6 +217,59 @@ class PurePursuitController(Node):
             self.now_seconds() + max(0.0, float(self.get_parameter("post_done_straighten_time_s").value))
         )
 
+    def on_home_pos(self, msg: Float64MultiArray) -> None:
+        if len(msg.data) < 2:
+            self.get_logger().warn("Ignoring homePos; expected at least [x, y].")
+            return
+        self.home = (float(msg.data[0]), float(msg.data[1]))
+
+    def on_mission_done(self, msg: Bool) -> None:
+        if not msg.data or self.returning_home:
+            return
+        self.returning_home = True
+        self.get_logger().info(
+            "mission_done=true; every target is collected or skipped, returning to spawn."
+        )
+
+    def drive_home(self) -> None:
+        """Drive back to the spawn point, stop there, and report arrival."""
+        if self.home is None:
+            self.get_logger().warn(
+                f"mission_done but no {self.home_pos_topic} received yet; holding.",
+                once=True,
+            )
+            self.command = self.ramp_command(VehicleCommand(steering=0.0, throttle=0.0, brake=1.0))
+            self.publish_command(self.command)
+            return
+
+        distance = math.hypot(self.home[0] - self.state.x, self.home[1] - self.state.y)
+        tolerance = max(0.1, float(self.get_parameter("home_tolerance_m").value))
+
+        if self.parked_at_home or distance <= tolerance:
+            self.command = self.ramp_command(VehicleCommand(steering=0.0, throttle=0.0, brake=1.0))
+            self.publish_command(self.command)
+            self.update_stop_dwell()
+            if not self.parked_at_home and self.is_fully_stopped():
+                self.parked_at_home = True
+                self.get_logger().info(
+                    f"Parked at spawn ({distance:.2f} m from home); publishing {self.at_home_topic}=true."
+                )
+            # Keep asserting arrival: the dump sequencer may start after we do.
+            if self.parked_at_home:
+                self.at_home_pub.publish(Bool(data=True))
+            return
+
+        # Taper the target speed so the last stretch is slow enough to stop on the mark.
+        cruise = max(0.0, float(self.get_parameter("home_approach_speed_mps").value))
+        slowdown = max(1e-3, float(self.get_parameter("home_slowdown_distance_m").value))
+        target_speed = cruise * clamp(distance / slowdown, 0.15, 1.0)
+
+        command = self.compute_speed_command(target_speed_override=target_speed)
+        command.steering = self.compute_steering(self.home)
+        self.command = self.ramp_command(command)
+        self.publish_command(self.command)
+        self.update_stop_dwell()
+
     def update_stop_dwell(self) -> None:
         """Accumulate time the chassis has been at/below the stop speed (reset if it moves)."""
         stop_speed = float(self.get_parameter("pickup_stop_speed_mps").value)
@@ -214,7 +283,17 @@ class PurePursuitController(Node):
         return self.stop_dwell_s >= float(self.get_parameter("pickup_stop_dwell_s").value)
 
     def on_timer(self) -> None:
-        if self.state is None or not self.targets:
+        if self.state is None:
+            self.command = self.ramp_command(VehicleCommand())
+            self.publish_command(self.command)
+            return
+
+        # The return leg outranks everything else, and does not need targetPos.
+        if self.returning_home:
+            self.drive_home()
+            return
+
+        if not self.targets:
             self.command = self.ramp_command(VehicleCommand())
             self.publish_command(self.command)
             return
