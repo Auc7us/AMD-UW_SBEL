@@ -144,6 +144,7 @@ class RobotRig {
     void AdvanceDumpCycle(double time);
     void ReportDumpOutcome(double time);
     void CheckWheelSinkage(double time, chrono::vehicle::ChTerrain& terrain);
+    void CheckStuck(double time, chrono::vehicle::ChTerrain& terrain);
     bool RockIsInBed(const std::shared_ptr<chrono::ChBodyAuxRef>& rock) const;
     std::unique_ptr<chrono::vehicle::ChDriver> m_driver;
     std::shared_ptr<chrono::vehicle::ChInteractiveDriver> m_irr_driver;
@@ -159,6 +160,8 @@ class RobotRig {
     // Per-wheel sunk latch (tractor wheels first, then trailer). See CheckWheelSinkage.
     std::vector<bool> m_wheel_sunk;
     int m_sink_reports = 0;
+    double m_stuck_since = -1.0;
+    double m_last_stuck_report = -1.0e9;
     std::vector<double> m_rock_top_heights;
 
     // Per-trailer-wheel anomaly probe state: last terrain height seen under each

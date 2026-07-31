@@ -483,6 +483,10 @@ constexpr double dump_dwell_time = 3.0;
 constexpr double bed_half_length = 0.7;
 constexpr double bed_half_width = 0.8;
 constexpr double bed_clear_height = 1.2;
+// Stuck detector: throttle applied but not moving. See CheckStuck.
+constexpr double stuck_speed = 0.08;          // m/s, below this counts as not moving
+constexpr double stuck_dwell = 3.0;           // s of sim before it is called stuck
+constexpr double stuck_report_period = 10.0;  // s of sim between repeat reports
 // A stage is finished when its angle is this close to target.
 constexpr double dump_angle_tol = 0.5 * chrono::CH_DEG_TO_RAD;
 
@@ -780,6 +784,7 @@ void RobotRig::ApplyTractionGuard(chrono::vehicle::DriverInputs& in, chrono::veh
 void RobotRig::Synchronize(double time, chrono::vehicle::ChTerrain& terrain) {
     UpdateRockCollisionActivation();
     CheckWheelSinkage(time, terrain);
+    CheckStuck(time, terrain);
     CheckTrailerWheelAnomalies(time, terrain);
     AdvanceDumpCycle(time);
     m_driver->Synchronize(time);
@@ -836,6 +841,57 @@ void RobotRig::UpdateRockCollisionActivation() {
             rock->SetSleeping(false);
         } else if (rock->IsCollisionEnabled() && rock->IsSleeping() && dist2 >= deactivate2) {
             rock->EnableCollision(false);
+        }
+    }
+}
+
+void RobotRig::CheckStuck(double time, chrono::vehicle::ChTerrain& terrain) {
+    // A rover being told to drive and not moving is the one failure that leaves no
+    // trace anywhere: the controller sees its command accepted, the sim reports no
+    // anomaly, and the rank simply never arrives. Everything needed to tell the
+    // causes apart lives on this side, so dump it all in one report:
+    //
+    //  - guarded vs raw inputs: the traction guard cuts throttle and ADDS brake when
+    //    it thinks the corner is over the friction limit, which looks like a seized
+    //    axle from outside.
+    //  - per-wheel Fz: a wheel at zero load is airborne (high-centred / tipped),
+    //    while a wheel far above nominal means the tire is bottoming out.
+    //  - per-wheel ground clearance: whether it is dug in rather than transiently low.
+    //  - roll/pitch: whether it is simply stuck on a slope it cannot climb.
+    const double speed = std::abs(m_vehicle->GetSpeed());
+    const bool trying = m_last_guarded_inputs.m_throttle > 0.05;
+    if (!trying || speed > stuck_speed) {
+        m_stuck_since = -1.0;
+        return;
+    }
+    if (m_stuck_since < 0.0) {
+        m_stuck_since = time;
+        return;
+    }
+    if (time - m_stuck_since < stuck_dwell || time - m_last_stuck_report < stuck_report_period)
+        return;
+    m_last_stuck_report = time;
+
+    const auto pos = m_vehicle->GetChassisBody()->GetPos();
+    const auto rot = m_vehicle->GetChassisBody()->GetRot();
+    const auto rpy = rot.GetCardanAnglesXYZ();
+    std::cout << "[RobotRig] rank " << m_rank << " STUCK for " << (time - m_stuck_since) << " s at t=" << time
+              << ": pos=(" << pos.x() << ", " << pos.y() << ", " << pos.z() << ") speed=" << speed
+              << " raw(str/thr/brk)=" << m_last_raw_inputs.m_steering << "/" << m_last_raw_inputs.m_throttle
+              << "/" << m_last_raw_inputs.m_braking << " guarded=" << m_last_guarded_inputs.m_steering << "/"
+              << m_last_guarded_inputs.m_throttle << "/" << m_last_guarded_inputs.m_braking
+              << " roll=" << (rpy.x() * chrono::CH_RAD_TO_DEG) << " pitch=" << (rpy.y() * chrono::CH_RAD_TO_DEG)
+              << " deg\n";
+    int index = 0;
+    for (const auto& axle : m_vehicle->GetAxles()) {
+        for (const auto& wheel : axle->GetWheels()) {
+            const auto wpos = wheel->GetSpindle()->GetPos();
+            const double ground = terrain.GetHeight(chrono::ChVector3d(wpos.x(), wpos.y(), m_height_probe_z));
+            const auto& tire = wheel->GetTire();
+            const double fz = tire ? std::abs(tire->ReportTireForce(&terrain).force.z()) : 0.0;
+            std::cout << "[RobotRig] rank " << m_rank << " STUCK   tractor wheel " << index << " Fz=" << fz
+                      << " N clearance=" << (wpos.z() - ground) << " m\n";
+            ++index;
         }
     }
 }
