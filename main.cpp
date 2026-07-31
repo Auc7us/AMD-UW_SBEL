@@ -677,6 +677,20 @@ int main(int argc, char* argv[]) {
                  << " [broad=" << (perf_accum.sys_broad * n) << " narrow=" << (perf_accum.sys_narrow * n)
                  << "] setup=" << (perf_accum.sys_setup * n) << " solve=" << (perf_accum.sys_solve * n)
                  << " upd=" << (perf_accum.sys_update * n) << "\n";
+            if (robot) {
+                // Rover drive telemetry: what the controller asked for, what the
+                // traction guard allowed, and how often the guard was saturated. At
+                // lunar gravity the guard only has mu*g ~ 1.3 m/s^2 of lateral grip,
+                // so an over-ambitious target speed shows up here as throttle being
+                // zeroed and brake being added on most steps.
+                const DriverInputs& raw = robot->GetRawDriverInputs();
+                const DriverInputs& guarded = robot->GetGuardedDriverInputs();
+                perf << "       rover speed=" << robot->GetSpeed() << " cmd(str/thr/brk)=" << raw.m_steering << "/"
+                     << raw.m_throttle << "/" << raw.m_braking << " guarded=" << guarded.m_steering << "/"
+                     << guarded.m_throttle << "/" << guarded.m_braking
+                     << " guard_limited=" << (100.0 * robot->GetGuardLimitFraction()) << "%\n";
+                robot->ResetGuardStats();
+            }
             if (builder) {
                 const DriverInputs& inputs = builder->GetDriverInputs();
                 const ChVector3d builder_pos = builder->GetPosition();

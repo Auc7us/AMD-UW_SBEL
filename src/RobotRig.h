@@ -59,6 +59,18 @@ class RobotRig {
     void Advance(double step);
     chrono::vehicle::DriverInputs GetDriverInputs() const;
 
+    // Last commanded inputs as the controller sent them, and as the traction guard
+    // left them. Reported by the perf probe so a rover that will not accelerate can
+    // be traced to either the controller or the guard.
+    const chrono::vehicle::DriverInputs& GetRawDriverInputs() const { return m_last_raw_inputs; }
+    const chrono::vehicle::DriverInputs& GetGuardedDriverInputs() const { return m_last_guarded_inputs; }
+    // Fraction of recent steps in which the guard was over its lateral limit.
+    double GetGuardLimitFraction() const {
+        return (m_guard_steps > 0) ? static_cast<double>(m_guard_limited_steps) / m_guard_steps : 0.0;
+    }
+    void ResetGuardStats() { m_guard_steps = m_guard_limited_steps = 0; }
+    double GetSpeed() const { return m_vehicle->GetSpeed(); }
+
     // Trailer dump cycle. The stages run in order and each one finishes before the
     // next starts, so the tailgate is never fighting the tilting bed.
     enum class DumpState { IDLE, OPENING_GATE, TILTING, DWELL, LEVELING, CLOSING_GATE, DONE };
@@ -92,6 +104,10 @@ class RobotRig {
 #endif
     void Settle(chrono::vehicle::ChTerrain& terrain, double settle_time, double step_size);
     void UpdateRockCollisionActivation();
+    // Watches each trailer wheel for the two things that can launch one wheel out
+    // of nowhere: a discontinuous terrain-height query under it, and a tire
+    // vertical force far above its own settled load. See the definition.
+    void CheckTrailerWheelAnomalies(double time, chrono::vehicle::ChTerrain& terrain);
 
     // Friction-circle traction guard: clamps the driver's (steering, throttle,
     // braking) to what the front tires can actually deliver, so the rover slows to
@@ -136,9 +152,20 @@ class RobotRig {
     std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> m_rocks;
     std::vector<double> m_rock_top_heights;
 
+    // Per-trailer-wheel anomaly probe state: last terrain height seen under each
+    // wheel, and that wheel's settled vertical tire force as the spike reference.
+    double m_height_probe_z = 0.0;
+    std::vector<double> m_trailer_wheel_last_height;
+    std::vector<double> m_trailer_wheel_static_fz;
+    int m_trailer_anomaly_reports = 0;
+
     // Front-axle normal load at rest (captured after settle), used as the reference
     // for the load-aware traction guard. 0 => guard runs open-loop (assumes full load).
     double m_front_static_load = 0.0;
+    chrono::vehicle::DriverInputs m_last_raw_inputs;
+    chrono::vehicle::DriverInputs m_last_guarded_inputs;
+    mutable long m_guard_steps = 0;
+    mutable long m_guard_limited_steps = 0;
 };
 
 }  // namespace amd_uw

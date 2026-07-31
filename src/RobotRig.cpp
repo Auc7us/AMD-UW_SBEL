@@ -195,6 +195,39 @@ void RobotRig::InitializeOnTerrain(chrono::vehicle::ChTerrain& terrain,
     }
     // Reference front-axle load at rest for the load-aware traction guard.
     m_front_static_load = FrontAxleNormalLoad(terrain);
+    // Settled per-wheel vertical tire load, tractor and trailer. TMeasy tires are
+    // parameterised for a nominal load; these are the loads they actually carry, so
+    // a gross mismatch (which makes the tire absurdly stiff for its duty) is visible.
+    {
+        int wheel_index = 0;
+        for (const auto& axle : m_vehicle->GetAxles()) {
+            for (const auto& wheel : axle->GetWheels()) {
+                const auto& tire = wheel->GetTire();
+                if (tire)
+                    std::cout << "[RobotRig] rank " << m_rank << " settled load: tractor wheel " << wheel_index
+                              << " Fz=" << std::abs(tire->ReportTireForce(&terrain).force.z()) << " N\n";
+                ++wheel_index;
+            }
+        }
+    }
+
+    // Baselines for the trailer wheel anomaly probe, captured after settling.
+    m_height_probe_z = height_probe_z;
+    m_trailer_wheel_last_height.clear();
+    m_trailer_wheel_static_fz.clear();
+    for (const auto& axle : m_trailer->GetAxles()) {
+        for (const auto& wheel : axle->GetWheels()) {
+            const auto pos = wheel->GetSpindle()->GetPos();
+            m_trailer_wheel_last_height.push_back(
+                terrain.GetHeight(chrono::ChVector3d(pos.x(), pos.y(), m_height_probe_z)));
+            const auto& tire = wheel->GetTire();
+            m_trailer_wheel_static_fz.push_back(
+                tire ? std::abs(tire->ReportTireForce(&terrain).force.z()) : 0.0);
+            std::cout << "[RobotRig] rank " << m_rank << " settled load: trailer wheel "
+                      << (m_trailer_wheel_static_fz.size() - 1) << " Fz=" << m_trailer_wheel_static_fz.back()
+                      << " N\n";
+        }
+    }
     UpdateRockCollisionActivation();
 
     chrono::synchrono::SynLog() << "Rank " << m_rank << " owns robot index " << m_robot_index << " and "
@@ -273,8 +306,11 @@ void RobotRig::InitializeTrailer() {
 
     for (auto& axle : m_trailer->GetAxles()) {
         for (auto& wheel : axle->GetWheels()) {
+            // Trailer-specific tire: a trailer wheel carries ~107 N against the
+            // tractor's ~480 N, and TMeasy stiffness follows its nominal load, so a
+            // single shared tire cannot suit both without being far too stiff for one.
             auto tire = chrono::vehicle::ReadTireJSON(
-                chrono::vehicle::GetVehicleDataFile("LRV/Polaris_TMeasyTire.json"));
+                chrono::vehicle::GetVehicleDataFile("LRV/Polaris_TMeasyTire_Trailer.json"));
             m_trailer->InitializeTire(tire, wheel, chrono::VisualizationType::MESH);
             tire->SetStepsize(m_tire_step_size);
         }
@@ -630,7 +666,9 @@ void RobotRig::ApplyTractionGuard(chrono::vehicle::DriverInputs& in, chrono::veh
         return;
     }
 
+    ++m_guard_steps;
     if (a_lat > a_lat_max) {
+        ++m_guard_limited_steps;
         // Over the friction limit: too fast to make this turn. Cut throttle, add brake
         // to shed speed, and clamp steering to the sharpest arc the front can hold
         // (steering past it just plows/understeers). This makes it slow down to turn.
@@ -653,6 +691,7 @@ void RobotRig::ApplyTractionGuard(chrono::vehicle::DriverInputs& in, chrono::veh
 
 void RobotRig::Synchronize(double time, chrono::vehicle::ChTerrain& terrain) {
     UpdateRockCollisionActivation();
+    CheckTrailerWheelAnomalies(time, terrain);
     AdvanceDumpCycle(time);
     m_driver->Synchronize(time);
 #ifdef AMD_UW_ENABLE_ROS2
@@ -665,7 +704,9 @@ void RobotRig::Synchronize(double time, chrono::vehicle::ChTerrain& terrain) {
         m_arm->Update(time);
 #endif
     auto driver_inputs = m_driver->GetInputs();
+    m_last_raw_inputs = driver_inputs;
     ApplyTractionGuard(driver_inputs, terrain);
+    m_last_guarded_inputs = driver_inputs;
     m_vehicle->Synchronize(time, driver_inputs, terrain);
     m_trailer->Synchronize(time, driver_inputs, terrain);
 }
@@ -706,6 +747,69 @@ void RobotRig::UpdateRockCollisionActivation() {
             rock->SetSleeping(false);
         } else if (rock->IsCollisionEnabled() && rock->IsSleeping() && dist2 >= deactivate2) {
             rock->EnableCollision(false);
+        }
+    }
+}
+
+void RobotRig::CheckTrailerWheelAnomalies(double time, chrono::vehicle::ChTerrain& terrain) {
+    // The trailer runs TMeasy tires, which are force elements with no collision
+    // geometry: each one asks the terrain for a height and a normal under its
+    // contact patch and turns the resulting deflection into a force. That makes two
+    // failure modes possible that leave no contact trace at all.
+    //
+    // 1. RigidTerrain::GetHeight ray-casts and returns 0 when the ray MISSES, and
+    //    this site sits several metres above z=0. One missed ray therefore reports
+    //    the ground as metres below the wheel, and the step after it reports it back
+    //    at the surface -- a deflection step that becomes an enormous single-wheel
+    //    force. Patch seams and patch edges are where rays go missing.
+    // 2. A tire parameterised for a load far above its actual lunar wheel load is
+    //    very stiff relative to what it carries, so a small deflection error is a
+    //    large force.
+    //
+    // Both look identical from the outside: one wheel suddenly launches. Report the
+    // height discontinuity and the force spike separately so they can be told apart.
+    if (m_trailer_wheel_last_height.empty() || m_trailer_anomaly_reports >= 20)
+        return;
+
+    constexpr double height_jump_tol = 0.5;   // m between consecutive steps
+    constexpr double force_spike_factor = 8.0;  // multiple of the settled load
+    constexpr double force_spike_floor = 2000.0;  // N, for near-unloaded wheels
+
+    size_t index = 0;
+    for (const auto& axle : m_trailer->GetAxles()) {
+        for (const auto& wheel : axle->GetWheels()) {
+            if (index >= m_trailer_wheel_last_height.size())
+                return;
+            const char* side = (index % 2 == 0) ? "LEFT" : "RIGHT";
+            const auto pos = wheel->GetSpindle()->GetPos();
+            const double height =
+                terrain.GetHeight(chrono::ChVector3d(pos.x(), pos.y(), m_height_probe_z));
+            const double previous = m_trailer_wheel_last_height[index];
+            m_trailer_wheel_last_height[index] = height;
+
+            if (std::abs(height - previous) > height_jump_tol) {
+                ++m_trailer_anomaly_reports;
+                std::cout << "[RobotRig] rank " << m_rank << " TRAILER " << side
+                          << " wheel terrain-height JUMP at t=" << time << ": " << previous << " -> " << height
+                          << " m at (" << pos.x() << ", " << pos.y() << ")"
+                          << (std::abs(height) < 1e-9 ? "  [returned exactly 0 -- ray MISSED the terrain]" : "")
+                          << "\n";
+            }
+
+            const auto& tire = wheel->GetTire();
+            if (tire) {
+                const double fz = std::abs(tire->ReportTireForce(&terrain).force.z());
+                const double reference = std::max(force_spike_floor,
+                                                  force_spike_factor * m_trailer_wheel_static_fz[index]);
+                if (fz > reference) {
+                    ++m_trailer_anomaly_reports;
+                    std::cout << "[RobotRig] rank " << m_rank << " TRAILER " << side
+                              << " wheel vertical force SPIKE at t=" << time << ": " << fz << " N (settled "
+                              << m_trailer_wheel_static_fz[index] << " N) at (" << pos.x() << ", " << pos.y()
+                              << ")\n";
+                }
+            }
+            ++index;
         }
     }
 }

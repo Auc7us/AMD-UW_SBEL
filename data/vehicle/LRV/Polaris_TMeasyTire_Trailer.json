@@ -16,7 +16,7 @@
 // Re-measure with the settled-load lines the sim prints at startup if the vehicle
 // mass, the trailer load, or gravity changes.
 {
-  "Name": "Polaris TMeasy Tire",
+  "Name": "Polaris TMeasy Tire (trailer)",
   "Type": "Tire",
   "Template": "TMeasyTire",
 
@@ -43,9 +43,9 @@
 
 
   // ------------------------------------------------
-  // Nominal vertical load [N]. Measured tractor wheel load is ~480 N.
+  // Nominal vertical load [N]. Measured trailer wheel load is ~107 N empty; 150 N leaves headroom for a bed full of rocks.
 
-  "Maximum Bearing Capacity [N]": 500.0,
+  "Maximum Bearing Capacity [N]": 150.0,
 
   // ------------------------------------------------
   // Visualization mesh (OPTIONAL)
