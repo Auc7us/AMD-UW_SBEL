@@ -213,6 +213,12 @@ void RobotRig::InitializeOnTerrain(chrono::vehicle::ChTerrain& terrain,
 
     // Baselines for the trailer wheel anomaly probe, captured after settling.
     m_height_probe_z = height_probe_z;
+    size_t total_wheels = 0;
+    for (const auto& axle : m_vehicle->GetAxles())
+        total_wheels += axle->GetWheels().size();
+    for (const auto& axle : m_trailer->GetAxles())
+        total_wheels += axle->GetWheels().size();
+    m_wheel_sunk.assign(total_wheels, false);
     m_trailer_wheel_last_height.clear();
     m_trailer_wheel_static_fz.clear();
     for (const auto& axle : m_trailer->GetAxles()) {
@@ -471,6 +477,12 @@ constexpr double bed_slew_rate = 12.0 * chrono::CH_DEG_TO_RAD;       // ~3.3 s t
 constexpr double tailgate_slew_rate = 60.0 * chrono::CH_DEG_TO_RAD;  // ~1.6 s to full swing
 // Hold at full tilt so rocks have time to actually leave the tub.
 constexpr double dump_dwell_time = 3.0;
+// Bed footprint, in the bed's own frame, used to decide whether a rock is aboard.
+// Matches the placement grid in RosArmBridge (bed floor ~1.0 x 1.2 m), with a little
+// margin so a rock resting against a wall still counts as in the bed.
+constexpr double bed_half_length = 0.7;
+constexpr double bed_half_width = 0.8;
+constexpr double bed_clear_height = 1.2;
 // A stage is finished when its angle is this close to target.
 constexpr double dump_angle_tol = 0.5 * chrono::CH_DEG_TO_RAD;
 
@@ -495,7 +507,54 @@ bool RobotRig::RequestTrailerDump() {
 
     m_dump_state = DumpState::OPENING_GATE;
     m_dump_stage_time = 0.0;
+
+    // Record which rocks are riding in the bed, so the end of the cycle can say
+    // whether they actually left it. Without this the cycle only proves the bed
+    // moved: the motors reach their commanded angles and report success whether the
+    // load tipped out, stayed put, or was flung somewhere it should not be.
+    m_carried_rocks.clear();
+    for (const auto& rock : m_rocks) {
+        if (!RockIsInBed(rock))
+            continue;
+        m_carried_rocks.push_back(rock);
+
+        // A rock that reaches home and comes to rest gets AUTO-SLEPT by Chrono, and a
+        // sleeping body is excluded from the dynamics: it ignores gravity and it ignores
+        // the bed tilting underneath it. The load then appears welded to the bed at full
+        // incline. It cannot happen earlier in the mission -- a rock cannot fall asleep
+        // while the rover is driving -- so it only ever shows up at the dump.
+        //
+        // Report the state before forcing it, because "asleep", "collision disabled" and
+        // "still fixed by the arm" all look identical from outside (load does not move)
+        // and each implicates different code.
+        const bool was_sleeping = rock->IsSleeping();
+        const bool was_fixed = rock->IsFixed();
+        const bool had_collision = rock->IsCollisionEnabled();
+        if (was_sleeping || was_fixed || !had_collision) {
+            std::cout << "[RobotRig] rank " << m_rank << " dump: rock in bed was"
+                      << (was_sleeping ? " ASLEEP" : "") << (was_fixed ? " FIXED" : "")
+                      << (had_collision ? "" : " NON-COLLIDING")
+                      << " -- it could not have tipped out. Forcing it dynamic.\n";
+        }
+        rock->SetSleepingAllowed(false);
+        rock->SetSleeping(false);
+        rock->SetFixed(false);
+        rock->EnableCollision(true);
+    }
+    std::cout << "[RobotRig] rank " << m_rank << " dump requested: " << m_carried_rocks.size()
+              << " rock(s) in the bed\n";
     return true;
+}
+
+// A rock counts as "in the bed" if it sits within the bed footprint in the bed's own
+// frame, and above its floor. Bed local frame: x along the trailer, y across it.
+bool RobotRig::RockIsInBed(const std::shared_ptr<chrono::ChBodyAuxRef>& rock) const {
+    if (!m_trailer_bed || !rock)
+        return false;
+    const chrono::ChVector3d local =
+        m_trailer_bed->GetRot().RotateBack(rock->GetPos() - m_trailer_bed->GetPos());
+    return std::abs(local.x()) < bed_half_length && std::abs(local.y()) < bed_half_width &&
+           local.z() > -0.3 && local.z() < bed_clear_height;
 }
 
 void RobotRig::AdvanceDumpCycle(double time) {
@@ -555,7 +614,7 @@ void RobotRig::AdvanceDumpCycle(double time) {
             if (SlewAngle(m_tailgate_angle, 0.0, tailgate_slew_rate, dt)) {
                 m_dump_state = DumpState::DONE;
                 m_dump_stage_time = 0.0;
-                std::cout << "[RobotRig] rank " << m_rank << " dump cycle complete at t=" << time << "\n";
+                ReportDumpOutcome(time);
             }
             break;
         default:
@@ -564,6 +623,35 @@ void RobotRig::AdvanceDumpCycle(double time) {
 
     m_trailer_bed_motor->SetAngleFunction(chrono_types::make_shared<chrono::ChFunctionConst>(m_bed_angle));
     m_trailer_tailgate_hinge->SetAngleFunction(chrono_types::make_shared<chrono::ChFunctionConst>(m_tailgate_angle));
+}
+
+void RobotRig::ReportDumpOutcome(double time) {
+    std::cout << "[RobotRig] rank " << m_rank << " dump cycle complete at t=" << time << "\n";
+    if (m_carried_rocks.empty()) {
+        std::cout << "[RobotRig] rank " << m_rank
+                  << " dump outcome: nothing was in the bed, so this proves only that the bed moved\n";
+        return;
+    }
+
+    const chrono::ChVector3d bed_pos = m_trailer_bed ? m_trailer_bed->GetPos() : chrono::VNULL;
+    int left = 0;
+    int stuck = 0;
+    for (size_t i = 0; i < m_carried_rocks.size(); ++i) {
+        const auto& rock = m_carried_rocks[i];
+        const bool in_bed = RockIsInBed(rock);
+        const chrono::ChVector3d pos = rock->GetPos();
+        const double range = (pos - bed_pos).Length();
+        if (in_bed)
+            ++stuck;
+        else
+            ++left;
+        std::cout << "[RobotRig] rank " << m_rank << " dump outcome: rock " << i << " "
+                  << (in_bed ? "STILL IN BED" : "left the bed") << " at (" << pos.x() << ", " << pos.y() << ", "
+                  << pos.z() << "), " << range << " m from the bed\n";
+    }
+    std::cout << "[RobotRig] rank " << m_rank << " dump outcome: " << left << " of " << m_carried_rocks.size()
+              << " rock(s) left the bed, " << stuck << " still aboard\n";
+    m_carried_rocks.clear();
 }
 
 void RobotRig::DumpTrailerBed() {
@@ -691,6 +779,7 @@ void RobotRig::ApplyTractionGuard(chrono::vehicle::DriverInputs& in, chrono::veh
 
 void RobotRig::Synchronize(double time, chrono::vehicle::ChTerrain& terrain) {
     UpdateRockCollisionActivation();
+    CheckWheelSinkage(time, terrain);
     CheckTrailerWheelAnomalies(time, terrain);
     AdvanceDumpCycle(time);
     m_driver->Synchronize(time);
@@ -749,6 +838,55 @@ void RobotRig::UpdateRockCollisionActivation() {
             rock->EnableCollision(false);
         }
     }
+}
+
+void RobotRig::CheckWheelSinkage(double time, chrono::vehicle::ChTerrain& terrain) {
+    // TMeasy tires carry NO collision geometry -- nothing physically stops a wheel from
+    // ending up below the surface. The tire only asks the terrain for a height under its
+    // contact patch and turns the deflection into a force, so if that force is too small
+    // for the load the wheel simply descends through the ground, and if GetHeight's ray
+    // misses (it returns 0, and this site sits metres above z=0) it descends with no
+    // force at all.
+    //
+    // A healthy spindle rides ~0.35-0.41 m above ground (unloaded radius 0.4089 m).
+    // Report on the way in and again on the way out, so a transient dip is
+    // distinguishable from a rover that is stuck high-centred.
+    if (m_sink_reports >= 12)
+        return;
+
+    constexpr double sunk_clearance = 0.15;   // spindle this close to ground = half buried
+    constexpr double recovered_clearance = 0.25;
+
+    size_t index = 0;
+    auto check = [&](const std::shared_ptr<chrono::vehicle::ChWheel>& wheel, const char* which) {
+        const auto pos = wheel->GetSpindle()->GetPos();
+        const double ground = terrain.GetHeight(chrono::ChVector3d(pos.x(), pos.y(), m_height_probe_z));
+        const double clearance = pos.z() - ground;
+        if (index >= m_wheel_sunk.size())
+            return;
+        const bool sunk = clearance < sunk_clearance;
+        if (sunk && !m_wheel_sunk[index]) {
+            m_wheel_sunk[index] = true;
+            ++m_sink_reports;
+            std::cout << "[RobotRig] rank " << m_rank << " " << which << " wheel " << index
+                      << " SUNK at t=" << time << ": spindle z=" << pos.z() << " ground z=" << ground
+                      << " clearance=" << clearance << " m (tire radius 0.409)"
+                      << (std::abs(ground) < 1e-9 ? "  [ground read exactly 0 -- ray MISSED]" : "") << "\n";
+        } else if (!sunk && m_wheel_sunk[index] && clearance > recovered_clearance) {
+            m_wheel_sunk[index] = false;
+            ++m_sink_reports;
+            std::cout << "[RobotRig] rank " << m_rank << " " << which << " wheel " << index
+                      << " recovered at t=" << time << ": clearance=" << clearance << " m\n";
+        }
+        ++index;
+    };
+
+    for (const auto& axle : m_vehicle->GetAxles())
+        for (const auto& wheel : axle->GetWheels())
+            check(wheel, "TRACTOR");
+    for (const auto& axle : m_trailer->GetAxles())
+        for (const auto& wheel : axle->GetWheels())
+            check(wheel, "TRAILER");
 }
 
 void RobotRig::CheckTrailerWheelAnomalies(double time, chrono::vehicle::ChTerrain& terrain) {

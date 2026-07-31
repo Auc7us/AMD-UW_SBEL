@@ -142,6 +142,9 @@ class RobotRig {
     double m_dump_stage_time = 0.0;
     double m_last_dump_time = -1.0;
     void AdvanceDumpCycle(double time);
+    void ReportDumpOutcome(double time);
+    void CheckWheelSinkage(double time, chrono::vehicle::ChTerrain& terrain);
+    bool RockIsInBed(const std::shared_ptr<chrono::ChBodyAuxRef>& rock) const;
     std::unique_ptr<chrono::vehicle::ChDriver> m_driver;
     std::shared_ptr<chrono::vehicle::ChInteractiveDriver> m_irr_driver;
     std::unique_ptr<LrvArm> m_arm;
@@ -150,6 +153,12 @@ class RobotRig {
     std::unique_ptr<RosTrailerBridge> m_trailer_bridge;
 #endif
     std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> m_rocks;
+    // Rocks that were in the bed when a dump was requested, so the end of the cycle
+    // can report whether they actually left it. See ReportDumpOutcome.
+    std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> m_carried_rocks;
+    // Per-wheel sunk latch (tractor wheels first, then trailer). See CheckWheelSinkage.
+    std::vector<bool> m_wheel_sunk;
+    int m_sink_reports = 0;
     std::vector<double> m_rock_top_heights;
 
     // Per-trailer-wheel anomaly probe state: last terrain height seen under each
