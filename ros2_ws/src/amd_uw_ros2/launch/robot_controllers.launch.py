@@ -35,6 +35,7 @@ def launch_setup(context, *args, **kwargs):
     pickup_request_rate_hz = ParameterValue(LaunchConfiguration("pickup_request_rate_hz"), value_type=float)
     skip_failed_targets = ParameterValue(LaunchConfiguration("skip_failed_targets"), value_type=bool)
     command_timeout_s = ParameterValue(LaunchConfiguration("command_timeout_s"), value_type=float)
+    command_timeout_sim_s = ParameterValue(LaunchConfiguration("command_timeout_sim_s"), value_type=float)
     arm_cmd_republish_rate_hz = ParameterValue(
         LaunchConfiguration("arm_cmd_republish_rate_hz"),
         value_type=float,
@@ -71,6 +72,7 @@ def launch_setup(context, *args, **kwargs):
                         "robot_id": robot_id,
                         "skip_failed_targets": skip_failed_targets,
                         "command_timeout_s": command_timeout_s,
+                        "command_timeout_sim_s": command_timeout_sim_s,
                         "arm_cmd_republish_rate_hz": arm_cmd_republish_rate_hz,
                     }
                 ],
@@ -120,8 +122,19 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 "command_timeout_s",
-                default_value="120.0",
-                description="Manipulator command timeout before reporting failure.",
+                default_value="1800.0",
+                description=(
+                    "WALL-clock backstop only, for a sim that is not progressing at all. "
+                    "It is not a duration budget: the sim runs ~19x slower than real time and "
+                    "that ratio moves with rank count, terrain and machine, so a wall number "
+                    "cannot bound arm work. The old 120 s default was ~6 s of sim and fired on "
+                    "essentially every SUCCESSFUL grab. Use command_timeout_sim_s instead."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "command_timeout_sim_s",
+                default_value="90.0",
+                description="Manipulator command timeout in SIMULATION seconds (the real deadline).",
             ),
             DeclareLaunchArgument(
                 "arm_cmd_republish_rate_hz",

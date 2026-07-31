@@ -87,6 +87,7 @@ RosArmBridge::~RosArmBridge() {
 }
 
 void RosArmBridge::Synchronize(double time, chrono::vehicle::ChTerrain& terrain) {
+    m_last_time = time;
     m_executor->spin_some();
 
     // Duplicate manipulator nodes are worse here than on the drive topic. Each one
@@ -194,7 +195,16 @@ void RosArmBridge::Synchronize(double time, chrono::vehicle::ChTerrain& terrain)
         m_placed_seq = m_last_started_seq;  // handled this placement once
     }
 
-    PublishStatus();
+    // Throttled for the same reason as arm_base_pose, but it matters more here:
+    // arm_status now carries the sim clock the manipulator controller uses as its
+    // deadline. Published every 5e-4 s step, it buried the Python node in a backlog
+    // it could never drain, so the controller's view of sim time crawled -- and its
+    // sim-time timeout could never fire correctly because its clock barely moved.
+    constexpr double status_period = 0.02;  // 50 Hz of sim time
+    if (m_last_status_pub_time < 0.0 || time - m_last_status_pub_time >= status_period) {
+        m_last_status_pub_time = time;
+        PublishStatus();
+    }
 }
 
 void RosArmBridge::OnArmCommand(const std_msgs::msg::Float64MultiArray::SharedPtr msg) {
@@ -277,6 +287,11 @@ void RosArmBridge::PublishStatus() {
         static_cast<double>(status.target_index),
         status.success ? 1.0 : 0.0,
         static_cast<double>(status.error_code),
+        // Simulation time, appended so a controller can supervise the arm on the clock
+        // the arm actually advances on. A wall-clock deadline is meaningless here: the
+        // sim runs ~19x slower than real time, and that ratio changes with rank count,
+        // terrain cost and machine, so any fixed wall timeout is wrong somewhere.
+        m_last_time,
     };
     m_arm_status_pub->publish(msg);
 }

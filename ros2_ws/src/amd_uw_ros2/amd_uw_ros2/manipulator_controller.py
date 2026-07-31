@@ -70,7 +70,10 @@ class ManipulatorController(Node):
 
         self.declare_parameter("robot_id", 1)
         self.declare_parameter("skip_failed_targets", True)
-        self.declare_parameter("command_timeout_s", 120.0)
+        # Wall-clock BACKSTOP only (sim not progressing at all). Generous on purpose.
+        self.declare_parameter("command_timeout_s", 1800.0)
+        # The real deadline, on the sim clock reported by arm_status.
+        self.declare_parameter("command_timeout_sim_s", 90.0)
         self.declare_parameter("arm_cmd_republish_rate_hz", 1.0)
         # Aim the gripper at the rock's actual center height (rock_z reported by the
         # sim) plus a tiny offset, instead of a fixed height above ground -- so the
@@ -102,6 +105,8 @@ class ManipulatorController(Node):
         self.command_seq = int(time.monotonic_ns() // 1_000_000)
         self.active: Optional[ActiveCommand] = None
         self.active_start_time_s: Optional[float] = None
+        self.active_start_sim_s: Optional[float] = None
+        self.sim_time: Optional[float] = None
         self.ego_state: Optional[EgoState] = None
         self.arm_base_pose: Optional[ArmBasePose] = None
         self.place_target: Optional[Tuple[float, float, float]] = None
@@ -178,6 +183,7 @@ class ManipulatorController(Node):
             place_theta=place_theta,
         )
         self.active_start_time_s = now_s
+        self.active_start_sim_s = self.sim_time
 
         self.publish_active_command()
         z_text = f", {request.rock_z:.2f}" if request.rock_z is not None else ""
@@ -230,17 +236,26 @@ class ManipulatorController(Node):
         target_index = int(round(float(msg.data[2])))
         success = bool(round(float(msg.data[3])))
         error_code = int(round(float(msg.data[4])))
+        # Optional 6th element: the sim's own clock. The arm advances on sim time, so
+        # that is the only clock its deadline can sensibly use.
+        if len(msg.data) >= 6:
+            self.sim_time = float(msg.data[5])
 
         if self.active is None or command_seq != self.active.command_seq:
             return
 
         self.active.status_seen = True
+        # Anchor the deadline to the first sim time seen for THIS command, not to the
+        # time the command was sent: the sim may not have picked it up yet.
+        if self.active_start_sim_s is None and self.sim_time is not None:
+            self.active_start_sim_s = self.sim_time
 
         if state == ARM_STATE_DONE and success:
             self.publish_target_done(target_index)
             self.get_logger().info(f"Manipulator completed target {target_index}; published target_done=true.")
             self.active = None
             self.active_start_time_s = None
+            self.active_start_sim_s = None
         elif state == ARM_STATE_FAILED:
             self.get_logger().warn(
                 f"Manipulator failed target {target_index} with error_code={error_code}."
@@ -250,6 +265,7 @@ class ManipulatorController(Node):
                 self.get_logger().warn(f"Skipping failed target {target_index}; published target_done=true.")
             self.active = None
             self.active_start_time_s = None
+            self.active_start_sim_s = None
 
     def on_timer(self) -> None:
         if self.active is None or self.active_start_time_s is None:
@@ -257,18 +273,52 @@ class ManipulatorController(Node):
 
         self.republish_active_command_if_needed()
 
-        timeout = max(0.0, float(self.get_parameter("command_timeout_s").value))
-        if timeout <= 0.0:
-            return
+        # Two independent deadlines, because they catch different failures.
+        #
+        # command_timeout_sim_s is the real one, measured on the SIM clock reported by
+        # arm_status. A full pick-and-place takes ~10-20 s of sim time, and the sim runs
+        # roughly 19x slower than wall -- so the old 120 s WALL budget was ~6 s of sim
+        # and fired on essentially every successful grab, skipping the target as failed
+        # while the arm was still working correctly. Worse, the wall/sim ratio moves with
+        # rank count, terrain cost and machine, so no fixed wall number is ever right.
+        #
+        # command_timeout_s stays as a wall-clock backstop for the case the sim-time
+        # clock never advances at all: sim dead, crashed, or never received the command.
+        # That is a liveness check, not a duration budget, so it should be generous.
+        target_index = self.active.target_index
+        sim_timeout = max(0.0, float(self.get_parameter("command_timeout_sim_s").value))
+        if sim_timeout > 0.0 and self.sim_time is not None and self.active_start_sim_s is not None:
+            elapsed_sim = self.sim_time - self.active_start_sim_s
+            if elapsed_sim > sim_timeout:
+                self.fail_active_command(
+                    f"Manipulator command timed out for target {target_index} after "
+                    f"{elapsed_sim:.1f} s of SIM time (limit {sim_timeout:.1f})."
+                )
+                return
 
-        if self.now_seconds() - self.active_start_time_s > timeout:
-            target_index = self.active.target_index
-            self.get_logger().warn(f"Manipulator command timed out for target {target_index}.")
-            if bool(self.get_parameter("skip_failed_targets").value):
-                self.publish_target_done(target_index)
-                self.get_logger().warn(f"Skipping timed-out target {target_index}; published target_done=true.")
-            self.active = None
-            self.active_start_time_s = None
+        wall_timeout = max(0.0, float(self.get_parameter("command_timeout_s").value))
+        if wall_timeout <= 0.0:
+            return
+        if self.now_seconds() - self.active_start_time_s > wall_timeout:
+            stalled = "no arm_status ever arrived" if not self.active.status_seen else (
+                f"sim clock stuck at {self.sim_time}" if self.sim_time is not None else "no sim clock reported"
+            )
+            self.fail_active_command(
+                f"Manipulator command for target {target_index} hit the {wall_timeout:.0f} s WALL backstop "
+                f"({stalled}). This means the sim is not progressing, not that the arm is slow."
+            )
+
+    def fail_active_command(self, message: str) -> None:
+        if self.active is None:
+            return
+        target_index = self.active.target_index
+        self.get_logger().warn(message)
+        if bool(self.get_parameter("skip_failed_targets").value):
+            self.publish_target_done(target_index)
+            self.get_logger().warn(f"Skipping target {target_index}; published target_done=true.")
+        self.active = None
+        self.active_start_time_s = None
+        self.active_start_sim_s = None
 
     def publish_active_command(self) -> None:
         if self.active is None:

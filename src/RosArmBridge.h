@@ -64,7 +64,9 @@ class RosArmBridge {
     bool m_multi_publisher_warned = false;
     double m_dup_check_last_time = -1.0;
     int m_dup_confirmations = 0;
+    double m_last_time = 0.0;  // most recent sim time, published on arm_status
     double m_last_base_pose_pub_time = -1.0;
+    double m_last_status_pub_time = -1.0;
     double m_base_offset_reference = -1.0;
     int m_base_drift_reports = 0;
 
