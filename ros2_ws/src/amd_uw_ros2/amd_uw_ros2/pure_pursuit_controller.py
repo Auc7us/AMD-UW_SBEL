@@ -47,6 +47,7 @@ class PurePursuitController(Node):
     def __init__(self) -> None:
         super().__init__("pure_pursuit_controller")
 
+        self._hard_turning = False
         self.declare_parameter("robot_id", 1)
         self.declare_parameter("control_rate_hz", 20.0)
         self.declare_parameter("target_speed_mps", 1.0)
@@ -61,6 +62,23 @@ class PurePursuitController(Node):
         self.declare_parameter("steering_ramp_per_s", 2.5)
         self.declare_parameter("switch_radius_m", 1.0)
         self.declare_parameter("lookahead_min_m", 2.0)
+        # Upper bound on the pure-pursuit lookahead. Without it the lookahead becomes
+        # the raw distance to the target, and curvature 2*sin(alpha)/L vanishes for a
+        # far goal, so the rover barely steers on a long leg.
+        self.declare_parameter("lookahead_max_m", 8.0)
+        # Beyond this bearing the target is behind the vehicle, where pure pursuit is
+        # degenerate (sin(pi) = 0). Steer at full lock instead until it comes back into
+        # the forward arc; the hysteresis band prevents chatter on the boundary.
+        self.declare_parameter("reverse_turn_alpha_rad", 1.2)
+        self.declare_parameter("reverse_turn_hysteresis_rad", 0.35)
+        # A wheeled vehicle CANNOT turn in place: with Ackermann steering at full lock
+        # and no forward speed there is no yaw moment, so the tires just plow and the
+        # rover sits there digging. Full lock also saturates the lateral tire force on
+        # low-traction regolith, which loses steering authority exactly when it is
+        # needed. So turn on a bounded arc, under power, with room to swing: there is
+        # 20+ m of open ground on the return leg, so a wide arc costs nothing.
+        self.declare_parameter("reverse_turn_steering", 0.6)
+        self.declare_parameter("reverse_turn_speed_mps", 1.2)
         self.declare_parameter("wheelbase_m", 2.5)
         self.declare_parameter("max_steering_angle_rad", 0.6)
         self.declare_parameter("rock_side_offset_m", 1.5)
@@ -259,13 +277,28 @@ class PurePursuitController(Node):
                 self.at_home_pub.publish(Bool(data=True))
             return
 
-        # Taper the target speed so the last stretch is slow enough to stop on the mark.
-        cruise = max(0.0, float(self.get_parameter("home_approach_speed_mps").value))
+        # Cruise home at the SAME speed as the outbound leg. This used to cruise at
+        # home_approach_speed_mps (1.0 m/s) and then scale that down again by distance,
+        # so a rover told to run at 5 m/s crawled the whole way back at 1 m/s or less --
+        # the return leg ignored the set speed entirely. home_approach_speed_mps is now
+        # only what the LAST stretch tapers down to, so the rover still arrives slowly
+        # enough to stop on the mark.
+        cruise = max(0.0, float(self.get_parameter("target_speed_mps").value))
+        final = max(0.0, float(self.get_parameter("home_approach_speed_mps").value))
         slowdown = max(1e-3, float(self.get_parameter("home_slowdown_distance_m").value))
-        target_speed = cruise * clamp(distance / slowdown, 0.15, 1.0)
+        target_speed = final + (cruise - final) * clamp(distance / slowdown, 0.0, 1.0)
 
+        # Steering first: it decides whether we are in the hard-turn regime, and a turn
+        # needs forward speed to produce any yaw at all -- but it must not be taken at
+        # cruise. Cornering acceleration is v^2 * curvature, and at lunar gravity the
+        # traction guard only has mu*g ~ 1.3 m/s^2 to give: at 0.6 steering that caps the
+        # corner at ~2.9 m/s, above which the guard cuts throttle and adds brake, and the
+        # rover oscillates instead of turning. So the turn runs at its own fixed speed.
+        steering = self.compute_steering(self.home)
+        if self._hard_turning:
+            target_speed = min(target_speed, float(self.get_parameter("reverse_turn_speed_mps").value))
         command = self.compute_speed_command(target_speed_override=target_speed)
-        command.steering = self.compute_steering(self.home)
+        command.steering = steering
         self.command = self.ramp_command(command)
         self.publish_command(self.command)
         self.update_stop_dwell()
@@ -361,10 +394,43 @@ class PurePursuitController(Node):
         dy = target_y - self.state.y
         distance = math.hypot(dx, dy)
         alpha = wrap_to_pi(math.atan2(dy, dx) - self.state.yaw)
-        lookahead = max(distance, float(self.get_parameter("lookahead_min_m").value))
         wheelbase = max(1e-6, float(self.get_parameter("wheelbase_m").value))
         max_angle = max(1e-6, float(self.get_parameter("max_steering_angle_rad").value))
 
+        # Pure pursuit's curvature, 2*sin(alpha)/L, is DEGENERATE when the target is
+        # behind the vehicle: sin(pi) = 0, so a target dead astern commands ZERO
+        # steering and the rover drives straight away from it forever. alpha = +-pi is
+        # an unstable equilibrium, not a turn.
+        #
+        # This never showed on the way out -- rovers spawn facing outward with their
+        # rocks ahead, so alpha stays small -- and appeared the first time a rover had
+        # to come home, with the spawn point ~22 m astern. Outside the forward arc,
+        # abandon pure pursuit and steer at full lock the short way round until the
+        # target re-enters it. The hysteresis band keeps it from chattering on the
+        # boundary once it does.
+        turn_in_place = float(self.get_parameter("reverse_turn_alpha_rad").value)
+        release = turn_in_place - float(self.get_parameter("reverse_turn_hysteresis_rad").value)
+        if self._hard_turning:
+            if abs(alpha) < max(0.0, release):
+                self._hard_turning = False
+        elif abs(alpha) > turn_in_place:
+            self._hard_turning = True
+        if self._hard_turning:
+            # copysign, not a curvature: at alpha = +-pi the sign is arbitrary, so pick
+            # one and commit to it rather than dithering between equal-length turns.
+            # Bounded, NOT full lock -- see reverse_turn_steering above.
+            turn_steer = clamp(float(self.get_parameter("reverse_turn_steering").value), 0.0, 1.0)
+            return math.copysign(turn_steer, alpha if alpha != 0.0 else 1.0)
+
+        # Bound the lookahead. Using the raw distance to a far target flattens the
+        # curvature to nothing (2*sin(alpha)/22 m barely steers), which is the second
+        # reason the return leg tracked so poorly. Pure pursuit wants a lookahead set by
+        # the vehicle, not by how far away the goal happens to be.
+        lookahead = clamp(
+            distance,
+            float(self.get_parameter("lookahead_min_m").value),
+            max(1e-3, float(self.get_parameter("lookahead_max_m").value)),
+        )
         curvature = 2.0 * math.sin(alpha) / lookahead
         steering_angle = math.atan(wheelbase * curvature)
         return clamp(steering_angle / max_angle, -1.0, 1.0)
