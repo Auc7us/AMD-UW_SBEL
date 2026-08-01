@@ -937,6 +937,61 @@ void RobotRig::CheckStuck(double time, chrono::vehicle::ChTerrain& terrain) {
               << m_last_guarded_inputs.m_throttle << "/" << m_last_guarded_inputs.m_braking
               << " roll=" << (rpy.x() * chrono::CH_RAD_TO_DEG) << " pitch=" << (rpy.y() * chrono::CH_RAD_TO_DEG)
               << " deg\n";
+    // Rocks close enough to be in the way. Rocks are small (0.2 scale) but they are
+    // rigid and collidable within 12 m, and a rig can be stopped by one wedged under
+    // the chassis or against a wheel while every other reading looks normal. Dumped
+    // piles matter as much as targets: the drop point is on the route out to the next
+    // lane, so a rover can drive into the load it left behind on the previous cycle.
+    {
+        const auto tractor_pos = m_vehicle->GetChassisBody()->GetPos();
+        const auto trailer_pos =
+            (m_trailer && m_trailer->GetChassis()) ? m_trailer->GetChassis()->GetPos() : tractor_pos;
+        for (size_t i = 0; i < m_rocks.size(); ++i) {
+            const auto rpos = m_rocks[i]->GetPos();
+            const double d_tractor = std::sqrt(PlanarDistance2(rpos, tractor_pos));
+            const double d_trailer = std::sqrt(PlanarDistance2(rpos, trailer_pos));
+            const double nearest = std::min(d_tractor, d_trailer);
+            if (nearest < 5.0) {
+                std::cout << "[RobotRig] rank " << m_rank << " STUCK   rock " << i << " at (" << rpos.x()
+                          << ", " << rpos.y() << ", " << rpos.z() << ") is " << d_tractor
+                          << " m from the tractor, " << d_trailer << " m from the trailer, collision="
+                          << (m_rocks[i]->IsCollisionEnabled() ? "on" : "off") << "\n";
+            }
+        }
+    }
+
+    // Articulation angle between tractor and trailer. A rig that PIVOTS instead of
+    // driving -- tens of degrees of yaw for a metre of travel with zero steering
+    // commanded -- is being held at the rear, and a jackknifed trailer does exactly
+    // that: it drags sideways, swings the tractor round, and blocks any steering
+    // further into the fold no matter how much throttle is applied. Nothing else in
+    // this report can see it, because the trailer has no driven wheels and its tires
+    // report normal loads while skidding.
+    if (m_trailer && m_trailer->GetChassis()) {
+        const auto tractor_fwd = m_vehicle->GetChassisBody()->GetRot().GetAxisX();
+        const auto trailer_fwd = m_trailer->GetChassis()->GetBody()->GetRot().GetAxisX();
+        const double hitch_deg =
+            std::atan2(tractor_fwd.x() * trailer_fwd.y() - tractor_fwd.y() * trailer_fwd.x(),
+                       tractor_fwd.x() * trailer_fwd.x() + tractor_fwd.y() * trailer_fwd.y()) *
+            chrono::CH_RAD_TO_DEG;
+        std::cout << "[RobotRig] rank " << m_rank << " STUCK   hitch articulation=" << hitch_deg
+                  << " deg (0 = trailer straight behind; large = jackknifed)\n";
+        int t_index = 0;
+        for (const auto& axle : m_trailer->GetAxles()) {
+            for (const auto& wheel : axle->GetWheels()) {
+                const auto wpos = wheel->GetSpindle()->GetPos();
+                const double ground =
+                    terrain.GetHeight(chrono::ChVector3d(wpos.x(), wpos.y(), m_height_probe_z));
+                const auto& tire = wheel->GetTire();
+                const double fz = tire ? std::abs(tire->ReportTireForce(&terrain).force.z()) : 0.0;
+                std::cout << "[RobotRig] rank " << m_rank << " STUCK   trailer wheel " << t_index
+                          << " Fz=" << fz << " N clearance=" << (wpos.z() - ground)
+                          << " m omega=" << wheel->GetState().omega << " rad/s\n";
+                ++t_index;
+            }
+        }
+    }
+
     // Driveline state: an engine at idle with the throttle open, or a transmission
     // that never picked a gear, both present as "throttle applied, nothing happens".
     if (auto powertrain = m_vehicle->GetPowertrainAssembly()) {

@@ -1,7 +1,30 @@
+// Differentials are near-locked, and they have to be at lunar gravity.
+//
+// With the Chrono default locking limit of 100 Nm these are effectively OPEN, and an
+// open differential sends all torque to the wheel with the least grip. Every rover
+// that got stuck showed exactly that: one wheel -- always the least-loaded one --
+// spinning at 150-363 rad/s (rim speed up to 148 m/s) while the other three sat at
+// 0.00 rad/s and the chassis did not move. More throttle only spun it faster, which
+// is why throttle and steering both looked irrelevant while debugging.
+//
+// It bites here and not on Earth because lunar gravity makes every wheel load ~6x
+// smaller. A wheel carrying 288 N on a 4-8 degree side slope breaks traction at
+// 288 * 0.75 * 0.409 ~ 88 Nm, so the differential gives up long before the engine
+// runs out of torque, and the rig is left with one spinning wheel and no drive.
+//
+// A secondary symptom: the transmission read the spinning wheel as road speed and
+// upshifted to gear 6 while stationary.
+//
+// Real lunar rovers avoid this entirely by driving each wheel independently. The
+// nearest equivalent for a shafts driveline is a high locking limit, which keeps
+// torque on the wheels that still have grip.
 {
   "Name": "Polaris 4WD Driveline",
   "Type": "Driveline",
   "Template": "ShaftsDriveline4WD",
+
+  "Axle Differential Locking Limit": 2000,
+  "Central Differential Locking Limit": 2000,
 
   "Shaft Direction": {
     "Motor Block": [ 1, 0, 0 ],
