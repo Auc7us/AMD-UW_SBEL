@@ -86,7 +86,9 @@ void RosControllerDriver::OnCommand(const std_msgs::msg::Float64MultiArray::Shar
     }
 
     std::lock_guard<std::mutex> lock(m_command_mutex);
-    m_steering = std::clamp(msg->data[0], -1.0, 1.0);
+    // Store steering as a TARGET, slewed toward in Synchronize. It must never be
+    // applied as a step -- see the rate limiter there.
+    m_steering_cmd = std::clamp(msg->data[0], -1.0, 1.0);
     // Store commanded throttle as a target; the applied m_throttle is ramped
     // toward it in Synchronize() so a step full-throttle command doesn't slam in.
     m_throttle_cmd = std::clamp(msg->data[1], 0.0, 1.0);
@@ -130,7 +132,7 @@ void RosControllerDriver::Synchronize(double time) {
     {
         std::lock_guard<std::mutex> lock(m_command_mutex);
         if (!m_command_received) {
-            m_steering = 0.0;
+            m_steering_cmd = 0.0;
             m_throttle_cmd = 0.0;
             m_braking = 1.0;
             m_clutch = 0.0;
@@ -147,10 +149,32 @@ void RosControllerDriver::Synchronize(double time) {
             }
         }
 
-        // Rate-limit the throttle RISE (ramp up gently); apply any decrease
-        // immediately so lift-off / coasting stays responsive.
         const double dt = (m_last_sync_time >= 0.0) ? (time - m_last_sync_time) : 0.0;
         m_last_sync_time = time;
+
+        // Rate-limit STEERING, in the sim's own time, and never apply it as a step.
+        //
+        // Chrono's rack-pinion steering is a ChLinkLockLinActuator driven by a
+        // ChFunctionConst: ChRackPinion::Synchronize turns the steering input straight
+        // into the actuator's commanded POSITION. Re-setting that constant is therefore
+        // a position discontinuity -- an instantaneous velocity in the steering linkage,
+        // which drives an impulse into the front suspension. It is the same hazard the
+        // trailer bed has, and the bed was given a bounded slew rate for exactly this
+        // reason; the steering never was.
+        //
+        // A controller publishing at 20 Hz delivers a staircase, so this fired ~20 times
+        // a second even in steady cruise, and harder still on a mode switch (target
+        // following -> return home) or when a different publisher takes over. Slewing
+        // here, at the 5e-4 s physics step, turns that staircase into a continuous ramp.
+        // Rate-limiting in the Python controller is not enough: it only smooths one
+        // publisher's own output and cannot smooth the jump BETWEEN publishers.
+        if (dt > 0.0) {
+            const double max_step = m_steering_rate_per_s * dt;
+            m_steering = std::clamp(m_steering_cmd, m_steering - max_step, m_steering + max_step);
+        }
+
+        // Rate-limit the throttle RISE (ramp up gently); apply any decrease
+        // immediately so lift-off / coasting stays responsive.
         if (m_throttle_cmd > m_throttle) {
             const double max_rise = m_throttle_rise_per_s * std::max(dt, 0.0);
             m_throttle = std::min(m_throttle_cmd, m_throttle + max_rise);

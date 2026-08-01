@@ -51,6 +51,10 @@ class RosControllerDriver : public chrono::vehicle::ChDriver {
     // step full-throttle command ramps in gently instead of wheelie-ing / bouncing
     // the front wheels. Throttle release is applied immediately (braking stays
     // responsive). Full throttle takes ~1/m_throttle_rise_per_s seconds to reach.
+    // Steering is slewed, not stepped: the rack-pinion actuator takes the input as a
+    // commanded POSITION, so a jump is an instantaneous velocity into the suspension.
+    double m_steering_cmd = 0.0;
+    double m_steering_rate_per_s = 2.5;  // full lock in ~0.8 s
     double m_throttle_cmd = 0.0;
     double m_throttle_rise_per_s = 0.35;  // ~2.9 s from 0 to full
     double m_last_sync_time = -1.0;
