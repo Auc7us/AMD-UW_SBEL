@@ -204,6 +204,18 @@ void RosControllerDriver::PublishTelemetry(double time) {
     const auto forward = rot.GetAxisX();
     const double yaw = std::atan2(forward.y(), forward.x());
 
+    // Element 5 is SIMULATION time, and the controller needs it badly.
+    //
+    // Every deadline in pure_pursuit_controller is measured with the ROS clock,
+    // which here is wall time, while the thing being timed happens in sim time --
+    // and this sim runs ~20x slower than real time. So a "10 s" stop timeout is
+    // really 0.5 s of sim (which is why nearly every grab in every run so far
+    // logged `TIMEOUT, dwell=0.00s`, having never had time to settle), and a "15 s"
+    // manoeuvring allowance is 0.75 s of sim. Worse, the scale factor is not a
+    // constant: it moves with rank count, terrain and machine load, so a wall-clock
+    // number cannot express a physical deadline at all. The manipulator already
+    // learned this the hard way and grew command_timeout_sim_s; the drive
+    // controller had no sim clock to use. Now it does.
     std_msgs::msg::Float64MultiArray ego_state;
     ego_state.data = {
         pos.x(),
@@ -211,6 +223,7 @@ void RosControllerDriver::PublishTelemetry(double time) {
         yaw,
         m_vehicle.GetSpeed(),
         pos.z(),
+        time,
     };
     if (publish_ego) {
         m_last_ego_pub_time = time;

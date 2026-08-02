@@ -7,6 +7,8 @@
 
 #include "chrono/core/ChQuaternion.h"
 #include "chrono/core/ChVector3.h"
+#include "chrono/functions/ChFunctionSetpoint.h"
+#include "chrono/utils/ChConstants.h"
 #include "chrono/physics/ChBody.h"
 #include "chrono/physics/ChBodyAuxRef.h"
 #include "chrono/physics/ChLinkLock.h"
@@ -64,6 +66,15 @@ class LrvArm {
     // drift silently moves every IK target by the same amount.
     double BaseOffsetFromChassis() const;
 
+    // Read-only state for the divergence tripwire. The commanded pose is what the
+    // constraint motors are being asked to reach; the applied pose is where the
+    // slew has got to. A large gap between them at the moment a rank blows up says
+    // the arm was mid-swing; cmd_theta far outside the working range says the
+    // command itself was bad.
+    const char* GetPhaseName() const;
+    std::array<double, 4> GetCommandedTheta() const { return m_cmd_theta; }
+    std::array<double, 4> GetAppliedTheta() const { return m_applied_theta; }
+
     // Direct actuator interface used by the builder arm bridge and its
     // deterministic actuation test. Angles follow the same theta convention as
     // the Python IK output consumed by StartPickPlace.
@@ -82,6 +93,12 @@ class LrvArm {
 
     void CommandJointAngles(const std::array<double, 4>& theta);
     void CommandFingerPosition(double close_pos);
+    // Step m_applied_theta toward m_cmd_theta at a bounded rate and push the
+    // result (with its velocity) into the motors. Must run every physics step,
+    // in every phase, including IDLE/DONE.
+    void AdvanceJointCommands(double time);
+    static double MotorAngleForJoint(int joint, double theta);
+    static double MotorRateForJoint(int joint, double theta_rate);
     void OpenGripper();
     bool TryLockRock();
     void RemoveRockLock();
@@ -110,6 +127,20 @@ class LrvArm {
     std::shared_ptr<chrono::ChLinkMotorRotationAngle> m_motor_elbow_effector;
     std::shared_ptr<chrono::ChLinkMotorLinearPosition> m_motor_finger_1;
     std::shared_ptr<chrono::ChLinkMotorLinearPosition> m_motor_finger_2;
+
+    // Joint commands are SLEWED, never stepped -- see AdvanceJointCommands.
+    // Index order matches the theta[] convention used throughout: base, shoulder,
+    // elbow, wrist.
+    std::array<std::shared_ptr<chrono::ChFunctionSetpoint>, 4> m_joint_fn;
+    std::array<double, 4> m_cmd_theta = {-chrono::CH_PI, 0.0, 0.0, 0.0};
+    std::array<double, 4> m_applied_theta = {-chrono::CH_PI, 0.0, 0.0, 0.0};
+    double m_last_cmd_time = -1.0;
+
+    // Fingers get the same treatment. The motors are built at +/-0.15 m, so that is
+    // where the applied value starts.
+    std::array<std::shared_ptr<chrono::ChFunctionSetpoint>, 2> m_finger_fn;
+    double m_cmd_close_pos = 0.15;
+    double m_applied_close_pos = 0.15;
 
     Phase m_phase = Phase::IDLE;
     ArmStatusSnapshot m_status;

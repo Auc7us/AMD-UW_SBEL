@@ -13,7 +13,7 @@
 namespace amd_uw {
 
 struct RockFieldConfig {
-    int rocks_per_rank = 1;
+    int rocks_per_rank = 2;
     double mesh_scale = 0.2;
     double density = 2500.0;
     double first_distance = 20.0;

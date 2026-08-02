@@ -49,6 +49,43 @@ constexpr double place_timeout = 6.0;
 constexpr double release_hold_time = 1.0;
 constexpr double stow_hold_time = 2.0;
 constexpr double total_timeout = 45.0;
+// Max rate any joint's COMMANDED angle may change, rad/s. The largest pose change
+// in the sequence is roughly pi rad (rest/stow to a grab pose), so ~2 s to cross it
+// -- comfortably inside close_timeout (8 s) and place_timeout (6 s), and slower
+// than LIFTING's own 0.5 rad/s ramp so that phase is unaffected.
+// Reach envelope for an accepted grab target, measured in the arm-base frame --
+// the same frame the Python solver works in (world_to_arm_base_local there is
+// GetIkFrameRot().RotateBack(target - GetIkFramePos()) here).
+//
+// The Python IK is an UNCONSTRAINED BFGS minimisation of the FK residual: no joint
+// limits, no reach limits. So it will happily return a pose for a point underneath
+// the arm's own base by folding the arm back through the rover, and report
+// fk_err = 0.0000 -- which only ever meant "this pose is self-consistent", never
+// "this pose is legal". Nothing downstream checked either, and the six actuators
+// are CONSTRAINT motors (ChLinkMotorRotationAngle / ChLinkMotorLinearPosition):
+// they have no torque limit, so the solver drives the collision-enabled fingers
+// into the chassis with whatever force it takes, and that reaction goes straight
+// into the ChLinkLockLock welding the arm base to the chassis.
+//
+// Observed in the 3 h run: rank 4 was handed local_target = (-0.177, -0.324,
+// -0.541), i.e. the gripper commanded to a point 0.37 m from its own base, behind
+// it and half a metre down. Every one of the 30 legitimate grabs in that run sat
+// between 1.39 m and 2.22 m of horizontal reach, so the two populations do not
+// overlap and this bound does not cost a single good grab.
+//
+// The arm spans ~2.72 m from base origin to fingertip at geometry_scale 1, so the
+// upper bound is just inside full extension: a target beyond it can only be
+// reached by a solution that is straight-armed and singular.
+constexpr double min_grab_reach_xy = 1.0;
+constexpr double max_grab_reach_xy = 2.6;
+constexpr double min_grab_local_z = -1.2;
+constexpr double joint_slew_rate = 1.5;
+// Same, for the finger prismatic motors, m/s. Opening used to be a single step
+// from finger_close_pos to 0 -- 0.145 m demanded in one 5e-4 s step, a commanded
+// 290 m/s -- fired at the instant the rock is released over the bed. Closing was
+// always ramped (finger_close_speed); only the release snapped. 0.3 m/s clears the
+// full travel in ~0.5 s, inside release_hold_time.
+constexpr double finger_slew_rate = 0.3;
 constexpr std::array<double, 4> stow_theta = {-chrono::CH_PI, chrono::CH_PI / 5.0, chrono::CH_PI / 4.0, 0.0};
 
 struct BodySpec {
@@ -333,8 +370,29 @@ LrvArm::LrvArm(chrono::ChSystem* system,
     m_motor_finger_2 =
         AddLink<chrono::ChLinkMotorLinearPosition>(system, m_end_effector, m_finger_2, joint_effector);
 
-    m_motor_finger_1->SetMotionFunction(chrono_types::make_shared<chrono::ChFunctionConst>(-0.15));
-    m_motor_finger_2->SetMotionFunction(chrono_types::make_shared<chrono::ChFunctionConst>(0.15));
+    const std::array<std::shared_ptr<chrono::ChLinkMotorLinearPosition>, 2> finger_motors = {
+        m_motor_finger_1, m_motor_finger_2};
+    const std::array<double, 2> finger_sign = {-1.0, 1.0};
+    for (int i = 0; i < 2; ++i) {
+        m_finger_fn[i] = chrono_types::make_shared<chrono::ChFunctionSetpoint>();
+        m_finger_fn[i]->SetSetpointAndDerivatives(finger_sign[i] * m_applied_close_pos, 0.0, 0.0);
+        finger_motors[i]->SetMotionFunction(m_finger_fn[i]);
+    }
+
+    // One setpoint function per joint, attached once and then mutated in place by
+    // AdvanceJointCommands. Attaching a freshly allocated function every step would
+    // also work but allocates four shared_ptrs per arm per 5e-4 s step.
+    //
+    // The motors are built at angle 0, which in theta[] terms is {-pi, 0, 0, 0} --
+    // the same value m_cmd_theta / m_applied_theta are initialised to, so the arm
+    // starts already at its commanded pose and the first step demands nothing.
+    const std::array<std::shared_ptr<chrono::ChLinkMotorRotationAngle>, 4> joint_motors = {
+        m_motor_base_shoulder, m_motor_shoulder_biceps, m_motor_biceps_elbow, m_motor_elbow_effector};
+    for (int i = 0; i < 4; ++i) {
+        m_joint_fn[i] = chrono_types::make_shared<chrono::ChFunctionSetpoint>();
+        m_joint_fn[i]->SetSetpointAndDerivatives(MotorAngleForJoint(i, m_applied_theta[i]), 0.0, 0.0);
+        joint_motors[i]->SetAngleFunction(m_joint_fn[i]);
+    }
 
     m_chassis_lock =
         AddLink<chrono::ChLinkLockLock>(system, m_chassis_body, m_base, chrono::ChFramed(mount_pos, mount_rot));
@@ -398,6 +456,25 @@ bool LrvArm::StartPickPlace(double command_seq,
         FinishFailed(2);
         return false;
     }
+    // Reject a pose the arm cannot legally hold BEFORE commanding the motors to it.
+    // The existing divergence_abort check in APPROACH is too late: it measures the
+    // gripper error only after the arm has already swung to the pose, which for a
+    // target inside the rover means after the fingers have been driven into the
+    // chassis. See min_grab_reach_xy.
+    {
+        const chrono::ChVector3d local = GetIkFrameRot().RotateBack(grab_target_world - GetIkFramePos());
+        const double reach_xy = std::hypot(local.x(), local.y());
+        if (reach_xy < min_grab_reach_xy || reach_xy > max_grab_reach_xy || local.z() < min_grab_local_z) {
+            std::cout << "[LrvArm] grab target OUT OF ENVELOPE: local=(" << local.x() << ", " << local.y()
+                      << ", " << local.z() << ") reach_xy=" << reach_xy << " m, allowed ["
+                      << min_grab_reach_xy << ", " << max_grab_reach_xy << "] and z >= " << min_grab_local_z
+                      << ". The rover is parked wrong for this rock; refusing to fold the arm through "
+                         "itself to reach it.\n";
+            FinishFailed(5);
+            return false;
+        }
+    }
+
     m_grab_theta = *grab_theta_override;
     m_place_theta = *place_theta_override;
 
@@ -410,6 +487,12 @@ bool LrvArm::StartPickPlace(double command_seq,
 }
 
 void LrvArm::Update(double time) {
+    // Before the phase early-out: the slew has to keep running in IDLE/DONE/FAILED
+    // too. STOWING calls FinishDone() after stow_hold_time, and the arm may still be
+    // travelling to the stow pose at that moment -- stopping the slew there would
+    // freeze it mid-swing and leave the motors holding a pose they never reached.
+    AdvanceJointCommands(time);
+
     if (m_phase == Phase::IDLE || m_phase == Phase::DONE || m_phase == Phase::FAILED)
         return;
 
@@ -485,10 +568,9 @@ void LrvArm::Update(double time) {
             if (TryLockRock()) {
                 std::cout << "[LrvArm] LOCKED t=" << time << " actual_sep=" << actual_sep
                           << " pad_force=" << pad_force << "\n";
-                // Now bonded to the end-effector: unfreeze so it lifts with the
-                // arm, but keep collision off so it doesn't fight terrain/fingers.
-                m_target_rock->SetFixed(false);
-                m_target_rock->EnableCollision(false);
+                // Unfreezing and disabling collision now happen inside TryLockRock,
+                // BEFORE the weld is built rather than one line after it -- see the
+                // comment there.
                 m_lift_angle = m_grab_theta[1];
                 m_phase = Phase::LIFTING;
                 m_phase_time = time;
@@ -572,6 +654,21 @@ ArmStatusSnapshot LrvArm::GetStatus() const {
     return m_status;
 }
 
+const char* LrvArm::GetPhaseName() const {
+    switch (m_phase) {
+        case Phase::IDLE: return "IDLE";
+        case Phase::APPROACH: return "APPROACH";
+        case Phase::CLOSING: return "CLOSING";
+        case Phase::LIFTING: return "LIFTING";
+        case Phase::PLACING: return "PLACING";
+        case Phase::RELEASING: return "RELEASING";
+        case Phase::STOWING: return "STOWING";
+        case Phase::DONE: return "DONE";
+        case Phase::FAILED: return "FAILED";
+    }
+    return "?";
+}
+
 chrono::ChVector3d LrvArm::GetIkFramePos() const {
     return m_base ? m_base->GetPos() : chrono::VNULL;
 }
@@ -632,16 +729,89 @@ std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> LrvArm::GetBodies() const {
     };
 }
 
-void LrvArm::CommandJointAngles(const std::array<double, 4>& theta) {
-    m_motor_base_shoulder->SetAngleFunction(chrono_types::make_shared<chrono::ChFunctionConst>(-theta[0] - chrono::CH_PI));
-    m_motor_shoulder_biceps->SetAngleFunction(chrono_types::make_shared<chrono::ChFunctionConst>(theta[1]));
-    m_motor_biceps_elbow->SetAngleFunction(chrono_types::make_shared<chrono::ChFunctionConst>(-theta[2]));
-    m_motor_elbow_effector->SetAngleFunction(chrono_types::make_shared<chrono::ChFunctionConst>(-theta[3]));
+// Sign/offset convention between the theta[] used everywhere in this file and the
+// raw motor angles. GetActuatorSnapshot inverts exactly this.
+double LrvArm::MotorAngleForJoint(int joint, double theta) {
+    switch (joint) {
+        case 0: return -theta - chrono::CH_PI;
+        case 1: return theta;
+        default: return -theta;
+    }
 }
 
+double LrvArm::MotorRateForJoint(int joint, double theta_rate) {
+    return (joint == 1) ? theta_rate : -theta_rate;
+}
+
+// Record the TARGET pose only. Never write the motors here.
+//
+// These are ChLinkMotorRotationAngle: the function value IS the commanded joint
+// position, so swapping in a new constant is a position discontinuity -- the same
+// hazard as the rack-pinion steering and the trailer bed, both of which were given
+// bounded slew rates for exactly this reason. Here the steps are large: rest or
+// stow (-pi) to a grab pose near -1.2 rad is ~1.9 rad demanded in a single 5e-4 s
+// step, i.e. a commanded ~3900 rad/s, while ChFunctionConst reports a derivative of
+// zero so the velocity-level constraint simultaneously says "hold still". The
+// solver absorbs that contradiction as an impulse, it reacts through the base into
+// the ChLinkLockLock welding the arm to the chassis, and that is the arm-base
+// divergence to NaN. The PLACING phase already documented the visible half of this
+// ("the rigid single-shot motors snap fast through the place pose (~1.4 m/s)").
+void LrvArm::CommandJointAngles(const std::array<double, 4>& theta) {
+    m_cmd_theta = theta;
+
+    // Base yaw takes the SHORT way round.
+    //
+    // theta[0] arrives from the Python IK, which is exact (fk_err = 0) but returns
+    // the angle in (-pi, pi]. Mapped through -theta - pi, a solution of -1.2 rad
+    // becomes a motor angle of -1.94 rad while +1.2 rad becomes -4.34 rad -- the
+    // same physical pose 2*pi away, but 249 degrees of travel instead of 111, and
+    // in the same rotational direction, so the arm sweeps the long way round
+    // through its own chassis and trailer instead of straight out to the side.
+    //
+    // Which one the IK returns depends only on which side of the rover the rock
+    // ended up (rock_side_offset_m puts local_target.y at -2 or +2), so a rank
+    // approaching from the mirrored side had every grab fail: the arm either
+    // diverged en route (err 1.9 m) or arrived late and closed on empty air 0.4 m
+    // short. Ranks that happened to approach from the other side worked perfectly
+    // with an identical solver, which is what made it look like a per-rank fault.
+    //
+    // Only joint 0 is wrapped. It is a full revolute, so every 2*pi-equivalent is
+    // the same pose; the shoulder/elbow/wrist are not, and wrapping those would
+    // silently select a folded-back configuration rather than a shorter path.
+    const double delta = m_cmd_theta[0] - m_applied_theta[0];
+    m_cmd_theta[0] = m_applied_theta[0] + std::remainder(delta, chrono::CH_2PI);
+}
+
+void LrvArm::AdvanceJointCommands(double time) {
+    const double dt = (m_last_cmd_time >= 0.0) ? (time - m_last_cmd_time) : 0.0;
+    m_last_cmd_time = time;
+    if (dt <= 0.0)
+        return;
+
+    const double max_step = joint_slew_rate * dt;
+    for (int i = 0; i < 4; ++i) {
+        const double diff = m_cmd_theta[i] - m_applied_theta[i];
+        const double step = std::clamp(diff, -max_step, max_step);
+        m_applied_theta[i] += step;
+        // Hand the motor a consistent position AND velocity. ChFunctionConst
+        // always reports zero derivative, which is what makes even a small
+        // position increment inconsistent at the velocity level.
+        m_joint_fn[i]->SetSetpointAndDerivatives(MotorAngleForJoint(i, m_applied_theta[i]),
+                                                 MotorRateForJoint(i, step / dt),
+                                                 0.0);
+    }
+
+    const double finger_diff = m_cmd_close_pos - m_applied_close_pos;
+    const double finger_step = std::clamp(finger_diff, -finger_slew_rate * dt, finger_slew_rate * dt);
+    m_applied_close_pos += finger_step;
+    const double finger_rate = finger_step / dt;
+    m_finger_fn[0]->SetSetpointAndDerivatives(-m_applied_close_pos, -finger_rate, 0.0);
+    m_finger_fn[1]->SetSetpointAndDerivatives(m_applied_close_pos, finger_rate, 0.0);
+}
+
+// Target only; the slew in AdvanceJointCommands writes the motors.
 void LrvArm::CommandFingerPosition(double close_pos) {
-    m_motor_finger_1->SetMotionFunction(chrono_types::make_shared<chrono::ChFunctionConst>(-close_pos));
-    m_motor_finger_2->SetMotionFunction(chrono_types::make_shared<chrono::ChFunctionConst>(close_pos));
+    m_cmd_close_pos = close_pos;
 }
 
 void LrvArm::OpenGripper() {
@@ -659,6 +829,21 @@ bool LrvArm::TryLockRock() {
         (rock_pos - m_finger_2->GetPos()).Length() >= lock_finger_dist) {
         return false;
     }
+
+    // Give the rock its state variables back BEFORE welding it to the end effector.
+    //
+    // The rock is held SetFixed(true) through APPROACH so the gripper cannot shove
+    // it. A fixed body has no variables in the solver, so initialising a
+    // ChLinkLockLock against it builds the constraint against a body that is not
+    // part of the system's DOFs -- and the caller then unfixed it on the very next
+    // line, meaning the weld's first solved step was also the first step in which
+    // its second body existed. Unfixing first makes the weld's Jacobian describe
+    // the body it will actually constrain.
+    //
+    // Collision goes off at the same moment and for the same reason it always did:
+    // once bonded, the rock must not fight the fingers or the terrain.
+    m_target_rock->SetFixed(false);
+    m_target_rock->EnableCollision(false);
 
     const auto midpoint = GripperCenter();
     m_rock_lock = chrono_types::make_shared<chrono::ChLinkLockLock>();

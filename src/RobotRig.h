@@ -73,6 +73,10 @@ class RobotRig {
     // Current harvest cycle. The rank's lane angle is
     // RankRayAngleRad(robot_index, num_robots, GetHarvestCycle()).
     int GetHarvestCycle() const { return m_harvest_cycle; }
+    // True once this rank's physics has produced a non-finite value. Nothing this
+    // rig reports afterwards is meaningful, so the caller should stop the run
+    // rather than spend hours simulating a dead rank.
+    bool HasDiverged() const { return m_diverged; }
 
     // Trailer dump cycle. The stages run in order and each one finishes before the
     // next starts, so the tailgate is never fighting the tilting bed.
@@ -118,6 +122,10 @@ class RobotRig {
     // Load-aware via the measured front-axle normal force; open-loop (mu*g) when the
     // static reference isn't available.
     void ApplyTractionGuard(chrono::vehicle::DriverInputs& inputs, chrono::vehicle::ChTerrain& terrain) const;
+    // Lock the axle differentials for straight running, release them to turn.
+    void UpdateAxleDifferentialLock(double steering);
+    // Engaged at initialization, so this starts true.
+    bool m_axle_diff_locked = true;
     double FrontAxleNormalLoad(chrono::vehicle::ChTerrain& terrain) const;
 
     int m_rank;
@@ -148,6 +156,10 @@ class RobotRig {
     void ReportDumpOutcome(double time);
     void CheckWheelSinkage(double time, chrono::vehicle::ChTerrain& terrain);
     void CheckStuck(double time, chrono::vehicle::ChTerrain& terrain);
+    // Names the body that is blowing up while it is still finite, and the
+    // constraints pulling on it. See the definition for why NaN itself is too
+    // late to diagnose from.
+    void CheckDivergence(double time);
     // Rotate this rank's lane one step and spawn its next set of rocks. Called on the
     // dump-complete edge; see the definition for why it must rebind collision.
     void StartNextHarvestCycle(double time);
@@ -168,6 +180,12 @@ class RobotRig {
     int m_sink_reports = 0;
     double m_stuck_since = -1.0;
     double m_last_stuck_report = -1.0e9;
+    // Divergence tripwire state. m_diverged latches on the first non-finite body:
+    // once true this rank's physics is dead and no other reading from it means
+    // anything.
+    double m_last_divergence_scan = -1.0e9;
+    int m_divergence_reports = 0;
+    bool m_diverged = false;
     std::vector<double> m_rock_top_heights;
 
     // Per-trailer-wheel anomaly probe state: last terrain height seen under each

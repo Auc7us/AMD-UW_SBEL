@@ -237,7 +237,19 @@ void RosArmBridge::PublishArmBasePose(double time) {
     // is transformed into this frame, a drift of d moves every IK target by d and the
     // solver reports "unreachable" for a rock the arm is parked next to.
     const double offset = m_arm.BaseOffsetFromChassis();
-    if (m_base_offset_reference < 0.0) {
+    // Order matters: test for non-finite FIRST. `std::abs(NaN - ref) > 0.25` is
+    // false, so the plain drift branch below reports the finite part of a blow-up
+    // and then falls permanently silent at the exact moment the arm tears off --
+    // which is worse than no detector at all, because the last thing it printed
+    // was a merely-large number that looked survivable.
+    if (!std::isfinite(offset)) {
+        if (m_base_drift_reports < 10) {
+            ++m_base_drift_reports;
+            std::cout << "[RosArmBridge] robot " << m_robot_id << " arm base NON-FINITE at t=" << time
+                      << " (reference offset was " << m_base_offset_reference
+                      << " m); this rank's arm has diverged\n";
+        }
+    } else if (m_base_offset_reference < 0.0) {
         m_base_offset_reference = offset;
     } else if (std::abs(offset - m_base_offset_reference) > 0.25 && m_base_drift_reports < 10) {
         ++m_base_drift_reports;

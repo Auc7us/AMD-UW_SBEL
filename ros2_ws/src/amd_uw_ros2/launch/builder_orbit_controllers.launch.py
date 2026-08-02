@@ -78,7 +78,7 @@ def generate_launch_description():
                 "work_circle_radius_m", default_value="30.0"
             ),
             DeclareLaunchArgument(
-                "path_radius_m", default_value="40.0"
+                "path_radius_m", default_value="35.0"
             ),
             DeclareLaunchArgument(
                 "target_speed_mps", default_value="1.0"

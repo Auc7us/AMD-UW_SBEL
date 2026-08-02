@@ -36,6 +36,27 @@ namespace {
 constexpr double rock_collision_activation_radius = 12.0;
 constexpr double rock_collision_deactivation_radius = 16.0;
 
+// Divergence tripwire thresholds. See RobotRig::CheckDivergence.
+//
+// The point of the WARN tier is that NaN is a useless place to start looking: by
+// the time a value is NaN it has propagated through every constraint the body
+// touches, and every rank body reads NaN within a few steps. The blow-up is only
+// localised while it is still FINITE, so the tripwire has to fire on absurd-but-
+// finite motion and name the body then. 60 m/s is ~10x anything on this site (the
+// rover cruises at 5) and 200 rad/s is ~500x a wheel at speed.
+constexpr double divergence_speed_warn = 60.0;      // m/s
+constexpr double divergence_omega_warn = 200.0;     // rad/s
+constexpr double divergence_scan_period = 0.05;     // sim s between scans
+constexpr int divergence_max_reports = 6;
+
+bool IsFinite(const chrono::ChVector3d& v) {
+    return std::isfinite(v.x()) && std::isfinite(v.y()) && std::isfinite(v.z());
+}
+
+bool IsFinite(const chrono::ChQuaternion<>& q) {
+    return std::isfinite(q.e0()) && std::isfinite(q.e1()) && std::isfinite(q.e2()) && std::isfinite(q.e3());
+}
+
 double VecNorm(const chrono::ChVector3d& v) {
     return std::sqrt(v.x() * v.x() + v.y() * v.y() + v.z() * v.z());
 }
@@ -265,6 +286,31 @@ void RobotRig::InitializeVehicle(const chrono::ChCoordsys<>& init_pos) {
         chrono::vehicle::GetVehicleDataFile("LRV/Polaris_AutomaticTransmissionSimpleMap.json"));
     auto powertrain = chrono_types::make_shared<chrono::vehicle::ChPowertrainAssembly>(engine, transmission);
     m_vehicle->InitializePowertrain(powertrain);
+
+    // ENGAGE the differential locks. Setting the locking limits in Polaris_4WD.json
+    // is necessary but on its own does nothing at all.
+    //
+    // ChShaftsDriveline4WD builds each differential lock as a ChShaftsClutch and
+    // then calls SetModulation(0) on it -- "By default, unlocked". The JSON
+    // "Axle/Central Differential Locking Limit" only sets that clutch's torque
+    // CAPACITY via SetTorqueLimit; modulation is the engagement, and at 0 the
+    // clutch transmits nothing no matter how large the limit is. Raising the limit
+    // alone therefore leaves the differentials fully open, which is what a wheel
+    // spinning at 31 rad/s beside its own axle-mate at 0.02 rad/s means.
+    //
+    // Both halves are needed: modulation 1 engages the clutch, and the raised limit
+    // stops it slipping again at Chrono's default 100 Nm.
+    //
+    // -1 locks both driven axles. LockCentralDifferential ignores its first
+    // argument. Locked for the whole run: these are slow rovers on loose regolith
+    // in lunar gravity, where every wheel load is ~6x smaller than on Earth, and
+    // real lunar rovers sidestep the problem entirely by driving each wheel
+    // independently. The scrub a locked axle causes while turning costs far less
+    // than being stranded.
+    if (auto* driveline = m_vehicle->GetDriveline().get()) {
+        driveline->LockAxleDifferential(-1, true);
+        driveline->LockCentralDifferential(-1, true);
+    }
 
     for (auto& axle : m_vehicle->GetAxles()) {
         for (auto& wheel : axle->GetWheels()) {
@@ -665,10 +711,23 @@ void RobotRig::StartNextHarvestCycle(double time) {
     // silently mark the new rocks as already done.
     m_rocks.insert(m_rocks.end(), new_rocks.begin(), new_rocks.end());
 
-    // Bodies added after the SolidWorks arm import do not register contacts unless the
-    // collision system is rebound -- the same trap BuilderRig works around. Without
-    // this the new rocks fall through the terrain and the gripper passes through them.
-    GetSystem()->GetCollisionSystem()->BindAll();
+    // Bodies added after the SolidWorks arm import do not register contacts unless
+    // they are bound into the collision system -- the same trap BuilderRig works
+    // around. Without this the new rocks fall through the terrain and the gripper
+    // passes through them.
+    //
+    // Bind ONLY the new rocks. This used to call BindAll(), which rebuilds the
+    // collision state of every body in the rank -- while the rig is sitting in
+    // resting contact with the terrain, the bed, and whatever it just dumped. Under
+    // SMC a contact that is re-detected with its existing penetration delivers the
+    // full penalty force in a single step rather than the force it had been
+    // carrying, so BindAll was an impulse applied to the whole rank at the one
+    // moment per cycle when it was guaranteed to be loaded. Rank 4 in the 3 h run
+    // went non-finite ~0.4 s of sim time after this line. That is correlation, not
+    // proof -- but a whole-system rebind was never needed here, since the only
+    // unbound bodies are the ones this function just created.
+    for (size_t i = first_new; i < m_rocks.size(); ++i)
+        GetSystem()->GetCollisionSystem()->BindItem(m_rocks[i]);
 
     // The drop point moves with the lane, so the rover must be told where home is now.
     const chrono::ChVector3d home = InitialGroundPositionForRobot(m_robot_index, m_num_robots, m_harvest_cycle);
@@ -837,6 +896,9 @@ void RobotRig::ApplyTractionGuard(chrono::vehicle::DriverInputs& in, chrono::veh
 }
 
 void RobotRig::Synchronize(double time, chrono::vehicle::ChTerrain& terrain) {
+    // First, before anything reads the state: a rank whose physics has blown up
+    // must say so. Everything below this line silently no-ops on NaN.
+    CheckDivergence(time);
     UpdateRockCollisionActivation();
     CheckWheelSinkage(time, terrain);
     CheckStuck(time, terrain);
@@ -856,8 +918,62 @@ void RobotRig::Synchronize(double time, chrono::vehicle::ChTerrain& terrain) {
     m_last_raw_inputs = driver_inputs;
     ApplyTractionGuard(driver_inputs, terrain);
     m_last_guarded_inputs = driver_inputs;
+    UpdateAxleDifferentialLock(driver_inputs.m_steering);
     m_vehicle->Synchronize(time, driver_inputs, terrain);
     m_trailer->Synchronize(time, driver_inputs, terrain);
+}
+
+// Lock the axle differentials for straight running, release them to turn.
+//
+// Locked all the time is too blunt. A locked axle forces both wheels to the same
+// speed while a turn needs them to travel different distances, so the tires scrub
+// against each other; at full steering on a slope that scrub bogged the engine to
+// 3.4 rad/s (33 rpm) in gear 1 and the rig stopped just as dead as it used to with
+// a wheel spinning -- all four wheels turning together at 0.18 rad/s, going
+// nowhere. Unlocked all the time is the original fault: an open differential sends
+// every newton-metre to the least-loaded wheel, which at lunar gravity breaks
+// traction almost immediately.
+//
+// So lock where locking pays -- hauling in a straight line, which is where the
+// runaway wheel always appeared -- and release before the scrub can build. The two
+// thresholds are hysteresis; a single one would chatter the clutch on and off
+// around the boundary. The centre differential stays locked throughout: it splits
+// front to rear, where the wheels travel the same distance through a turn, so it
+// costs no scrub.
+void RobotRig::UpdateAxleDifferentialLock(double steering) {
+    constexpr double lock_below = 0.25;      // |steering| under this: lock
+    constexpr double release_above = 0.35;   // over this: unlock, but only at speed
+    constexpr double scrub_speed = 1.0;      // below this, scrub is irrelevant
+
+    // Releasing on STEERING ALONE was wrong, and it broke the turnaround.
+    //
+    // Pure pursuit's hard-turn branch commands exactly 0.6 steering, which sailed
+    // past the 0.35 release threshold and unlocked the differentials for the whole
+    // post-dump turnaround -- a manoeuvre done at ~0 m/s, which is precisely when
+    // an open differential dumps every newton-metre into the least-loaded wheel and
+    // the rig stops moving. A rover was seen pirouetting for 38 s, covering 0.13 m,
+    // at full throttle with the locks released.
+    //
+    // Scrub is a function of SPEED, not steer angle: two wheels forced to the same
+    // speed only fight each other when they are actually covering ground, and the
+    // energy involved scales with how fast. Standing still there is nothing to
+    // scrub. So release only when the rover is both turning hard AND moving --
+    // otherwise stay locked, because at low speed traction is the only thing that
+    // matters.
+    const double magnitude = std::abs(steering);
+    const double speed = std::abs(m_vehicle->GetSpeed());
+
+    bool want_locked;
+    if (speed < scrub_speed) {
+        want_locked = true;
+    } else {
+        want_locked = m_axle_diff_locked ? (magnitude <= release_above) : (magnitude < lock_below);
+    }
+    if (want_locked == m_axle_diff_locked)
+        return;
+    m_axle_diff_locked = want_locked;
+    if (auto* driveline = m_vehicle->GetDriveline().get())
+        driveline->LockAxleDifferential(-1, want_locked);
 }
 
 void RobotRig::Advance(double step) {
@@ -900,6 +1016,150 @@ void RobotRig::UpdateRockCollisionActivation() {
     }
 }
 
+// Name the body that is diverging, WHILE IT IS STILL FINITE.
+//
+// This exists because a rank that goes NaN currently dies without a word, and I
+// have spent three sessions guessing at the mechanism from the silence. Every
+// other detector in this file fails open on NaN -- `NaN > threshold` and
+// `std::abs(NaN - ref) > 0.25` are both FALSE, so CheckStuck early-returns and the
+// arm-base DRIFT check goes quiet at exactly the moment it should shout. Worse,
+// once a value is NaN it has already propagated through every constraint the body
+// touches and every body in the rank reads NaN within a few steps, so the NaN
+// itself cannot tell you where it started.
+//
+// So there are two tiers. The WARN tier fires on absurd-but-FINITE motion, which
+// is the only window in which the blow-up is still localised to one body -- that
+// is the report that actually names a culprit. The FATAL tier catches the NaN
+// itself and dumps enough state to reconstruct what the rig was doing.
+//
+// Both report the links touching the offending body and their reaction wrenches,
+// because on this rig the suspects are all constraints: six position-driven arm
+// motors with no torque limit, the ChLinkLockLock welding the arm to the chassis,
+// and the weld that bonds a grabbed rock to the end effector.
+void RobotRig::CheckDivergence(double time) {
+    // Note the scan is NOT gated on the report count. Only PRINTING is capped.
+    // Gating the scan would mean a rig that emitted its quota of warnings while
+    // still finite could then go NaN without ever latching m_diverged -- i.e. the
+    // detector would go quiet exactly as the failure completed, which is the same
+    // fail-open bug this whole function exists to correct.
+    if (m_diverged)
+        return;
+    if (time - m_last_divergence_scan < divergence_scan_period)
+        return;
+    m_last_divergence_scan = time;
+
+    chrono::ChBody* nonfinite = nullptr;
+    chrono::ChBody* fastest = nullptr;
+    chrono::ChBody* spinniest = nullptr;
+    double fastest_speed = 0.0;
+    double spinniest_omega = 0.0;
+
+    for (const auto& body : GetSystem()->GetBodies()) {
+        const auto pos = body->GetPos();
+        const auto rot = body->GetRot();
+        const auto vel = body->GetPosDt();
+        const auto omg = body->GetAngVelLocal();
+        if (!IsFinite(pos) || !IsFinite(rot) || !IsFinite(vel) || !IsFinite(omg)) {
+            if (!nonfinite)
+                nonfinite = body.get();
+            continue;  // magnitudes are meaningless once any component is NaN
+        }
+        const double speed = VecNorm(vel);
+        if (speed > fastest_speed) {
+            fastest_speed = speed;
+            fastest = body.get();
+        }
+        const double omega = VecNorm(omg);
+        if (omega > spinniest_omega) {
+            spinniest_omega = omega;
+            spinniest = body.get();
+        }
+    }
+
+    const bool fatal = (nonfinite != nullptr);
+    const bool warn = (fastest_speed > divergence_speed_warn) || (spinniest_omega > divergence_omega_warn);
+    if (!fatal && !warn)
+        return;
+
+    // Latch first: a fatal finding must stop the job even if the print quota for
+    // the warning tier is already spent.
+    if (fatal)
+        m_diverged = true;
+    if (!fatal && m_divergence_reports >= divergence_max_reports)
+        return;  // still scanning every cycle, just no longer shouting about it
+    ++m_divergence_reports;
+
+    const char* tag = fatal ? "DIVERGED" : "DIVERGING";
+    std::cout << "[RobotRig] rank " << m_rank << " " << tag << " at t=" << time << "\n";
+
+    auto report_body = [&](const char* what, chrono::ChBody* body, double magnitude) {
+        if (!body)
+            return;
+        const auto p = body->GetPos();
+        const auto v = body->GetPosDt();
+        const auto w = body->GetAngVelLocal();
+        // A negative magnitude means "not applicable" (the non-finite body, whose
+        // numbers are meaningless). Printing a literal NaN here would be worse than
+        // useless: the test harness greps the sim log for NaN as a failure signal,
+        // so the detector would flag itself.
+        std::cout << "[RobotRig] rank " << m_rank << " " << tag << "   " << what << " '" << body->GetName()
+                  << "' magnitude=" << (magnitude < 0.0 ? std::string("n/a") : std::to_string(magnitude))
+                  << " pos=(" << p.x() << ", " << p.y() << ", " << p.z()
+                  << ") vel=(" << v.x() << ", " << v.y() << ", " << v.z() << ") omega=(" << w.x() << ", "
+                  << w.y() << ", " << w.z() << ") fixed=" << (body->IsFixed() ? "yes" : "no")
+                  << " collision=" << (body->IsCollisionEnabled() ? "on" : "off")
+                  << " |Fcontact|=" << body->GetContactForce().Length() << " N\n";
+
+        // Which constraints are pulling on it, and how hard. A position-driven
+        // motor has no torque limit, so an impossible pose shows up here as a
+        // reaction of absurd magnitude long before anything becomes NaN.
+        for (const auto& link_base : GetSystem()->GetLinks()) {
+            auto link = std::dynamic_pointer_cast<chrono::ChLink>(link_base);
+            if (!link)
+                continue;
+            const auto* frame = static_cast<const chrono::ChBodyFrame*>(body);
+            const bool first = (link->GetBody1() == frame);
+            if (!first && link->GetBody2() != frame)
+                continue;
+            const auto wrench = first ? link->GetReaction1() : link->GetReaction2();
+            std::cout << "[RobotRig] rank " << m_rank << " " << tag << "     link '" << link->GetName()
+                      << "' |F|=" << wrench.force.Length() << " N |T|=" << wrench.torque.Length() << " Nm\n";
+        }
+    };
+
+    if (fatal) {
+        report_body("first non-finite body", nonfinite, -1.0);
+        std::cout << "[RobotRig] rank " << m_rank << " " << tag
+                  << "   this rank's physics is dead; every reading below it is meaningless\n";
+    }
+    if (fastest_speed > divergence_speed_warn || fatal)
+        report_body("fastest body", fastest, fastest_speed);
+    if (spinniest_omega > divergence_omega_warn || fatal)
+        report_body("fastest-spinning body", spinniest, spinniest_omega);
+
+    // What the rig was being asked to do. The arm is the prime suspect: its six
+    // actuators are CONSTRAINT motors, so the solver must hit the commanded pose
+    // with whatever reaction force that takes, and nothing upstream validates that
+    // the pose is physically legal.
+    if (m_arm) {
+        const auto status = m_arm->GetStatus();
+        std::cout << "[RobotRig] rank " << m_rank << " " << tag << "   arm phase=" << m_arm->GetPhaseName()
+                  << " target=" << status.target_index << " state=" << status.state
+                  << " err=" << status.error_code << " base_offset=" << m_arm->BaseOffsetFromChassis()
+                  << " m (rigid mount, so a change here IS the arm tearing off the chassis)\n";
+        const auto cmd = m_arm->GetCommandedTheta();
+        const auto applied = m_arm->GetAppliedTheta();
+        std::cout << "[RobotRig] rank " << m_rank << " " << tag << "   arm cmd_theta=(" << cmd[0] << ", "
+                  << cmd[1] << ", " << cmd[2] << ", " << cmd[3] << ") applied=(" << applied[0] << ", "
+                  << applied[1] << ", " << applied[2] << ", " << applied[3] << ")\n";
+    }
+    std::cout << "[RobotRig] rank " << m_rank << " " << tag << "   harvest_cycle=" << m_harvest_cycle
+              << " dump_state=" << static_cast<int>(m_dump_state) << " rocks=" << m_rocks.size()
+              << " raw(str/thr/brk)=" << m_last_raw_inputs.m_steering << "/" << m_last_raw_inputs.m_throttle
+              << "/" << m_last_raw_inputs.m_braking << "\n";
+    std::cout.flush();
+}
+
 void RobotRig::CheckStuck(double time, chrono::vehicle::ChTerrain& terrain) {
     // A rover being told to drive and not moving is the one failure that leaves no
     // trace anywhere: the controller sees its command accepted, the sim reports no
@@ -915,6 +1175,15 @@ void RobotRig::CheckStuck(double time, chrono::vehicle::ChTerrain& terrain) {
     //  - roll/pitch: whether it is simply stuck on a slope it cannot climb.
     const double speed = std::abs(m_vehicle->GetSpeed());
     const bool trying = m_last_guarded_inputs.m_throttle > 0.05;
+
+    // NaN fails EVERY comparison, so without this line a diverged rank takes the
+    // `!trying` branch below on every step and can never be reported stuck --
+    // which is exactly how rank 4 disappeared for 90 minutes of a 3 h run with no
+    // output at all. Divergence is CheckDivergence's to report; bail out here
+    // rather than silently pretending the rig is fine.
+    if (!std::isfinite(speed) || !std::isfinite(m_last_guarded_inputs.m_throttle))
+        return;
+
     if (!trying || speed > stuck_speed) {
         m_stuck_since = -1.0;
         return;
@@ -937,6 +1206,38 @@ void RobotRig::CheckStuck(double time, chrono::vehicle::ChTerrain& terrain) {
               << m_last_guarded_inputs.m_throttle << "/" << m_last_guarded_inputs.m_braking
               << " roll=" << (rpy.x() * chrono::CH_RAD_TO_DEG) << " pitch=" << (rpy.y() * chrono::CH_RAD_TO_DEG)
               << " deg\n";
+
+    // WHAT IS TOUCHING THE GROUND that should not be.
+    //
+    // Every reading above can look normal on a rig that will not move: all four
+    // wheels loaded, locked together, turning, ample engine torque, flat ground,
+    // and still 0.0003 m/s. None of those say what is absorbing the thrust, so the
+    // cause has been guessed at repeatedly instead of measured. This reports it
+    // directly: any body in this rank's system carrying a contact force, other than
+    // the wheels themselves (TMeasy tires are force elements with no collision
+    // geometry, so a wheel spindle never shows up here anyway).
+    //
+    // A chassis, trailer frame, bed or arm link bearing load means the rig is
+    // high-centred or dragging -- the tires deflect ~0.13 m under load, so the whole
+    // vehicle rides that much lower than its design clearance.
+    {
+        int reported = 0;
+        double total = 0.0;
+        for (const auto& body : GetSystem()->GetBodies()) {
+            const double f = body->GetContactForce().Length();
+            if (f < 1.0)
+                continue;
+            total += f;
+            if (reported++ < 8) {
+                const auto bpos = body->GetPos();
+                std::cout << "[RobotRig] rank " << m_rank << " STUCK   contact on '" << body->GetName()
+                          << "' |F|=" << f << " N at (" << bpos.x() << ", " << bpos.y() << ", " << bpos.z()
+                          << ")\n";
+            }
+        }
+        std::cout << "[RobotRig] rank " << m_rank << " STUCK   " << reported
+                  << " bodies in contact, total |F|=" << total << " N\n";
+    }
     // Rocks close enough to be in the way. Rocks are small (0.2 scale) but they are
     // rigid and collidable within 12 m, and a rig can be stopped by one wedged under
     // the chassis or against a wheel while every other reading looks normal. Dumped

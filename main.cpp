@@ -1,6 +1,8 @@
 // Minimal MPI SynChrono demo for the AMD-UW Polaris JSON vehicle.
 // Rank 0 is the global sensor/visualization rank. Robot physics starts on rank 1.
 
+#include <mpi.h>
+
 #include <chrono>
 #include <algorithm>
 #include <cmath>
@@ -508,7 +510,10 @@ int main(int argc, char* argv[]) {
         trailer_agent->SetNumWheels(2);
         syn_manager.AddAgent(trailer_agent);
 
-        syn_manager.AddAgent(chrono_types::make_shared<SynRockAgent>(robot->GetRocks(), chrono_data_path,
+        // Pass the ADDRESS of the rig's live rock vector. Passing it by value took a
+        // snapshot of the two cycle-0 rocks that never grew, so every rock spawned
+        // by a later harvest cycle was transmitted to nobody and drawn nowhere.
+        syn_manager.AddAgent(chrono_types::make_shared<SynRockAgent>(&robot->GetRocks(), chrono_data_path,
                                                                      /*visualize_zombies=*/false, rock_field_config));
 
         syn_manager.AddAgent(chrono_types::make_shared<SynTrackedVehicleAgent>(
@@ -531,9 +536,9 @@ int main(int argc, char* argv[]) {
         if (robot_rank == rank)
             continue;
 
+        // A zombie owns no rocks of its own; it only receives poses.
         syn_manager.AddZombie(chrono_types::make_shared<SynRockAgent>(
-                                  std::vector<std::shared_ptr<ChBodyAuxRef>>{}, chrono_data_path, is_sensor_rank,
-                                  rock_field_config),
+                                  nullptr, chrono_data_path, is_sensor_rank, rock_field_config),
                               AgentKey(robot_rank, 3));
         syn_manager.AddZombie(
             chrono_types::make_shared<SynBuilderArmAgent>(
@@ -670,6 +675,21 @@ int main(int argc, char* argv[]) {
                 app.Advance(step_size);
             }
             robot->LogMotionIfNeeded(step_number, motion_log_steps, terrain);
+
+            // A rank whose physics has gone non-finite is not going to recover, and
+            // every rank is in MPI lockstep, so letting it run wastes the whole job:
+            // in the last 3 h run one rank died 1 h 39 m in and the other three kept
+            // simulating around a corpse for 90 minutes. It also poisons rank 0,
+            // which keeps receiving NaN zombie poses over SynChrono. Take the whole
+            // job down with a message that says which rank and when. RobotRig has
+            // already printed the body and the constraint reactions that named it.
+            if (robot->HasDiverged()) {
+                std::cout << "[main] rank " << rank << " has diverged at t=" << time
+                          << "; aborting the job. See the [RobotRig] DIVERGING/DIVERGED report above for the "
+                             "body and the link reactions that caused it.\n";
+                std::cout.flush();
+                MPI_Abort(MPI_COMM_WORLD, 1);
+            }
         } else {
             ScopedTimer timer(perf_accum.robot_adv);
             terrain.Synchronize(time);

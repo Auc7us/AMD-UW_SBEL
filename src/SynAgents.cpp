@@ -17,6 +17,21 @@
 
 namespace amd_uw {
 
+namespace {
+
+// How many harvest cycles' worth of zombie rocks rank 0 pre-creates per rank. A
+// rank spawns rocks_per_rank rocks per cycle and the longest run so far reached 5
+// cycles, so this is ample headroom; the cost is one fixed, collision-free,
+// visual-only body each. See SynRockAgent::InitializeZombie for why they cannot be
+// created on demand.
+constexpr int zombie_rock_cycle_capacity = 32;
+
+// Where unused zombie rocks wait. Far below the lowest terrain on the site, so
+// they are out of every camera and the VSG view until a message places them.
+const chrono::ChVector3d zombie_rock_stash_position(0.0, 0.0, -5000.0);
+
+}  // namespace
+
 SynTrailerAgent::SynTrailerAgent(std::shared_ptr<chrono::vehicle::WheeledTrailer> trailer)
     : chrono::synchrono::SynWheeledVehicleAgent(nullptr), m_trailer(trailer) {}
 
@@ -49,12 +64,12 @@ void SynTrailerAgent::Update() {
     m_state->SetState(time, chassis, wheels);
 }
 
-SynRockAgent::SynRockAgent(std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> rocks,
+SynRockAgent::SynRockAgent(const std::vector<std::shared_ptr<chrono::ChBodyAuxRef>>* rocks,
                            std::string chrono_data_path,
                            bool visualize_zombies,
                            RockFieldConfig config)
     : chrono::synchrono::SynAgent(),
-      m_rocks(std::move(rocks)),
+      m_rocks(rocks),
       m_chrono_data_path(std::move(chrono_data_path)),
       m_visualize_zombies(visualize_zombies),
       m_config(config),
@@ -80,13 +95,30 @@ void SynRockAgent::InitializeZombie(chrono::ChSystem* system) {
         rock_vis_shapes[i]->AddMaterial(rock_vis_mat);
     }
 
+    // Create the zombies for EVERY harvest cycle now, not just the first.
+    //
+    // This used to create exactly rocks_per_rank bodies, once, so SynchronizeZombie
+    // below -- which iterates `i < m_zombie_rocks.size()` -- could never draw more
+    // than the two rocks that existed at startup, no matter how many the message
+    // carried. Every rock spawned by a later cycle was invisible for the rest of
+    // the run.
+    //
+    // They are all created HERE, up front, rather than on demand when the messages
+    // grow, because bodies added to rank 0's system after startup are not picked up
+    // by the VSG scene graph or the Chrono Sensor OptiX scene -- both bind their
+    // renderables when they initialise. Creating them late would have reproduced
+    // exactly the bug being fixed, one layer further down. Unused ones sit parked
+    // below the terrain where nothing can see them until a message moves them into
+    // place, which costs a fixed, collision-free, visual-only body apiece.
     const int robot_index = m_agent_key.GetNodeID() - 1;
-    for (int i = 0; i < m_config.rocks_per_rank; i++) {
+    const int capacity = std::max(1, m_config.rocks_per_rank) * zombie_rock_cycle_capacity;
+    for (int i = 0; i < capacity; i++) {
         const int shape_index = (robot_index * m_config.rocks_per_rank + i) % static_cast<int>(rock_vis_shapes.size());
         auto rock = chrono_types::make_shared<chrono::ChBodyAuxRef>();
         rock->SetFixed(true);
         rock->EnableCollision(false);
         rock->AddVisualShape(rock_vis_shapes[shape_index]);
+        rock->SetFrameRefToAbs(chrono::ChFrame<>(zombie_rock_stash_position, chrono::QUNIT));
         system->AddBody(rock);
         m_zombie_rocks.push_back(rock);
     }
@@ -98,6 +130,24 @@ void SynRockAgent::SynchronizeZombie(std::shared_ptr<chrono::synchrono::SynMessa
         return;
 
     const auto& lanes = state->intersections[0].approaches[0]->lanes;
+
+    // Report every time this rank starts drawing more rocks for that robot. This is
+    // the only place the fix is observable from a log: the rocks themselves are
+    // correct in their owning rank either way, and what was broken was purely
+    // whether anyone else ever heard about them. A count that climbs 2 -> 4 -> 6
+    // across harvest cycles is the proof; a count pinned at 2 was the bug.
+    if (lanes.size() > m_zombies_placed) {
+        m_zombies_placed = lanes.size();
+        std::cout << "[SynRockAgent] robot " << m_agent_key.GetNodeID() << ": now drawing "
+                  << std::min(m_zombies_placed, m_zombie_rocks.size()) << " of " << lanes.size()
+                  << " rock(s) (zombie capacity " << m_zombie_rocks.size() << ")\n";
+        if (lanes.size() > m_zombie_rocks.size()) {
+            std::cout << "[SynRockAgent] robot " << m_agent_key.GetNodeID()
+                      << ": OUT OF ZOMBIE CAPACITY -- rocks beyond " << m_zombie_rocks.size()
+                      << " are invisible. Raise zombie_rock_cycle_capacity.\n";
+        }
+    }
+
     for (size_t i = 0; i < lanes.size() && i < m_zombie_rocks.size(); i++) {
         if (lanes[i].controlPoints.size() < 3)
             continue;
@@ -111,19 +161,19 @@ void SynRockAgent::SynchronizeZombie(std::shared_ptr<chrono::synchrono::SynMessa
 }
 
 void SynRockAgent::Update() {
-    if (m_rocks.empty())
+    if (!m_rocks || m_rocks->empty())
         return;
 
     m_state = chrono_types::make_shared<chrono::synchrono::SynMAPMessage>(m_agent_key,
                                                                           chrono::synchrono::AgentKey());
-    m_state->time = m_rocks[0]->GetSystem()->GetChTime();
+    m_state->time = (*m_rocks)[0]->GetSystem()->GetChTime();
 
     chrono::synchrono::Intersection rock_intersection;
     auto rock_approach = chrono_types::make_shared<chrono::synchrono::SynApproachMessage>(
         m_agent_key, chrono::synchrono::AgentKey());
     rock_approach->time = m_state->time;
 
-    for (const auto& rock : m_rocks) {
+    for (const auto& rock : *m_rocks) {
         const auto frame = rock->GetFrameRefToAbs();
         const auto p = frame.GetPos();
         const auto q = frame.GetRot();
@@ -140,7 +190,7 @@ void SynRockAgent::Update() {
 }
 
 void SynRockAgent::GatherMessages(chrono::synchrono::SynMessageList& messages) {
-    if (!m_rocks.empty())
+    if (m_rocks && !m_rocks->empty())
         messages.push_back(m_state);
 }
 

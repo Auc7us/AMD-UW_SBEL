@@ -31,6 +31,15 @@ def launch_setup(context, *args, **kwargs):
     target_speed_mps = ParameterValue(LaunchConfiguration("target_speed_mps"), value_type=float)
     switch_radius_m = ParameterValue(LaunchConfiguration("switch_radius_m"), value_type=float)
     rock_side_offset_m = ParameterValue(LaunchConfiguration("rock_side_offset_m"), value_type=float)
+    drop_band_half_width_m = ParameterValue(
+        LaunchConfiguration("drop_band_half_width_m"), value_type=float
+    )
+    drop_arc_tolerance_m = ParameterValue(
+        LaunchConfiguration("drop_arc_tolerance_m"), value_type=float
+    )
+    home_slowdown_distance_m = ParameterValue(
+        LaunchConfiguration("home_slowdown_distance_m"), value_type=float
+    )
     rear_reference_offset_m = ParameterValue(LaunchConfiguration("rear_reference_offset_m"), value_type=float)
     pickup_request_rate_hz = ParameterValue(LaunchConfiguration("pickup_request_rate_hz"), value_type=float)
     skip_failed_targets = ParameterValue(LaunchConfiguration("skip_failed_targets"), value_type=bool)
@@ -57,6 +66,9 @@ def launch_setup(context, *args, **kwargs):
                         "rock_side_offset_m": rock_side_offset_m,
                         "rear_reference_offset_m": rear_reference_offset_m,
                         "pickup_request_rate_hz": pickup_request_rate_hz,
+                        "drop_band_half_width_m": drop_band_half_width_m,
+                        "drop_arc_tolerance_m": drop_arc_tolerance_m,
+                        "home_slowdown_distance_m": home_slowdown_distance_m,
                     }
                 ],
             )
@@ -104,6 +116,36 @@ def generate_launch_description():
                 "rock_side_offset_m",
                 default_value="1.5",
                 description="Lateral drive waypoint offset from each rock.",
+            ),
+            DeclareLaunchArgument(
+                "drop_band_half_width_m",
+                default_value="2.0",
+                description=(
+                    "Half-width of the radial band around the collector circle that "
+                    "counts as arrived at the drop point, so a band twice this wide. "
+                    "The drop point is not a surveyed spot -- rocks only have to land "
+                    "near this rank's builder -- and demanding a tight circle made "
+                    "rovers orbit a point they were already standing beside."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "drop_arc_tolerance_m",
+                default_value="8.0",
+                description=(
+                    "How far along the collector circle the rover may stop from its "
+                    "drop point. Without this the whole ring would count as arrived."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "home_slowdown_distance_m",
+                default_value="25.0",
+                description=(
+                    "Distance over which the return leg tapers from cruise down to "
+                    "home_approach_speed_mps, measured to the DROP BAND BOUNDARY. "
+                    "Mirrors pickup_slowdown_offset_m so arriving at the drop point "
+                    "is as gentle as arriving at a rock; a short taper meant braking "
+                    "from ~4.5 m/s and throwing the load out of the bed."
+                ),
             ),
             DeclareLaunchArgument(
                 "rear_reference_offset_m",

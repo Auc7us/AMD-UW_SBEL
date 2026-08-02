@@ -16,8 +16,16 @@
 // upshifted to gear 6 while stationary.
 //
 // Real lunar rovers avoid this entirely by driving each wheel independently. The
-// nearest equivalent for a shafts driveline is a high locking limit, which keeps
-// torque on the wheels that still have grip.
+// nearest equivalent for a shafts driveline is a locked differential.
+//
+// THESE LIMITS DO NOTHING ON THEIR OWN. ChShaftsDriveline4WD builds each lock as a
+// ChShaftsClutch, sets this value as its torque CAPACITY via SetTorqueLimit, and
+// then calls SetModulation(0) -- unlocked. A disengaged clutch transmits nothing
+// however large its capacity, so raising these alone left the differentials fully
+// open and one wheel still ran away at 31 rad/s beside an axle-mate at 0.02.
+// RobotRig::InitializeOnTerrain must also call LockAxleDifferential(-1, true) and
+// LockCentralDifferential(-1, true); this value then stops the now-engaged clutch
+// slipping again at Chrono's 100 Nm default.
 {
   "Name": "Polaris 4WD Driveline",
   "Type": "Driveline",

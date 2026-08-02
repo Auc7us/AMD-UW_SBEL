@@ -10,7 +10,7 @@ namespace amd_uw {
 // Concentric site layout. Every rank owns one ray from the shared site centre,
 // and everything belonging to that rank sits on it:
 //
-//        centre --- work circle (30) --- builder (40) --- collector (50) --->  rocks
+//        centre --- work circle (30) --- builder (35) --- collector (40) --->  rocks
 //
 // so a collector starts just outside its own builder, drives radially outward to
 // fetch rocks, and comes back inward to the builder it feeds. Ranks are spread
@@ -20,8 +20,17 @@ namespace amd_uw {
 inline constexpr double site_center_x = 0.0;
 inline constexpr double site_center_y = 0.0;
 inline constexpr double work_circle_radius = 30.0;
-inline constexpr double builder_path_radius = 40.0;
-inline constexpr double robot_start_radius = 50.0;
+inline constexpr double builder_path_radius = 35.0;
+inline constexpr double robot_start_radius = 40.0;
+
+// Half-width of the radial band around the collector circle that counts as "at the
+// drop point" -- so a 2 * this metre band, concentric with the collector circle.
+// The collector's job is to put rocks down near its builder, not on a surveyed
+// spot: demanding a 1.5 m circle made rovers orbit a point they were already
+// standing beside, because pure pursuit cannot converge on a target inside its own
+// turning radius. Kept here rather than in the controller so it stays tied to the
+// radius it is a band around.
+inline constexpr double drop_band_half_width = 2.0;
 
 // Harvest cycles. Each time a collector finishes a load and dumps it, its whole
 // lane -- rock line, drop point, and the builder it feeds -- rotates one step

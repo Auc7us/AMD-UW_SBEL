@@ -83,8 +83,28 @@ class PurePursuitController(Node):
         self.declare_parameter("max_steering_angle_rad", 0.6)
         self.declare_parameter("rock_side_offset_m", 1.5)
         self.declare_parameter("rear_reference_offset_m", 1.25)
-        self.declare_parameter("pickup_angle_min_deg", 60.0)
-        self.declare_parameter("pickup_angle_max_deg", 100.0)
+        # 55, not 60. The clean grabs land at 60.0-60.3 deg, so a 60 deg floor is
+        # right on top of the target and a 1.3 deg undershoot (-59.0 deg was logged)
+        # counted as "never reached the sector" for a pose that was perfectly good.
+        self.declare_parameter("pickup_angle_min_deg", 55.0)
+        # Was 100 deg. Every one of the 30 clean grabs in the 3 h run committed at
+        # 60.0-60.3 deg; the ones that produced a folded, near-singular arm pose
+        # committed at 65.9, 66.8 and -89.2 deg. 80 keeps a 20 deg margin over every
+        # good grab while refusing the abeam case, where the rock ends up beside the
+        # arm base and the only IK solution folds back through the rover.
+        self.declare_parameter("pickup_angle_max_deg", 80.0)
+        # SIMULATION seconds. At 15 wall seconds this was 0.75 s of sim, so the
+        # rover was given essentially no chance to reposition and 6 of 8 grabs in
+        # the 2-rank run committed through this path -- one of them from 3.24 m
+        # away, beyond the arm's reach, which then deadlocked the rank.
+        # Bound on how long the rover may keep manoeuvring for a better angle.
+        # Tightening the sector above is only safe with this: the drive target of a
+        # rock that is nearly abeam sits inside the turning radius, where pure
+        # pursuit cannot converge and the rover would circle it forever -- the exact
+        # failure the drop band was added to cure. So once it has been loitering
+        # within switch_radius this long, take the grab anyway and say so. A
+        # cramped grab that might fail beats an orbit that certainly never ends.
+        self.declare_parameter("pickup_sector_patience_s", 15.0)
         # Distance over which target speed ramps linearly down to the boundary
         # speed. On deformable SCM soil the rover decelerates much more slowly than
         # on rigid ground, so a 10 m band left it still hot at the boundary -> the
@@ -102,8 +122,21 @@ class PurePursuitController(Node):
         # End-of-mission return leg: once every rock is collected or skipped, drive
         # back to the spawn point and stop there so the load can be dumped.
         self.declare_parameter("home_tolerance_m", 1.5)
+        # Drop band: see in_drop_band(). The site centre is the hub every rank's ray
+        # radiates from; the band is concentric with the collector circle that the
+        # drop point sits on, so its radius is taken from the drop point itself and
+        # does not have to be configured here.
+        self.declare_parameter("site_center_x", 0.0)
+        self.declare_parameter("site_center_y", 0.0)
+        self.declare_parameter("drop_band_half_width_m", 2.0)
+        self.declare_parameter("drop_arc_tolerance_m", 8.0)
         self.declare_parameter("home_approach_speed_mps", 1.0)
-        self.declare_parameter("home_slowdown_distance_m", 8.0)
+        # Matches pickup_slowdown_offset_m, and for the same reason: on this soil the
+        # rover sheds speed slowly, so a short taper means arriving hot and braking
+        # hard. It was 8 m, measured to the wrong point (see distance_to_drop_band),
+        # which put ~4.5 m/s of momentum into a full-brake stop and launched rocks
+        # out of the bed.
+        self.declare_parameter("home_slowdown_distance_m", 25.0)
         # Only request a pickup once the chassis has actually come to a FULL STOP:
         # the arm IK is solved for the base pose at request time, and the rover
         # coasts after the wheels brake (low lunar traction), so requesting while
@@ -111,9 +144,21 @@ class PurePursuitController(Node):
         # or below stop_speed held continuously for stop_dwell_s (so we fire at rest,
         # not while still decelerating through the threshold). stop_timeout_s is a
         # safety fallback so a rover that can't fully settle still proceeds.
+        # All three are SIMULATION seconds now. pickup_stop_timeout_s was 10 wall
+        # seconds = 0.5 s of sim, so the "safety fallback" fired on essentially
+        # every grab: the logs are full of `TIMEOUT, dwell=0.00s`, i.e. the rover
+        # was told to grab while still rolling, every single time, in every run.
+        # 10 s of sim is the deadline that was actually intended.
         self.declare_parameter("pickup_stop_speed_mps", 0.05)
         self.declare_parameter("pickup_stop_dwell_s", 0.4)
         self.declare_parameter("pickup_stop_timeout_s", 10.0)
+        # Backstop against a target that never resolves. The manipulator is supposed
+        # to answer every pickup request with target_done -- success, failure, or
+        # skip -- and if it does not, the rover brakes and waits for it forever with
+        # no detector firing anywhere: it is stopped on purpose, so it is not STUCK,
+        # and it is not diverging either. That is exactly how rank 1 lost the last
+        # 265 s of sim in the 2-rank run to a single unsolvable IK. SIM seconds.
+        self.declare_parameter("target_done_timeout_sim_s", 180.0)
         self.declare_parameter("post_done_straighten_time_s", 0.75)
 
         self.robot_id = int(self.get_parameter("robot_id").value)
@@ -146,6 +191,16 @@ class PurePursuitController(Node):
         self.parked_at_home = False
         self.command = VehicleCommand()
         self.ramped_target_speed = 0.0
+        # Breakaway state: see compute_speed_command.
+        self._stalled_since: Optional[float] = None
+        self._breakaway_active = False
+        # Simulation clock, from egoState element 5. See sim_now().
+        self.sim_time: Optional[float] = None
+        # Speed at which the drop band was entered on this cycle: see drive_home.
+        self._drop_entry_speed: Optional[float] = None
+        # When the rover first got within switch_radius of the current drive target
+        # while still outside the pickup angle sector: see on_timer.
+        self._near_target_since: Optional[float] = None
 
         self.command_pub = self.create_publisher(Float64MultiArray, self.command_topic, 10)
         self.pickup_request_pub = self.create_publisher(Float64MultiArray, self.pickup_request_topic, 10)
@@ -177,6 +232,9 @@ class PurePursuitController(Node):
             yaw=float(msg.data[2]),
             speed=float(msg.data[3]),
         )
+        # Element 5 (index 5) is SIM time. Optional so an older sim still drives.
+        if len(msg.data) >= 6:
+            self.sim_time = float(msg.data[5])
 
     def on_target_pos(self, msg: Float64MultiArray) -> None:
         layout_dims = getattr(getattr(msg, "layout", None), "dim", [])
@@ -217,6 +275,7 @@ class PurePursuitController(Node):
             self.returning_home = False
             self.parked_at_home = False
             self.straighten_until_time_s = None
+            self._drop_entry_speed = None
         if not self.have_targets:
             self.have_targets = True
             self.get_logger().info(f"Received {len(self.targets)} targetPos points.")
@@ -245,9 +304,31 @@ class PurePursuitController(Node):
         self.last_pickup_request_index = -1
         self.ramped_target_speed = 0.0
         self.command = VehicleCommand(steering=0.0, throttle=0.0, brake=1.0)
+        # SIM seconds: this is a physical manoeuvre (straighten the wheels before
+        # driving off), so a wall-clock deadline made it ~0.04 s of sim, i.e. nothing.
         self.straighten_until_time_s = (
-            self.now_seconds() + max(0.0, float(self.get_parameter("post_done_straighten_time_s").value))
+            self.sim_now() + max(0.0, float(self.get_parameter("post_done_straighten_time_s").value))
         )
+
+    def abandon_current_target(self) -> None:
+        """Give up on the active rock and move on, as if it had been skipped.
+
+        Same bookkeeping as on_target_done, but no claim that anything succeeded.
+        Marking it completed is deliberate: the rank must not re-select the rock it
+        just proved it cannot solve, or it will deadlock on it again immediately.
+        """
+        if 0 <= self.target_index < len(self.targets):
+            self.completed_targets.add(self.target_index)
+        self.target_index = -1
+        self.drive_target_index = -1
+        self.waiting_for_target_done = False
+        self.stop_dwell_s = 0.0
+        self.wait_start_s = None
+        self.last_pickup_request_time_s = None
+        self.last_pickup_request_index = -1
+        self.ramped_target_speed = 0.0
+        self._near_target_since = None
+        self.command = VehicleCommand(steering=0.0, throttle=0.0, brake=1.0)
 
     def on_home_pos(self, msg: Float64MultiArray) -> None:
         if len(msg.data) < 2:
@@ -263,6 +344,84 @@ class PurePursuitController(Node):
             "mission_done=true; every target is collected or skipped, returning to spawn."
         )
 
+    def drop_band_errors(self) -> Optional[Tuple[float, float, float, float]]:
+        """(radial_err, arc_err, band_half_width, arc_tolerance) for the drop band.
+
+        Returns None when the band cannot be evaluated. Shared by in_drop_band (is
+        the rover there yet) and distance_to_drop_band (how much further), so the
+        arrival test and the speed taper can never disagree about where the band is.
+        """
+        if self.home is None or self.state is None:
+            return None
+        cx = float(self.get_parameter("site_center_x").value)
+        cy = float(self.get_parameter("site_center_y").value)
+        band = abs(float(self.get_parameter("drop_band_half_width_m").value))
+        arc_tol = abs(float(self.get_parameter("drop_arc_tolerance_m").value))
+        if band <= 0.0 or arc_tol <= 0.0:
+            return None
+
+        home_radius = math.hypot(self.home[0] - cx, self.home[1] - cy)
+        if home_radius < 1e-6:
+            return None
+        here_radius = math.hypot(self.state.x - cx, self.state.y - cy)
+        radial_err = abs(here_radius - home_radius)
+
+        home_angle = math.atan2(self.home[1] - cy, self.home[0] - cx)
+        here_angle = math.atan2(self.state.y - cy, self.state.x - cx)
+        arc_err = abs(wrap_to_pi(here_angle - home_angle)) * home_radius
+        return (radial_err, arc_err, band, arc_tol)
+
+    def distance_to_drop_band(self) -> float:
+        """Metres still to travel before the drop band is entered; 0 once inside.
+
+        The taper on the return leg has to be measured against THIS, not against
+        the distance to the home point, and that mismatch is what was launching
+        rocks out of the trailer. Arrival is decided by in_drop_band(), whose arc
+        tolerance is 8 m, but the taper was measured to the home point over an 8 m
+        slowdown -- so at the instant the band accepted the rover the taper was
+        still commanding nearly full cruise, and drive_home stepped brake to 1.0
+        (full in 0.1 s at brake_ramp_per_s=10). The rovers in the 3 h run parked
+        6.6-7.8 m from home, i.e. right at the arc edge: those were emergency stops
+        from ~4.5 m/s, and the load kept going.
+
+        The rock approach never had this problem because it measures to the
+        boundary it will actually stop at (see pickup_approach_target_speed) and so
+        arrives at 0.03-0.46 m/s. Same idea here: the radial and arc errors are
+        locally orthogonal, so the remaining travel is the hypotenuse of whatever
+        each of them still has to give up.
+        """
+        errors = self.drop_band_errors()
+        if errors is None:
+            # Fall back to the straight-line distance rather than claiming arrival.
+            if self.home is None or self.state is None:
+                return 0.0
+            return math.hypot(self.home[0] - self.state.x, self.home[1] - self.state.y)
+        radial_err, arc_err, band, arc_tol = errors
+        return math.hypot(max(0.0, radial_err - band), max(0.0, arc_err - arc_tol))
+
+    def in_drop_band(self) -> Tuple[bool, str]:
+        """True once the rover is anywhere in the drop band beside its builder.
+
+        The drop point is not a surveyed spot -- the rocks only have to end up near
+        this rank's builder. Insisting on a home_tolerance_m circle made rovers
+        circle a point they were already parked next to: pure pursuit cannot
+        converge on a target that sits inside its own turning radius, so it loops
+        around it forever, and the rock never gets dropped.
+
+        The accepted region is instead a ring segment hugging the collector circle:
+        within drop_band_half_width_m of that radius (a band twice that wide,
+        concentric with the circle, so the rover may stop short of or past it), and
+        within drop_arc_tolerance_m of the drop point measured ALONG the circle. The
+        arc limit is what keeps "near the builder" meaningful -- without it the whole
+        ring would qualify, including the far side of the site.
+        """
+        errors = self.drop_band_errors()
+        if errors is None:
+            return (False, "band unavailable")
+        radial_err, arc_err, band, arc_tol = errors
+        ok = radial_err <= band and arc_err <= arc_tol
+        return (ok, f"radial {radial_err:.2f}/{band:.2f} m, arc {arc_err:.2f}/{arc_tol:.2f} m")
+
     def drive_home(self) -> None:
         """Drive back to the spawn point, stop there, and report arrival."""
         if self.home is None:
@@ -276,31 +435,40 @@ class PurePursuitController(Node):
 
         distance = math.hypot(self.home[0] - self.state.x, self.home[1] - self.state.y)
         tolerance = max(0.1, float(self.get_parameter("home_tolerance_m").value))
+        in_band, band_why = self.in_drop_band()
 
-        if self.parked_at_home or distance <= tolerance:
+        if self.parked_at_home or distance <= tolerance or in_band:
+            # Speed at the instant the band accepted, i.e. the speed the full-brake
+            # stop below has to absorb. This is the number that decides whether the
+            # load stays in the bed, so it gets measured rather than assumed: it was
+            # reaching ~4.5 m/s here before the taper was pointed at the band
+            # boundary instead of the home point.
+            if self._drop_entry_speed is None:
+                self._drop_entry_speed = abs(self.state.speed)
             self.command = self.ramp_command(VehicleCommand(steering=0.0, throttle=0.0, brake=1.0))
             self.publish_command(self.command)
             self.update_stop_dwell()
             if not self.parked_at_home and self.is_fully_stopped():
                 self.parked_at_home = True
                 self.get_logger().info(
-                    f"Parked at spawn ({distance:.2f} m from home); publishing {self.at_home_topic}=true."
+                    f"Parked at drop point ({distance:.2f} m from home, {band_why}, "
+                    f"entered band at {self._drop_entry_speed:.3f} m/s); "
+                    f"publishing {self.at_home_topic}=true."
                 )
             # Keep asserting arrival: the dump sequencer may start after we do.
             if self.parked_at_home:
                 self.at_home_pub.publish(Bool(data=True))
             return
 
-        # Cruise home at the SAME speed as the outbound leg. This used to cruise at
-        # home_approach_speed_mps (1.0 m/s) and then scale that down again by distance,
-        # so a rover told to run at 5 m/s crawled the whole way back at 1 m/s or less --
-        # the return leg ignored the set speed entirely. home_approach_speed_mps is now
-        # only what the LAST stretch tapers down to, so the rover still arrives slowly
-        # enough to stop on the mark.
+        # Cruise home at the SAME speed as the outbound leg, then taper to the
+        # BOUNDARY OF THE DROP BAND -- the place the rover will actually be told to
+        # stop -- exactly as the rock approach tapers to the pickup boundary. See
+        # distance_to_drop_band for why measuring to the home point instead was
+        # throwing the load out of the trailer.
         cruise = max(0.0, float(self.get_parameter("target_speed_mps").value))
         final = max(0.0, float(self.get_parameter("home_approach_speed_mps").value))
         slowdown = max(1e-3, float(self.get_parameter("home_slowdown_distance_m").value))
-        target_speed = final + (cruise - final) * clamp(distance / slowdown, 0.0, 1.0)
+        target_speed = final + (cruise - final) * clamp(self.distance_to_drop_band() / slowdown, 0.0, 1.0)
 
         # Steering first: it decides whether we are in the hard-turn regime, and a turn
         # needs forward speed to produce any yaw at all -- but it must not be taken at
@@ -357,8 +525,23 @@ class PurePursuitController(Node):
             self.command = self.ramp_command(VehicleCommand(steering=0.0, throttle=0.0, brake=1.0))
             self.publish_command(self.command)
             self.update_stop_dwell()
+
+            # Never wait forever for the manipulator. See target_done_timeout_sim_s.
+            if self.wait_start_s is not None:
+                waited_total = self.sim_now() - self.wait_start_s
+                deadline = float(self.get_parameter("target_done_timeout_sim_s").value)
+                if deadline > 0.0 and waited_total >= deadline:
+                    self.get_logger().error(
+                        f"targetPos[{self.target_index}]: no {self.target_done_topic} after "
+                        f"{waited_total:.0f} s of sim. The manipulator never answered the pickup "
+                        f"request (an unsolvable IK does this). Abandoning this rock so the rank "
+                        f"can carry on."
+                    )
+                    self.abandon_current_target()
+                    return
+
             if self.last_pickup_request_index != self.target_index:
-                waited = self.now_seconds() - (self.wait_start_s or self.now_seconds())
+                waited = self.sim_now() - (self.wait_start_s or self.sim_now())
                 timed_out = waited >= float(self.get_parameter("pickup_stop_timeout_s").value)
                 if self.is_fully_stopped() or timed_out:
                     self.publish_pickup_request_if_due(force=True)
@@ -377,9 +560,30 @@ class PurePursuitController(Node):
                 self.publish_command(self.command)
                 return
 
-            if not self.is_target_in_pickup_position(switch_radius):
+            # Split the two halves of the old is_target_in_pickup_position so a rover
+            # that has ARRIVED but is badly angled can be told apart from one that is
+            # still driving. The first keeps manoeuvring (briefly); the second must
+            # not be interrupted.
+            in_radius = self.is_target_within_switch_radius(switch_radius)
+            in_sector = self.rock_is_in_pickup_angle_sector()
+            if not in_radius:
+                self._near_target_since = None
                 break
+            if not in_sector:
+                if self._near_target_since is None:
+                    self._near_target_since = self.sim_now()
+                patience = float(self.get_parameter("pickup_sector_patience_s").value)
+                if self.sim_now() - self._near_target_since < patience:
+                    break  # keep driving; the approach may still straighten out
+                self.get_logger().warn(
+                    f"targetPos[{self.target_index}] never reached the pickup sector "
+                    f"(rear-reference angle={self.rock_angle_from_rear_reference_deg():.1f} deg, "
+                    f"allowed {self.get_parameter('pickup_angle_min_deg').value:.0f}-"
+                    f"{self.get_parameter('pickup_angle_max_deg').value:.0f} deg) after {patience:.0f} s "
+                    f"loitering; grabbing from a poor pose rather than circling it."
+                )
 
+            self._near_target_since = None
             rock_angle_deg = self.rock_angle_from_rear_reference_deg()
             self.get_logger().info(
                 f"targetPos[{self.target_index}] is in pickup sector "
@@ -390,7 +594,7 @@ class PurePursuitController(Node):
             # once only after a confirmed full stop. Reset the stop dwell / wait clock.
             self.waiting_for_target_done = True
             self.stop_dwell_s = 0.0
-            self.wait_start_s = self.now_seconds()
+            self.wait_start_s = self.sim_now()
             self.command = self.ramp_command(VehicleCommand(steering=0.0, throttle=0.0, brake=1.0))
             self.publish_command(self.command)
             return
@@ -532,11 +736,63 @@ class PurePursuitController(Node):
             return VehicleCommand(steering=0.0, throttle=0.0, brake=0.0)
 
         effort = max(0.0, float(self.get_parameter("speed_kp").value)) * speed_error
-        return VehicleCommand(
-            steering=0.0,
-            throttle=clamp(effort, 0.0, 1.0),
-            brake=clamp(-effort, 0.0, 1.0),
-        )
+        throttle = clamp(effort, 0.0, 1.0)
+        brake = clamp(-effort, 0.0, 1.0)
+
+        # BREAKAWAY: a stopped rover needs full throttle to start moving again.
+        #
+        # Below 1 m/s the TMeasy tire stops using its slip curve and switches to a
+        # Dahl bristle friction model, which Chrono documents as acting "like a
+        # spring which enables holding of a vehicle on a slope without creeping".
+        # It is a STICTION model: to get moving, thrust must beat the full Coulomb
+        # limit mu*Fz, not merely the rolling resistance.
+        #
+        # Measured at a real stall: mu*Fz = 0.75 * 2023 N = 1517 N to break out.
+        # The engine map gives 37 Nm at 0 rpm, which through the driveline is
+        # 1696 N at FULL throttle but only 1196 N at the 0.705 this proportional
+        # controller was asking for. 1196 < 1517, so the rover stayed put -- and
+        # because it stayed put, speed_error never grew, so throttle never rose.
+        # A closed deadlock: stopped forever on flat ground with the engine idling
+        # at 1.6 rpm, every wheel loaded and gripping.
+        #
+        # Saturating the throttle once the rover has demonstrably failed to move
+        # for stall_dwell gives 1696 N > 1517 N and breaks the bristles. The dwell
+        # keeps this out of normal launches, which accelerate away long before it.
+        # Engage and release on DIFFERENT speeds, or this becomes a limit cycle.
+        # Releasing the moment speed crept back over stall_speed dropped throttle
+        # straight back to ~0.6, which is under the stiction threshold again, so the
+        # rover stuck, broke free, stuck again -- crawling a pickup approach at
+        # 0.06 m/s with 70+ breakaways instead of driving it. Hold full throttle
+        # until it is properly rolling. Never force it past what was actually
+        # commanded, though: the pickup approach deliberately targets a near-stop so
+        # the arm can solve IK against a stationary base.
+        stall_speed = 0.08
+        stall_dwell = 1.0
+        release_speed = min(0.5, max(2.0 * stall_speed, self.ramped_target_speed))
+
+        if self._breakaway_active:
+            if abs(self.state.speed) >= release_speed or brake > 0.0:
+                self._breakaway_active = False
+                self._stalled_since = None
+            else:
+                throttle = 1.0
+                brake = 0.0
+        elif self.ramped_target_speed > 0.1 and abs(self.state.speed) < stall_speed and brake <= 0.0:
+            if self._stalled_since is None:
+                self._stalled_since = self.now_seconds()
+            elif self.now_seconds() - self._stalled_since >= stall_dwell:
+                self._breakaway_active = True
+                self.get_logger().warn(
+                    f"Not moving ({abs(self.state.speed):.4f} m/s) with throttle {throttle:.2f} "
+                    f"for {stall_dwell:.1f} s -- tire stiction needs full throttle to break; "
+                    f"holding full throttle until {release_speed:.2f} m/s."
+                )
+                throttle = 1.0
+                brake = 0.0
+        else:
+            self._stalled_since = None
+
+        return VehicleCommand(steering=0.0, throttle=throttle, brake=brake)
 
     def ramp_command(self, target: VehicleCommand) -> VehicleCommand:
         throttle_delta = max(0.0, float(self.get_parameter("throttle_ramp_per_s").value)) * self.dt
@@ -601,11 +857,13 @@ class PurePursuitController(Node):
 
         return angle_min <= abs(angle) <= angle_max
 
-    def is_target_in_pickup_position(self, switch_radius: float) -> bool:
+    def is_target_within_switch_radius(self, switch_radius: float) -> bool:
         target_x, target_y = self.get_drive_target()
         ref_x, ref_y = self.rear_reference_position()
-        target_distance = math.hypot(target_x - ref_x, target_y - ref_y)
-        return target_distance <= switch_radius and self.rock_is_in_pickup_angle_sector()
+        return math.hypot(target_x - ref_x, target_y - ref_y) <= switch_radius
+
+    def is_target_in_pickup_position(self, switch_radius: float) -> bool:
+        return self.is_target_within_switch_radius(switch_radius) and self.rock_is_in_pickup_angle_sector()
 
     def pickup_approach_target_speed(self, switch_radius: float) -> float:
         target_speed = max(0.0, float(self.get_parameter("target_speed_mps").value))
@@ -627,11 +885,22 @@ class PurePursuitController(Node):
     def now_seconds(self) -> float:
         return self.get_clock().now().nanoseconds * 1e-9
 
+    def sim_now(self) -> float:
+        """Simulation seconds, for deadlines on things the ROVER has to do.
+
+        Use this, not now_seconds(), whenever the timeout is about physical
+        progress -- settling to a stop, manoeuvring into position. The wall clock
+        runs ~20x faster than this sim and the ratio is not fixed, so a wall-clock
+        allowance silently shrinks to a twentieth of its stated value. Falls back
+        to wall time only if the sim is too old to publish a clock.
+        """
+        return self.sim_time if self.sim_time is not None else self.now_seconds()
+
     def is_straightening_after_done(self) -> bool:
         if self.straighten_until_time_s is None:
             return False
 
-        if self.now_seconds() < self.straighten_until_time_s:
+        if self.sim_now() < self.straighten_until_time_s:
             return True
 
         self.straighten_until_time_s = None

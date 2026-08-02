@@ -89,7 +89,7 @@ class BuilderOrbitController(Node):
         self.declare_parameter("center_x", 0.0)
         self.declare_parameter("center_y", 0.0)
         self.declare_parameter("work_circle_radius_m", 30.0)
-        self.declare_parameter("path_radius_m", 40.0)
+        self.declare_parameter("path_radius_m", 35.0)
         self.declare_parameter("counter_clockwise", True)
         self.declare_parameter("lookahead_m", 8.0)
         self.declare_parameter("curvature_to_steering", 4.0)
@@ -221,8 +221,13 @@ class BuilderOrbitController(Node):
         if error is not None:
             tolerance = abs(float(self.get_parameter("station_tolerance_rad").value))
             release = max(tolerance, abs(float(self.get_parameter("station_release_rad").value)))
-            travel = error if error >= 0.0 else error + 2.0 * math.pi
-            if not self.holding_station and travel <= tolerance:
+            # Arrival is judged on ABSOLUTE angular proximity, not on remaining
+            # travel. Remaining travel is forced into [0, 2*pi), so overshooting
+            # the station by one control tick makes it read ~2*pi -- "nearly a
+            # full lap to go" -- and the builder commits to another whole orbit
+            # instead of stopping the few centimetres past where it wanted to be.
+            # Approaching from either side counts as being on station.
+            if not self.holding_station and abs(wrap_to_pi(error)) <= tolerance:
                 self.holding_station = True
                 self.get_logger().info(
                     f"holding station at {math.degrees(self.station_angle):.1f} deg."

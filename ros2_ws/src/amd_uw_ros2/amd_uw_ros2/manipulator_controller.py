@@ -164,6 +164,27 @@ class ManipulatorController(Node):
 
         theta = self.compute_grab_theta(request)
         if theta is None:
+            # An unsolvable grab pose must still be ANSWERED. This used to be a bare
+            # return: the warning went to the log and nothing was ever published, so
+            # the rover -- which is sitting on the brake waiting for target_done --
+            # waited for it forever. No detector catches that, because a rover
+            # stopped on purpose is not stuck and not diverging. One rank lost the
+            # last 265 s of a 400 s run to a single rock whose IK would not converge.
+            #
+            # skip_failed_targets already governs exactly this decision for a grab
+            # the ARM failed; a grab the SOLVER could not even attempt is no
+            # different, and if anything is more certain to be hopeless.
+            if bool(self.get_parameter("skip_failed_targets").value):
+                self.get_logger().warn(
+                    f"No grab pose for target {request.target_index}; skipping it so the "
+                    f"rover can move on (published target_done=true)."
+                )
+                self.publish_target_done(request.target_index)
+            else:
+                self.get_logger().error(
+                    f"No grab pose for target {request.target_index} and skip_failed_targets "
+                    f"is false; this rover will wait on the brake until told otherwise."
+                )
             return
 
         # Solve the drop pose with the same IK, in the same arm-base frame, from the
