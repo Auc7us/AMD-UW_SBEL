@@ -1,5 +1,7 @@
 #include "BuilderRig.h"
 
+#include "RobotLayout.h"
+
 #include <algorithm>
 #include <stdexcept>
 #include <string>
@@ -30,7 +32,8 @@ namespace amd_uw {
 namespace {
 
 void AddSquashedChassisVisual(const std::shared_ptr<chrono::ChBody>& chassis_body,
-                              const std::string& amd_uw_data_path) {
+                              const std::string& amd_uw_data_path,
+                              const chrono::ChColor& color) {
     // The stock M113 hull roof is far above the arm mount and visually buries
     // most of the arm. Preserve the hull's full X length and Y width, but
     // compress only its vertical (Z) mesh coordinates until its highest vertex
@@ -65,6 +68,10 @@ void AddSquashedChassisVisual(const std::shared_ptr<chrono::ChBody>& chassis_bod
     visual->SetMesh(mesh);
     visual->SetName("Builder_Chassis_Squashed_Z");
     visual->SetMutable(false);
+    // Same colour as this rank's collector trailer bed, so the pair reads as one
+    // team. The mesh has no material of its own, which is why every builder came
+    // out the default white.
+    visual->SetColor(color);
     chassis_body->AddVisualShape(visual);
 }
 
@@ -132,7 +139,7 @@ BuilderRig::BuilderRig(int rank,
     // No terrain is created here: the builder drives the rank's existing terrain,
     // which is also what its rocks rest on.
     const auto chassis_body = m_m113->GetChassisBody();
-    AddSquashedChassisVisual(chassis_body, amd_uw_data_path);
+    AddSquashedChassisVisual(chassis_body, amd_uw_data_path, RankColor(rank - 1));
     const ChQuaternion<> chassis_rot = chassis_body->GetRot();
     // Exact TrackedVeh_Builder.py reference mount and scale. The reference arm
     // uses a 2x geometric scale about this chassis-frame mount while preserving

@@ -49,6 +49,13 @@ constexpr double divergence_omega_warn = 200.0;     // rad/s
 constexpr double divergence_scan_period = 0.05;     // sim s between scans
 constexpr int divergence_max_reports = 6;
 
+// Dumped-rock freeze. See RobotRig::UpdateDumpedRockFreeze.
+constexpr double dumped_rock_settle_speed = 0.05;   // m/s below which it counts as at rest
+constexpr double dumped_rock_settle_dwell = 1.0;    // s it must stay there before freezing
+constexpr double dumped_rock_baseline_delay = 0.25; // s after freezing before trusting a force reading
+constexpr double dumped_rock_release_margin = 40.0; // N above the rock's resting load = pushed
+constexpr double dumped_rock_release_radius = 3.0;  // m from a builder body: backstop release
+
 bool IsFinite(const chrono::ChVector3d& v) {
     return std::isfinite(v.x()) && std::isfinite(v.y()) && std::isfinite(v.z());
 }
@@ -430,8 +437,12 @@ void RobotRig::InitializeTrailerBed() {
     // held flat. Unlike the old fixed/teleported plate, a jointed dynamic bed has
     // real velocity, so friction keeps placed rocks aboard while driving. Mirrors
     // the Python TrailerDumpBed; the motor can later run a dump cycle.
-    const double ex = 1.0, ey = 1.2;   // footprint: x along the trailer, y across
-    const double wall_h = 0.15, t = 0.03;
+    // Extents come from RobotLayout so the sensor rank's visual-only copy of this bed
+    // is built from the same numbers. See the trailer_bed_* constants there.
+    const double ex = trailer_bed_floor_x;  // footprint: x along the trailer, y across
+    const double ey = trailer_bed_floor_y;
+    const double wall_h = trailer_bed_wall_height;
+    const double t = trailer_bed_thickness;
 
     m_trailer_bed = chrono_types::make_shared<chrono::ChBody>();
     m_trailer_bed->SetName("trailer_bed");
@@ -443,7 +454,8 @@ void RobotRig::InitializeTrailerBed() {
                                                    mass / 12.0 * (ex * ex + wall_h * wall_h),
                                                    mass / 12.0 * (ex * ex + ey * ey)));
 
-    const chrono::ChColor bed_color(0.75f, 0.5f, 0.5f);
+    // Per-rank colour, matched to this rank's builder. See RankColor.
+    const chrono::ChColor bed_color = RankColor(m_robot_index);
 
     auto add_box = [&](const std::shared_ptr<chrono::ChBody>& body,
                        double sx,
@@ -462,10 +474,11 @@ void RobotRig::InitializeTrailerBed() {
         visual->SetColor(bed_color);
         body->AddVisualShape(visual, frame);
     };
-    add_box(m_trailer_bed, ex, ey, t, 0.0, 0.0, 0.0);                       // floor
-    add_box(m_trailer_bed, t, ey, wall_h, ex / 2.0, 0.0, wall_h / 2.0);     // +x front wall
-    add_box(m_trailer_bed, ex, t, wall_h, 0.0, ey / 2.0, wall_h / 2.0);     // +y left wall
-    add_box(m_trailer_bed, ex, t, wall_h, 0.0, -ey / 2.0, wall_h / 2.0);    // -y right wall
+    // Floor, +x front wall, +/-y side walls. Rear is open for the tailgate.
+    for (const auto& box : TrailerBedBoxes()) {
+        add_box(m_trailer_bed, box.size.x(), box.size.y(), box.size.z(), box.center.x(), box.center.y(),
+                box.center.z());
+    }
     m_trailer_bed->EnableCollision(true);
     GetSystem()->AddBody(m_trailer_bed);
 
@@ -485,7 +498,11 @@ void RobotRig::InitializeTrailerBed() {
         chrono::ChVector3d(tailgate_mass / 12.0 * (ey * ey + wall_h * wall_h),
                            tailgate_mass / 12.0 * (t * t + wall_h * wall_h),
                            tailgate_mass / 12.0 * (t * t + ey * ey)));
-    add_box(m_trailer_tailgate, t, ey, wall_h, 0.0, 0.0, 0.0);
+    {
+        const auto gate = TrailerTailgateBox();
+        add_box(m_trailer_tailgate, gate.size.x(), gate.size.y(), gate.size.z(), gate.center.x(), gate.center.y(),
+                gate.center.z());
+    }
     m_trailer_tailgate->EnableCollision(true);
     GetSystem()->AddBody(m_trailer_tailgate);
 
@@ -729,6 +746,14 @@ void RobotRig::StartNextHarvestCycle(double time) {
     for (size_t i = first_new; i < m_rocks.size(); ++i)
         GetSystem()->GetCollisionSystem()->BindItem(m_rocks[i]);
 
+    // DO NOT bind these into the VSG scene from here -- it segfaults. VSG needs new
+    // geometry compiled and merged between frames (the LoadOperation/Merge pattern in
+    // ChVisualSystemVSG.cpp); BindBody does neither, so it is only safe before
+    // Initialize(). Doing it from the physics loop races the render thread and killed
+    // a 4-rank run. These rocks are still simulated and still visible to the sensor
+    // camera, just absent from VSG. Proper fix: pre-create every cycle's rocks before
+    // Initialize() and move them into place, as SynRockAgent does for its zombies.
+
     // The drop point moves with the lane, so the rover must be told where home is now.
     const chrono::ChVector3d home = InitialGroundPositionForRobot(m_robot_index, m_num_robots, m_harvest_cycle);
 #ifdef AMD_UW_ENABLE_ROS2
@@ -769,7 +794,131 @@ void RobotRig::ReportDumpOutcome(double time) {
     }
     std::cout << "[RobotRig] rank " << m_rank << " dump outcome: " << left << " of " << m_carried_rocks.size()
               << " rock(s) left the bed, " << stuck << " still aboard\n";
+
+    // Hand the rocks that made it out to the settle-then-freeze watcher. A dumped
+    // rock is awake and on a slope, so it creeps and rolls away from the pile the
+    // builder is meant to work from. Rocks look still at the START of the demo only
+    // because Chrono has put them to sleep and nothing has disturbed them -- that is
+    // not a freeze, and it does not survive being tipped out of a bed.
+    for (const auto& rock : m_carried_rocks) {
+        if (!RockIsInBed(rock))
+            m_settling_rocks.push_back(rock);
+    }
     m_carried_rocks.clear();
+}
+
+// Freeze a dumped rock once it stops, and let the builder wake it again.
+//
+// Mirrors what LrvArm does to its own target: SetFixed(true) with collision left
+// ON, so the rock is a solid object that simply cannot be moved by gravity, soil,
+// or a passing wheel. The freeze waits for the rock to come to rest first --
+// freezing mid-roll would leave it hanging at whatever angle it happened to be at.
+void RobotRig::UpdateDumpedRockFreeze(double time) {
+    for (auto it = m_settling_rocks.begin(); it != m_settling_rocks.end();) {
+        const auto& rock = *it;
+        if (!rock || rock->IsFixed()) {
+            it = m_settling_rocks.erase(it);
+            continue;
+        }
+        const double speed = VecNorm(rock->GetPosDt());
+        if (!std::isfinite(speed)) {
+            it = m_settling_rocks.erase(it);
+            continue;
+        }
+        if (speed > dumped_rock_settle_speed) {
+            m_rock_still_since.erase(rock.get());
+            ++it;
+            continue;
+        }
+        auto since = m_rock_still_since.find(rock.get());
+        if (since == m_rock_still_since.end()) {
+            m_rock_still_since[rock.get()] = time;
+            ++it;
+            continue;
+        }
+        if (time - since->second < dumped_rock_settle_dwell) {
+            ++it;
+            continue;
+        }
+
+        rock->SetFixed(true);
+        rock->EnableCollision(true);
+        const auto p = rock->GetPos();
+        std::cout << "[RobotRig] rank " << m_rank << " dumped rock FROZEN at t=" << time << " at (" << p.x()
+                  << ", " << p.y() << ", " << p.z() << "); it will unfreeze when the builder touches it\n";
+        // Baseline is captured LATER, not now: on this step GetContactForce() still
+        // holds the value from when the rock was dynamic and being held up by the
+        // ground, which is tens of newtons. Reading it here and calling it "touched"
+        // released every rock on the same step it was frozen.
+        m_frozen_rocks.push_back({rock, time, -1.0});
+        m_rock_still_since.erase(rock.get());
+        it = m_settling_rocks.erase(it);
+    }
+
+    // Release when something movable pushes the rock, measured against the rock's OWN
+    // resting load, not against zero -- a frozen rock still reports the tens of
+    // newtons of ground support it was carrying. So settle after the freeze, record
+    // that resting force, and trigger only on a rise above it. Self-calibrating, like
+    // CheckTrailerWheelAnomalies' per-wheel Fz reference.
+    for (auto it = m_frozen_rocks.begin(); it != m_frozen_rocks.end();) {
+        auto& entry = *it;
+        const auto& rock = entry.rock;
+        if (!rock || !rock->IsFixed()) {
+            it = m_frozen_rocks.erase(it);
+            continue;
+        }
+        const double contact = rock->GetContactForce().Length();
+
+        if (entry.baseline_force < 0.0) {
+            if (time - entry.frozen_at < dumped_rock_baseline_delay) {
+                ++it;  // still settling; the reading is not trustworthy yet
+                continue;
+            }
+            entry.baseline_force = std::isfinite(contact) ? contact : 0.0;
+            const auto p = rock->GetPos();
+            std::cout << "[RobotRig] rank " << m_rank << " frozen rock resting load |F|=" << entry.baseline_force
+                      << " N at (" << p.x() << ", " << p.y() << ", " << p.z()
+                      << "); release needs " << dumped_rock_release_margin << " N above that\n";
+            ++it;
+            continue;
+        }
+
+        const bool touched =
+            std::isfinite(contact) && contact > entry.baseline_force + dumped_rock_release_margin;
+        const bool near_builder = BuilderIsNear(rock, dumped_rock_release_radius);
+        if (!touched && !near_builder) {
+            ++it;
+            continue;
+        }
+        rock->SetFixed(false);
+        const auto p = rock->GetPos();
+        std::cout << "[RobotRig] rank " << m_rank << " dumped rock RELEASED at t=" << time << " at (" << p.x()
+                  << ", " << p.y() << ", " << p.z() << "): "
+                  << (touched ? "pushed" : "builder within range") << " |F|=" << contact << " N vs resting "
+                  << entry.baseline_force << " N\n";
+        it = m_frozen_rocks.erase(it);
+    }
+}
+
+// Is any body of the builder that shares this rank's system within `radius` of the
+// rock, measured in the ground plane? The builder lives in the same ChSystem as
+// this rig, so it is found by name rather than by holding a pointer to BuilderRig
+// -- the two are siblings owned by main, and wiring them together for one distance
+// test would couple them for good.
+bool RobotRig::BuilderIsNear(const std::shared_ptr<chrono::ChBodyAuxRef>& rock, double radius) const {
+    if (!rock)
+        return false;
+    const double radius2 = radius * radius;
+    const auto rock_pos = rock->GetPos();
+    for (const auto& body : GetSystem()->GetBodies()) {
+        const std::string name = body->GetName();
+        if (name.find("builder") == std::string::npos && name.find("M113") == std::string::npos &&
+            name.find("m113") == std::string::npos)
+            continue;
+        if (PlanarDistance2(body->GetPos(), rock_pos) <= radius2)
+            return true;
+    }
+    return false;
 }
 
 void RobotRig::DumpTrailerBed() {
@@ -900,6 +1049,7 @@ void RobotRig::Synchronize(double time, chrono::vehicle::ChTerrain& terrain) {
     // must say so. Everything below this line silently no-ops on NaN.
     CheckDivergence(time);
     UpdateRockCollisionActivation();
+    UpdateDumpedRockFreeze(time);
     CheckWheelSinkage(time, terrain);
     CheckStuck(time, terrain);
     CheckTrailerWheelAnomalies(time, terrain);

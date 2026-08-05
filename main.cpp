@@ -29,6 +29,7 @@
 #include "chrono_vehicle/wheeled_vehicle/ChWheeledVehicleVisualSystemVSG.h"
 
 #include "chrono_sensor/ChSensorManager.h"
+#include "chrono_sensor/filters/ChFilterSave.h"
 #include "chrono_sensor/filters/ChFilterVisualize.h"
 #include "chrono_sensor/sensors/ChCameraSensor.h"
 
@@ -102,8 +103,26 @@ const double builder_ride_height = 0.7;
 // Site geometry (centre, work circle, builder orbit, collector ring) lives in
 // src/RobotLayout.h so the placement of every rank's builder and collector comes
 // from one source.
-// Physics ranks register rover, trailer, rocks, tracked builder, then arm.
+// Physics ranks register rover, trailer, rocks, tracked builder, arm, then trailer
+// bed -- in that order. SynChronoManager::AddAgent hands out agent ids sequentially
+// from 1 in call order, so these constants must match the AddAgent sequence below,
+// and every AddZombie must use the same id as the agent it shadows.
+const int trailer_agent_id = 2;
+const int rock_agent_id = 3;
+const int tracked_builder_agent_id = 4;
 const int builder_arm_agent_id = 5;
+const int trailer_bed_agent_id = 6;
+const int rover_arm_agent_id = 7;
+// Highest id a robot rank hands out -- ranks that draw no zombies register one inert
+// placeholder per remote agent, so this must cover every AddAgent below.
+const int last_agent_id = rover_arm_agent_id;
+
+// Mesh directory and geometry scale per manipulator; the sensor rank must rebuild
+// each arm exactly as its owning rank did.
+const char* const builder_arm_shapes_dir = "m113_builder_arm/m113_builder_arm_shapes/";
+const char* const rover_arm_shapes_dir = "lrv_robotarm/lrv_arm_shapes/";
+const double builder_arm_geometry_scale = 2.0;
+const double rover_arm_geometry_scale = 1.0;
 const double rock_line_extension_width = 16.0;
 const double rock_line_extension_end_margin = 8.0;
 
@@ -177,6 +196,49 @@ void AddOrbitVisualRing(ChSystem* system,
     }
 
     system->AddBody(ring);
+}
+
+// A 10 x 10 m pad at the site centre, as four 5 x 5 m tiles. Visual only: fixed,
+// collision-free, terrain untouched -- a marker, not a surface to drive on.
+void AddCenterPad(ChSystem* system, RigidTerrain& terrain, double height_probe_z) {
+    constexpr double tile = 5.0;         // one tile edge; four of them make 10 x 10
+    constexpr double pad_thickness = 0.06;
+    constexpr double surface_offset = 0.06;
+    // Two dark greys in a checker, so this reads as four tiles and doubles as a 5 m
+    // scale reference. Values look darker than they render: diffuse colour is linear
+    // and the image is gamma-encoded, so 0.16 comes out ~100/255, the same as this
+    // terrain. 0.03 measures ~45/255.
+    const ChColor tile_dark(0.030f, 0.030f, 0.034f);
+    const ChColor tile_light(0.055f, 0.055f, 0.060f);
+
+    auto pad = chrono_types::make_shared<ChBody>();
+    pad->SetName("center_pad_10x10");
+    pad->SetFixed(true);
+    pad->EnableCollision(false);
+
+    // Highest terrain sample under the footprint: a flat slab on slope must clip one
+    // edge or float at the other, and burying it hides the pad itself.
+    double pad_z = -std::numeric_limits<double>::infinity();
+    for (int ix = -2; ix <= 2; ++ix) {
+        for (int iy = -2; iy <= 2; ++iy) {
+            const double x = site_center_x + 0.25 * ix * 2.0 * tile;
+            const double y = site_center_y + 0.25 * iy * 2.0 * tile;
+            pad_z = std::max(pad_z, terrain.GetHeight(ChVector3d(x, y, height_probe_z)));
+        }
+    }
+    pad_z += surface_offset;
+
+    for (int ix = 0; ix < 2; ++ix) {
+        for (int iy = 0; iy < 2; ++iy) {
+            const double cx = site_center_x + (ix == 0 ? -0.5 : 0.5) * tile;
+            const double cy = site_center_y + (iy == 0 ? -0.5 : 0.5) * tile;
+            auto shape = chrono_types::make_shared<ChVisualShapeBox>(tile, tile, pad_thickness);
+            shape->SetColor(((ix + iy) % 2 == 0) ? tile_dark : tile_light);
+            pad->AddVisualShape(shape, ChFramed(ChVector3d(cx, cy, pad_z), QUNIT));
+        }
+    }
+
+    system->AddBody(pad);
 }
 
 // The final rocks and builder centers lie beyond the finite terrain2 heightmap.
@@ -297,10 +359,25 @@ class VsgAppWrapper {
             return;
 
         m_app->Render();
+
+        // VSG counterpart of --sensor_frame_dir.
+        if (!m_frame_dir.empty() && m_frames_left > 0) {
+            --m_frames_left;
+            m_app->WriteImageToFile(m_frame_dir + "vsg_frame_" + std::to_string(m_frame_index++) + ".png");
+        }
+    }
+
+    // Writes the first `count` rendered frames into `dir`, then stops.
+    void SaveFrames(const std::string& dir, int count) {
+        m_frame_dir = dir;
+        m_frames_left = count;
     }
 
   private:
     std::shared_ptr<ChWheeledVehicleVisualSystemVSG> m_app;
+    std::string m_frame_dir;
+    int m_frames_left = 0;
+    int m_frame_index = 0;
 };
 
 // Command-line options used by the demo.
@@ -322,6 +399,11 @@ void AddCommandLineOptions(ChCLI& cli) {
     cli.AddOption<std::vector<int>>("VSG", "vsg", "MPI ranks that should open VSG visualization", "-1");
     cli.AddOption<bool>("Simulation", "no_sensor",
                         "Disable the sensor/render rank 0 (it just syncs) -- measure physics without rendering");
+    // Save frames instead of opening a window, so either view can be checked from a
+    // script with no display. The sensor rank draws zombies and VSG draws the real
+    // bodies, so the two can legitimately differ.
+    cli.AddOption<std::string>("Diagnostics", "sensor_frame_dir",
+                               "Save global-camera frames as PNG to this directory instead of opening a window", "");
 }
 
 }  // namespace
@@ -348,6 +430,7 @@ int main(int argc, char* argv[]) {
     BuilderRig::Options builder_options;
     builder_options.with_arm = !cli.CheckOption("builder_no_arm");
     const bool no_sensor = cli.CheckOption("no_sensor");
+    const std::string sensor_frame_dir = cli.GetAsType<std::string>("sensor_frame_dir");
     const std::string solver_name = cli.GetAsType<std::string>("solver");
     const int solver_iterations = cli.GetAsType<int>("solver_iterations");
     syn_manager.SetHeartbeat(heartbeat);
@@ -380,6 +463,9 @@ int main(int argc, char* argv[]) {
     const double terrain_width = terrain_pixels_y * terrain_resolution_scale;
 
     const bool is_sensor_rank = (rank == 0);
+    // Only the sensor rank needs copies of other ranks' bodies, and only when its
+    // camera exists. Rank 0 never opens a VSG window (that requires owning a robot).
+    const bool draws_zombies = is_sensor_rank && !no_sensor;
     const bool owns_robot = (rank > 0);
     const int num_robot_ranks = std::max(0, num_ranks - 1);
 
@@ -422,6 +508,7 @@ int main(int argc, char* argv[]) {
                        ChColor(0.10f, 0.65f, 0.95f), "builder_path_40m");
     AddOrbitVisualRing(system, terrain, site_center_x, site_center_y, robot_start_radius, height_probe_z,
                        ChColor(0.20f, 0.90f, 0.35f), "collector_ring_50m");
+    AddCenterPad(system, terrain, height_probe_z);
     AddRockLineTerrainExtensions(terrain, ground_mat, num_robot_ranks, height_probe_z, terrain_length, terrain_width,
                                  rock_field_config);
     auto rock_mat = MakeContactMaterial(contact_method, 0.9f, 0.0f);
@@ -516,12 +603,23 @@ int main(int argc, char* argv[]) {
         syn_manager.AddAgent(chrono_types::make_shared<SynRockAgent>(&robot->GetRocks(), chrono_data_path,
                                                                      /*visualize_zombies=*/false, rock_field_config));
 
-        syn_manager.AddAgent(chrono_types::make_shared<SynTrackedVehicleAgent>(
+        syn_manager.AddAgent(chrono_types::make_shared<AmdTrackedVehicleAgent>(
             builder->GetVehicle(), amd_uw_data_path + "synchrono/vehicle/M113.json"));
-        syn_manager.AddAgent(chrono_types::make_shared<SynBuilderArmAgent>(
+        syn_manager.AddAgent(chrono_types::make_shared<SynArmAgent>(
             builder->GetArm() ? builder->GetArm()->GetBodies()
                               : std::vector<std::shared_ptr<ChBodyAuxRef>>{},
-            amd_uw_data_path,
+            amd_uw_data_path, builder_arm_shapes_dir, builder_arm_geometry_scale,
+            /*visualize_zombies=*/false));
+
+        syn_manager.AddAgent(chrono_types::make_shared<SynTrailerBedAgent>(
+            robot->GetTrailerBed(), robot->GetTrailerTailgate(), /*visualize_zombies=*/false));
+
+        // The rover's arm. Must stay LAST of this rank's AddAgent calls so the agent
+        // ids declared above keep matching registration order.
+        syn_manager.AddAgent(chrono_types::make_shared<SynArmAgent>(
+            robot->GetArm() ? robot->GetArm()->GetBodies()
+                            : std::vector<std::shared_ptr<ChBodyAuxRef>>{},
+            amd_uw_data_path, rover_arm_shapes_dir, rover_arm_geometry_scale,
             /*visualize_zombies=*/false));
 
         const ChVector3d builder_pos = builder->GetPosition();
@@ -536,16 +634,51 @@ int main(int argc, char* argv[]) {
         if (robot_rank == rank)
             continue;
 
+        // Only the rank that draws the whole site builds zombie bodies. Every other
+        // rank chase-cams its own vehicle, so remote machines were ~150 bodies apiece
+        // (142 of them M113 running gear) created and stepped purely off-camera.
+        // Terrain, rings and the centre pad are local, not zombies, so they remain.
+        if (!draws_zombies) {
+            for (int agent_id = 1; agent_id <= last_agent_id; ++agent_id)
+                syn_manager.AddZombie(chrono_types::make_shared<SynQuietAgent>(), AgentKey(robot_rank, agent_id));
+            continue;
+        }
+
         // A zombie owns no rocks of its own; it only receives poses.
         syn_manager.AddZombie(chrono_types::make_shared<SynRockAgent>(
-                                  nullptr, chrono_data_path, is_sensor_rank, rock_field_config),
-                              AgentKey(robot_rank, 3));
+                                  nullptr, chrono_data_path, /*visualize_zombies=*/true, rock_field_config),
+                              AgentKey(robot_rank, rock_agent_id));
         syn_manager.AddZombie(
-            chrono_types::make_shared<SynBuilderArmAgent>(
-                std::vector<std::shared_ptr<ChBodyAuxRef>>{},
-                amd_uw_data_path,
-                is_sensor_rank),
+            chrono_types::make_shared<SynArmAgent>(
+                std::vector<std::shared_ptr<ChBodyAuxRef>>{}, amd_uw_data_path, builder_arm_shapes_dir,
+                builder_arm_geometry_scale, /*visualize_zombies=*/true),
             AgentKey(robot_rank, builder_arm_agent_id));
+        syn_manager.AddZombie(
+            chrono_types::make_shared<SynArmAgent>(
+                std::vector<std::shared_ptr<ChBodyAuxRef>>{}, amd_uw_data_path, rover_arm_shapes_dir,
+                rover_arm_geometry_scale, /*visualize_zombies=*/true),
+            AgentKey(robot_rank, rover_arm_agent_id));
+
+        // Register our builder zombie explicitly: the agent factory only runs when no
+        // zombie exists for that key, and subclassing on the OWNING rank would do
+        // nothing (a rank calls InitializeZombie only on its zombies). Vis files come
+        // from M113.json, since a pre-registered zombie gets no description message.
+        syn_manager.AddZombie(chrono_types::make_shared<AmdTrackedVehicleAgent>(
+                                  nullptr, amd_uw_data_path + "synchrono/vehicle/M113.json"),
+                              AgentKey(robot_rank, tracked_builder_agent_id));
+
+        // Likewise the trailer. Vis files and wheel count set here for the same reason.
+        auto trailer_zombie = chrono_types::make_shared<SynTrailerAgent>();
+        trailer_zombie->SetZombieVisualizationFiles("LRV_Wagon/trailer_chassis.obj",
+                                                    "LRV/meshes/Polaris_wheel.obj",
+                                                    "LRV/meshes/LRVtire_red_m.obj");
+        trailer_zombie->SetNumWheels(2);
+        syn_manager.AddZombie(trailer_zombie, AgentKey(robot_rank, trailer_agent_id));
+
+        // The dump bed and tailgate, which no stock agent carries.
+        syn_manager.AddZombie(
+            chrono_types::make_shared<SynTrailerBedAgent>(nullptr, nullptr, /*visualize_zombies=*/true),
+            AgentKey(robot_rank, trailer_bed_agent_id));
     }
 
     // The SolidWorks importer's embedded `import pychrono` (in LrvArm) resets
@@ -557,7 +690,13 @@ int main(int argc, char* argv[]) {
     SetChronoDataPath(vehicle_data_path);
     SetVehicleDataPath(vehicle_data_path);
 
+    const size_t bodies_before_zombies = system->GetBodies().size();
     syn_manager.Initialize(system);
+    // Zombie creation happens inside Initialize. Catches a rank silently going back
+    // to building other ranks' bodies.
+    std::cout << "[main] rank " << rank << ": " << bodies_before_zombies << " own bodies + "
+              << (system->GetBodies().size() - bodies_before_zombies) << " zombie bodies = "
+              << system->GetBodies().size() << " total\n";
 
     std::shared_ptr<ChSensorManager> sensor_manager;
     if (is_sensor_rank && !no_sensor) {
@@ -581,8 +720,14 @@ int main(int argc, char* argv[]) {
             global_camera_height,
             global_camera_fov);
         global_camera->SetName("Global Camera");
-        global_camera->PushFilter(
-            chrono_types::make_shared<ChFilterVisualize>(global_camera_width, global_camera_height, "Global Camera"));
+        if (sensor_frame_dir.empty()) {
+            global_camera->PushFilter(chrono_types::make_shared<ChFilterVisualize>(
+                global_camera_width, global_camera_height, "Global Camera"));
+        } else {
+            // Saving instead of showing, so this works with no display attached.
+            global_camera->PushFilter(chrono_types::make_shared<ChFilterSave>(sensor_frame_dir));
+            std::cout << "[main] global camera frames -> " << sensor_frame_dir << "\n";
+        }
         sensor_manager->AddSensor(global_camera);
 
     }
@@ -608,6 +753,9 @@ int main(int argc, char* argv[]) {
         // attachment and the rover chase camera keeps its original target.
         vsg_app->Initialize();
         app.Set(vsg_app);
+        // Reuses --sensor_frame_dir: one flag captures whichever view this rank has.
+        if (!sensor_frame_dir.empty())
+            app.SaveFrames(sensor_frame_dir, 40);
     }
 
     const int render_steps = static_cast<int>(std::ceil(render_step_size / step_size));

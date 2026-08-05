@@ -103,7 +103,17 @@ class BuilderOrbitController(Node):
         # tracked vehicle cannot stop on a point, so without it the builder would
         # creep past, restart, and hunt around its station forever.
         self.declare_parameter("station_tolerance_rad", 0.05)
-        self.declare_parameter("station_release_rad", 0.20)
+        # Widened from 0.20 rad. With active station keeping (see on_timer) the
+        # builder now corrects creep continuously instead of waiting to fall out of
+        # this band, so the band's only remaining job is to catch a builder that has
+        # been shoved so far it is genuinely quicker to drive round than to creep
+        # back. 0.6 rad is ~21 m of arc at the 35 m path radius.
+        self.declare_parameter("station_release_rad", 0.60)
+        # Active station keeping. Inside the deadband the builder sits on the brake;
+        # outside it, it creeps forward along its arc at gain * error, capped.
+        self.declare_parameter("station_keep_deadband_m", 0.4)
+        self.declare_parameter("station_keep_speed_mps", 0.5)
+        self.declare_parameter("station_keep_gain", 0.35)
 
         self.builder_id = int(self.get_parameter("builder_id").value)
         self.state_topic = f"/builder_{self.builder_id}/vehicle_state"
@@ -234,11 +244,47 @@ class BuilderOrbitController(Node):
                 )
             elif self.holding_station and abs(wrap_to_pi(error)) > release:
                 self.holding_station = False
-                self.get_logger().info("drifted off station; re-acquiring.")
+                self.get_logger().info(
+                    f"pushed {math.degrees(abs(wrap_to_pi(error))):.1f} deg off station, past the "
+                    f"{math.degrees(release):.1f} deg release band; driving round to re-acquire."
+                )
 
         if self.holding_station:
-            self.steering_command = approach(self.steering_command, 0.0, steering_delta)
-            self.publish_command(self.steering_command, 0.0, 1.0)
+            # Station keeping is ACTIVE, not just the brake.
+            #
+            # Holding used to mean brake=1.0 and nothing else, with a release band of
+            # 0.20 rad -- 7 m of arc at this radius. On sloped regolith the terrain
+            # simply pushed the builder back, and because nothing corrected inside the
+            # band it drifted the whole 7 m before the controller reacted, then drove a
+            # long arc to come back. From outside that reads as a builder that sits
+            # still and occasionally rolls backwards, which is exactly what it was.
+            #
+            # So close the loop on position instead: measure how far off station it is
+            # along its own arc and creep back onto the mark under pure-pursuit
+            # steering, at a speed proportional to the error. Inside a small deadband
+            # it holds the brake, so there is no hunting.
+            arc_error = wrap_to_pi(error) * radius if error is not None else 0.0
+            deadband = max(0.0, float(self.get_parameter("station_keep_deadband_m").value))
+            if arc_error <= deadband:
+                # On the mark, or crept slightly PAST it. Do not chase forward past
+                # the station -- the builder only drives one way round, so overshoot
+                # would cost a full lap. Sit on the brake.
+                self.steering_command = approach(self.steering_command, 0.0, steering_delta)
+                self.publish_command(self.steering_command, 0.0, 1.0)
+                return
+
+            keep_speed = max(0.0, float(self.get_parameter("station_keep_speed_mps").value))
+            gain = max(0.0, float(self.get_parameter("station_keep_gain").value))
+            target_speed = min(keep_speed, gain * (arc_error - deadband))
+            speed_error = target_speed - self.state.speed
+            kp = max(0.0, float(self.get_parameter("speed_kp").value))
+            max_throttle = clamp(float(self.get_parameter("max_throttle").value), 0.0, 1.0)
+            effort = kp * speed_error
+            self.publish_command(
+                self.steering_command,
+                clamp(effort, 0.0, max_throttle),
+                clamp(-effort, 0.0, 1.0),
+            )
             return
 
         target_speed = max(

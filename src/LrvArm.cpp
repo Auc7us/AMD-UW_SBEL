@@ -21,6 +21,7 @@
 #endif
 
 #include "MaterialUtils.h"
+#include "RobotLayout.h"
 
 namespace amd_uw {
 
@@ -185,21 +186,22 @@ std::shared_ptr<chrono::ChBodyAuxRef> CreateBody(chrono::ChSystem* system,
     body->SetFrameRefToAbs(chrono::ChFramed(ref_pos, mount_rot * spec.rot));
     body->SetFixed(false);
 
-    if (!spec.finger && geometry_scale != 1.0) {
-        auto mesh = chrono::ChTriangleMeshConnected::CreateFromWavefrontFile(
-            shapes_dir + spec.mesh, true, true);
-        if (!mesh)
-            throw std::runtime_error("Cannot load scaled arm mesh: " + shapes_dir + spec.mesh);
+    // One visual path for every arm body: a triangle mesh we load ourselves.
+    // ChVisualShapeModelFile cannot be coloured in the sensor view -- ChOptixEngine
+    // reloads the OBJ into a fresh shape and discards its materials -- so owning the
+    // mesh is what lets both renderers read the same material.
+    auto mesh = chrono::ChTriangleMeshConnected::CreateFromWavefrontFile(
+        shapes_dir + spec.mesh, true, true);
+    if (!mesh)
+        throw std::runtime_error("Cannot load arm mesh: " + shapes_dir + spec.mesh);
+    if (!spec.finger && geometry_scale != 1.0)
         mesh->Transform(chrono::VNULL, chrono::ChMatrix33<>(geometry_scale));
-        auto visual = chrono_types::make_shared<chrono::ChVisualShapeTriangleMesh>();
-        visual->SetMesh(mesh);
-        visual->SetMutable(false);
-        body->AddVisualShape(visual, chrono::ChFramed(chrono::VNULL, chrono::QUNIT));
-    } else {
-        auto visual = chrono_types::make_shared<chrono::ChVisualShapeModelFile>();
-        visual->SetFilename(shapes_dir + spec.mesh);
-        body->AddVisualShape(visual, chrono::ChFramed(chrono::VNULL, chrono::QUNIT));
-    }
+
+    auto visual = chrono_types::make_shared<chrono::ChVisualShapeTriangleMesh>();
+    visual->SetMesh(mesh);
+    visual->SetMutable(false);
+    // Colour is applied once at the end of the constructor; see the GetBodies() loop.
+    body->AddVisualShape(visual, chrono::ChFramed(chrono::VNULL, chrono::QUNIT));
 
     if (spec.finger) {
         // Match the system's contact method: an NSC pad in an SMC system (or vice
@@ -324,6 +326,12 @@ LrvArm::LrvArm(chrono::ChSystem* system,
         m_finger_1 =
             CreateBody(system, arm_bodies[7], shapes_dir, mount_pos, mount_rot, name_prefix, m_geometry_scale);
     }
+
+    // One grey for every arm, applied here because this is the only point both
+    // construction paths reach: the SolidWorks importer builds its own visual shapes,
+    // and the LRV arm takes that path. See ArmGrey.
+    for (const auto& arm_body : GetBodies())
+        ApplyColorToVisualShapes(arm_body, ArmGrey());
 
     if (parked_rigid) {
         const std::array<std::shared_ptr<chrono::ChBodyAuxRef>, 8> parked_bodies = {

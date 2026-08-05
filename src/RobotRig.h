@@ -1,5 +1,6 @@
 #pragma once
 
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -41,7 +42,14 @@ class RobotRig {
     chrono::vehicle::WheeledVehicle* GetVehicle() const;
     int GetRobotIndex() const { return m_robot_index; }
     std::shared_ptr<chrono::vehicle::WheeledTrailer> GetTrailer() const;
+    // Dump tub and hinged tailgate, exposed so SynTrailerBedAgent can broadcast their
+    // poses -- no stock agent carries them.
+    std::shared_ptr<chrono::ChBody> GetTrailerBed() const { return m_trailer_bed; }
+    std::shared_ptr<chrono::ChBody> GetTrailerTailgate() const { return m_trailer_tailgate; }
     chrono::vehicle::ChDriver* GetDriver() const;
+    // The rover's manipulator, exposed so its bodies can be broadcast to the sensor
+    // rank like the builder's.
+    LrvArm* GetArm() const { return m_arm.get(); }
     const std::vector<std::shared_ptr<chrono::ChBodyAuxRef>>& GetRocks() const;
 
     void InitializeOnTerrain(chrono::vehicle::ChTerrain& terrain,
@@ -111,6 +119,10 @@ class RobotRig {
 #endif
     void Settle(chrono::vehicle::ChTerrain& terrain, double settle_time, double step_size);
     void UpdateRockCollisionActivation();
+    // Freeze rocks that have been dumped and come to rest, so they stop creeping
+    // away from the pile, and release them when the builder engages them.
+    void UpdateDumpedRockFreeze(double time);
+    bool BuilderIsNear(const std::shared_ptr<chrono::ChBodyAuxRef>& rock, double radius) const;
     // Watches each trailer wheel for the two things that can launch one wheel out
     // of nowhere: a discontinuous terrain-height query under it, and a tire
     // vertical force far above its own settled load. See the definition.
@@ -176,6 +188,20 @@ class RobotRig {
     // can report whether they actually left it. See ReportDumpOutcome.
     std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> m_carried_rocks;
     // Per-wheel sunk latch (tractor wheels first, then trailer). See CheckWheelSinkage.
+    // Dumped rocks waiting to come to rest, then the ones frozen in place. See
+    // UpdateDumpedRockFreeze.
+    std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> m_settling_rocks;
+    // A frozen rock plus when it was frozen and the contact force it carries at
+    // rest. The resting load has to be measured a moment AFTER the freeze and then
+    // subtracted, or the ground reaction the rock was already carrying reads as the
+    // builder having touched it. See UpdateDumpedRockFreeze.
+    struct FrozenRock {
+        std::shared_ptr<chrono::ChBodyAuxRef> rock;
+        double frozen_at = 0.0;
+        double baseline_force = -1.0;  // negative until measured
+    };
+    std::vector<FrozenRock> m_frozen_rocks;
+    std::map<const chrono::ChBody*, double> m_rock_still_since;
     std::vector<bool> m_wheel_sunk;
     int m_sink_reports = 0;
     double m_stuck_since = -1.0;

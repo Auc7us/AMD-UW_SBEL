@@ -83,28 +83,12 @@ class PurePursuitController(Node):
         self.declare_parameter("max_steering_angle_rad", 0.6)
         self.declare_parameter("rock_side_offset_m", 1.5)
         self.declare_parameter("rear_reference_offset_m", 1.25)
-        # 55, not 60. The clean grabs land at 60.0-60.3 deg, so a 60 deg floor is
-        # right on top of the target and a 1.3 deg undershoot (-59.0 deg was logged)
-        # counted as "never reached the sector" for a pose that was perfectly good.
+        # Grab sector. Clean grabs land at 60.0-60.3 deg, so 55 leaves margin for a
+        # small undershoot. The upper bound refuses the abeam case (65-90 deg produced
+        # folded, near-singular arm poses), where the only IK solution folds the arm
+        # back through the rover.
         self.declare_parameter("pickup_angle_min_deg", 55.0)
-        # Was 100 deg. Every one of the 30 clean grabs in the 3 h run committed at
-        # 60.0-60.3 deg; the ones that produced a folded, near-singular arm pose
-        # committed at 65.9, 66.8 and -89.2 deg. 80 keeps a 20 deg margin over every
-        # good grab while refusing the abeam case, where the rock ends up beside the
-        # arm base and the only IK solution folds back through the rover.
         self.declare_parameter("pickup_angle_max_deg", 80.0)
-        # SIMULATION seconds. At 15 wall seconds this was 0.75 s of sim, so the
-        # rover was given essentially no chance to reposition and 6 of 8 grabs in
-        # the 2-rank run committed through this path -- one of them from 3.24 m
-        # away, beyond the arm's reach, which then deadlocked the rank.
-        # Bound on how long the rover may keep manoeuvring for a better angle.
-        # Tightening the sector above is only safe with this: the drive target of a
-        # rock that is nearly abeam sits inside the turning radius, where pure
-        # pursuit cannot converge and the rover would circle it forever -- the exact
-        # failure the drop band was added to cure. So once it has been loitering
-        # within switch_radius this long, take the grab anyway and say so. A
-        # cramped grab that might fail beats an orbit that certainly never ends.
-        self.declare_parameter("pickup_sector_patience_s", 15.0)
         # Distance over which target speed ramps linearly down to the boundary
         # speed. On deformable SCM soil the rover decelerates much more slowly than
         # on rigid ground, so a 10 m band left it still hot at the boundary -> the
@@ -200,7 +184,11 @@ class PurePursuitController(Node):
         self._drop_entry_speed: Optional[float] = None
         # When the rover first got within switch_radius of the current drive target
         # while still outside the pickup angle sector: see on_timer.
-        self._near_target_since: Optional[float] = None
+        # When the active target was selected. One deadline per target (see
+        # target_done_timeout_sim_s) covers every way a rank can stall on one rock:
+        # circling it without ever reaching a usable angle, or waiting on a
+        # manipulator that never answers.
+        self._target_started_s: Optional[float] = None
 
         self.command_pub = self.create_publisher(Float64MultiArray, self.command_topic, 10)
         self.pickup_request_pub = self.create_publisher(Float64MultiArray, self.pickup_request_topic, 10)
@@ -327,7 +315,7 @@ class PurePursuitController(Node):
         self.last_pickup_request_time_s = None
         self.last_pickup_request_index = -1
         self.ramped_target_speed = 0.0
-        self._near_target_since = None
+        self._target_started_s = None
         self.command = VehicleCommand(steering=0.0, throttle=0.0, brake=1.0)
 
     def on_home_pos(self, msg: Float64MultiArray) -> None:
@@ -508,6 +496,20 @@ class PurePursuitController(Node):
             self.drive_home()
             return
 
+        # One deadline per target, checked in every state: it covers waiting on a
+        # manipulator that never answers AND circling a rock whose approach angle never
+        # comes good. Abandoning marks the rock completed so the rank moves on.
+        if self._target_started_s is not None and 0 <= self.target_index < len(self.targets):
+            elapsed = self.sim_now() - self._target_started_s
+            deadline = float(self.get_parameter("target_done_timeout_sim_s").value)
+            if deadline > 0.0 and elapsed >= deadline:
+                self.get_logger().error(
+                    f"targetPos[{self.target_index}]: stalled for {elapsed:.0f} s of sim "
+                    f"(waiting={self.waiting_for_target_done}); abandoning this rock."
+                )
+                self.abandon_current_target()
+                return
+
         if not self.targets:
             self.command = self.ramp_command(VehicleCommand())
             self.publish_command(self.command)
@@ -525,20 +527,6 @@ class PurePursuitController(Node):
             self.command = self.ramp_command(VehicleCommand(steering=0.0, throttle=0.0, brake=1.0))
             self.publish_command(self.command)
             self.update_stop_dwell()
-
-            # Never wait forever for the manipulator. See target_done_timeout_sim_s.
-            if self.wait_start_s is not None:
-                waited_total = self.sim_now() - self.wait_start_s
-                deadline = float(self.get_parameter("target_done_timeout_sim_s").value)
-                if deadline > 0.0 and waited_total >= deadline:
-                    self.get_logger().error(
-                        f"targetPos[{self.target_index}]: no {self.target_done_topic} after "
-                        f"{waited_total:.0f} s of sim. The manipulator never answered the pickup "
-                        f"request (an unsolvable IK does this). Abandoning this rock so the rank "
-                        f"can carry on."
-                    )
-                    self.abandon_current_target()
-                    return
 
             if self.last_pickup_request_index != self.target_index:
                 waited = self.sim_now() - (self.wait_start_s or self.sim_now())
@@ -560,30 +548,11 @@ class PurePursuitController(Node):
                 self.publish_command(self.command)
                 return
 
-            # Split the two halves of the old is_target_in_pickup_position so a rover
-            # that has ARRIVED but is badly angled can be told apart from one that is
-            # still driving. The first keeps manoeuvring (briefly); the second must
-            # not be interrupted.
-            in_radius = self.is_target_within_switch_radius(switch_radius)
-            in_sector = self.rock_is_in_pickup_angle_sector()
-            if not in_radius:
-                self._near_target_since = None
+            # Arrived AND correctly angled. A rover that is close but badly angled
+            # keeps manoeuvring; the per-target deadline stops it circling forever.
+            if not (self.is_target_within_switch_radius(switch_radius) and self.rock_is_in_pickup_angle_sector()):
                 break
-            if not in_sector:
-                if self._near_target_since is None:
-                    self._near_target_since = self.sim_now()
-                patience = float(self.get_parameter("pickup_sector_patience_s").value)
-                if self.sim_now() - self._near_target_since < patience:
-                    break  # keep driving; the approach may still straighten out
-                self.get_logger().warn(
-                    f"targetPos[{self.target_index}] never reached the pickup sector "
-                    f"(rear-reference angle={self.rock_angle_from_rear_reference_deg():.1f} deg, "
-                    f"allowed {self.get_parameter('pickup_angle_min_deg').value:.0f}-"
-                    f"{self.get_parameter('pickup_angle_max_deg').value:.0f} deg) after {patience:.0f} s "
-                    f"loitering; grabbing from a poor pose rather than circling it."
-                )
 
-            self._near_target_since = None
             rock_angle_deg = self.rock_angle_from_rear_reference_deg()
             self.get_logger().info(
                 f"targetPos[{self.target_index}] is in pickup sector "
@@ -666,6 +635,7 @@ class PurePursuitController(Node):
             key=lambda i: math.hypot(self.targets[i][0] - self.state.x, self.targets[i][1] - self.state.y),
         )
         self.drive_target_index = -1
+        self._target_started_s = self.sim_now()
         target_x, target_y, _target_z = self.targets[self.target_index]
         distance = math.hypot(target_x - self.state.x, target_y - self.state.y)
         self.get_logger().info(

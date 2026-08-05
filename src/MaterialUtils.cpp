@@ -1,5 +1,6 @@
 #include "MaterialUtils.h"
 
+#include "chrono/assets/ChVisualShapeTriangleMesh.h"
 #include "chrono/core/ChTypes.h"
 #include "chrono/utils/ChConstants.h"
 
@@ -48,6 +49,56 @@ void ApplyMaterialToVisualShapes(std::shared_ptr<chrono::ChBody> body,
             shape->GetMaterials()[0] = material;
         }
     }
+}
+
+namespace {
+
+// Shared matching rule for the two helpers below.
+template <class Fn>
+int ForEachMatchingShape(const std::shared_ptr<chrono::ChBody>& body,
+                         const std::string& shape_name_filter,
+                         Fn&& fn) {
+    if (!body || !body->GetVisualModel())
+        return 0;
+
+    int matched = 0;
+    for (const auto& shape_instance : body->GetVisualModel()->GetShapeInstances()) {
+        const auto& shape = shape_instance.shape;
+        if (!shape)
+            continue;
+
+        if (!shape_name_filter.empty()) {
+            // Only ChVisualShapeTriangleMesh carries a name; unnamed shapes cannot
+            // match and are left alone.
+            auto mesh_shape = std::dynamic_pointer_cast<chrono::ChVisualShapeTriangleMesh>(shape);
+            if (!mesh_shape || mesh_shape->GetName().find(shape_name_filter) == std::string::npos)
+                continue;
+        }
+
+        fn(shape);
+        ++matched;
+    }
+
+    return matched;
+}
+
+}  // namespace
+
+int ApplyColorToVisualShapes(const std::shared_ptr<chrono::ChBody>& body,
+                             const chrono::ChColor& color,
+                             const std::string& shape_name_filter) {
+    // SetColor clones the shared default material when needed, so this is safe on
+    // shapes with MTL materials and on shapes with none.
+    return ForEachMatchingShape(body, shape_name_filter,
+                                [&](const std::shared_ptr<chrono::ChVisualShape>& shape) { shape->SetColor(color); });
+}
+
+int SetVisualShapesVisible(const std::shared_ptr<chrono::ChBody>& body,
+                           bool visible,
+                           const std::string& shape_name_filter) {
+    return ForEachMatchingShape(
+        body, shape_name_filter,
+        [&](const std::shared_ptr<chrono::ChVisualShape>& shape) { shape->SetVisible(visible); });
 }
 
 }  // namespace amd_uw

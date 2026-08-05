@@ -1,7 +1,9 @@
 #pragma once
 
 #include <memory>
+#include <string>
 
+#include "chrono/assets/ChColor.h"
 #include "chrono/assets/ChVisualMaterial.h"
 #include "chrono/physics/ChBody.h"
 #include "chrono/physics/ChContactMaterial.h"
@@ -23,5 +25,19 @@ std::shared_ptr<chrono::ChVisualMaterial> CreateLunarHapkeMaterial();
 
 void ApplyMaterialToVisualShapes(std::shared_ptr<chrono::ChBody> body,
                                  std::shared_ptr<chrono::ChVisualMaterial> material);
+
+// Recolour shapes on an already-built body -- the SolidWorks-imported arm and
+// SynChrono's stock zombies build their own shapes, reachable only after the fact.
+// `shape_name_filter` is a substring test on the shape name (SynChrono names each
+// zombie shape after its OBJ), empty means all. Returns the number matched, so a
+// filter that finds nothing can be reported rather than silently doing nothing.
+int ApplyColorToVisualShapes(const std::shared_ptr<chrono::ChBody>& body,
+                             const chrono::ChColor& color,
+                             const std::string& shape_name_filter = "");
+
+// Show/hide shapes, same matching rules. Both renderers skip !IsVisible() shapes.
+int SetVisualShapesVisible(const std::shared_ptr<chrono::ChBody>& body,
+                           bool visible,
+                           const std::string& shape_name_filter = "");
 
 }  // namespace amd_uw
