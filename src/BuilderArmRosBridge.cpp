@@ -54,6 +54,29 @@ constexpr double feedstock_reach_max = 5.0;
 // has to be visible in the log rather than inferred from the wall not growing.
 constexpr double starved_report_period = 30.0;
 
+// How long a parked builder may sit unable to reach its OWN WALL SLOT before the station
+// is advanced past it.
+//
+// This closes a real deadlock, measured: builder 3 parked with its hull 0.93 m off the
+// 33 m lane -- inside the orbit controller's take band, so it correctly reported holding
+// station -- but yawed 16.3 deg off tangential. The arm mounts 2.5 m BACK along the hull,
+// so that heading error swings the arm base 2.5*sin(16.3) = 0.70 m radially inward, to
+// r = 31.47. Its wall slot at r = 30 was then 1.47 m away, under LrvArm's 2.0 m minimum,
+// and the arm controller refused it at 10 Hz indefinitely. The hull was parked, so nothing
+// drove; the controller was satisfied, so nothing re-acquired. It would have sat there for
+// the rest of the run.
+//
+// The controller closes its loop on hull radius and orbit angle and never on hull HEADING,
+// which is the term the arm base is most sensitive to. Fixing that properly means giving
+// the drive law a heading target; this is the backstop that makes the failure recoverable
+// instead of terminal, and it belongs here because the bridge is the only place that knows
+// both the true arm base pose and where the slot is.
+//
+// Advancing the station is what breaks it: the builder has to DRIVE about a metre, which
+// re-orients the hull along its lane, and the next slot is judged from the new pose. It
+// costs a gap in the wall, which is logged and is honest about what happened.
+constexpr double unservable_slot_timeout = 20.0;
+
 // How close a feedstock rock must be to the position a pick/place command was solved for
 // to count as the rock that command meant. Neighbouring rocks in the seed heap sit 0.30 m
 // of clear air apart -- roughly 0.6 m centre to centre -- so this is comfortably tighter
@@ -388,6 +411,30 @@ void BuilderArmRosBridge::PublishBuildTopics(double time) {
         pick.data = {0.0, -1.0, 0.0, 0.0, 0.0};
     }
     m_pick_target_pub->publish(pick);
+
+    // Parked but unable to reach the slot it is here to fill: advance past it rather than
+    // stare at it forever. See unservable_slot_timeout for the pose that produces this.
+    if (m_hull_parked && !m_arm.IsBusy() && !BuildComplete()) {
+        const double place_reach = (m_wall_slots[m_placed_count] - pos).Length();
+        const bool servable = place_reach >= feedstock_reach_min && place_reach <= feedstock_reach_max;
+        if (!servable) {
+            if (m_unservable_since < 0.0)
+                m_unservable_since = time;
+            else if (time - m_unservable_since >= unservable_slot_timeout) {
+                RCLCPP_WARN(m_node->get_logger(),
+                            "t=%.2f slot %d is %.2f m from the arm base (need %.1f-%.1f m) and has "
+                            "been for %.0f s; skipping it so the hull has to move.",
+                            time, m_placed_count, place_reach, feedstock_reach_min,
+                            feedstock_reach_max, time - m_unservable_since);
+                m_placed_count += 1;
+                m_unservable_since = -1.0;
+            }
+        } else {
+            m_unservable_since = -1.0;
+        }
+    } else {
+        m_unservable_since = -1.0;
+    }
 
     // Parked, still owing the wall a rock, and nothing in reach: the builder is waiting
     // on its collector. Normal between loads, fatal if it never ends, so it is reported

@@ -134,6 +134,9 @@ class BuilderArmRosBridge {
     bool m_reported_complete = false;
     // Diagnostics for a builder that is parked with nothing in reach.
     double m_starved_since = -1.0;
+    // When the builder first found itself parked unable to reach its own wall slot.
+    // See unservable_slot_timeout.
+    double m_unservable_since = -1.0;
     double m_last_starved_report = -1.0e9;
 
     rclcpp::Node::SharedPtr m_node;

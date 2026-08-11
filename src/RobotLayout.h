@@ -125,6 +125,28 @@ inline double HarvestLaneOffsetRad(int cycle) {
     return HarvestDropSlot(cycle) * wall_slot_pitch_rad;
 }
 
+// Distance from the tractor's chassis origin BACK to the trailer's rear pour lip, along
+// the rig. The rocks land here, not under the tractor, and getting that wrong is the
+// difference between a pile the builder can reach and one it cannot.
+//
+// Geometry: the trailer's front connector sits 1.9 m behind the tractor origin, and the
+// tub's pour lip is trailer_bed_half_x = 0.5 m behind the trailer chassis origin.
+//
+// Measured before this existed: rank 4's cycle-0 drop point is slot 6 = 280.31 deg, its
+// rover parked at ~276.1 deg, and the two rocks froze at 269.4 and 270.3 deg -- roughly
+// 10 deg, or 6.5 m of arc, clockwise of the slot they were meant for, which put them
+// outside the arm's 5 m envelope from a builder standing at slot 5. Two terms made that
+// up: the rover stops the instant it is inside drop_arc_tolerance_m, so it parked 2.7-2.9 m
+// short (its own logs), and then poured 2.4 m further back again.
+inline constexpr double trailer_pour_offset_m = 2.4;
+
+// Where the ROVER must park for its pour lip to land on the drop point: the same arc,
+// advanced by the length of its own rig. Counter-clockwise, because that is the direction
+// it runs the last stretch of the collector circle (see the tangential run-in).
+inline double RoverParkOffsetRad() {
+    return trailer_pour_offset_m / robot_start_radius;
+}
+
 // One colour per rank, so a collector and the builder it feeds read as a matched pair
 // and the ranks can be told apart in a wide shot. Everything belonging to rank i is
 // painted RankColor(i).
@@ -257,11 +279,21 @@ inline chrono::ChVector3d PointOnHarvestLane(int rank_index, int num_ranks, doub
                               site_center_y + radius * std::sin(angle), 0.0);
 }
 
-// The rank's drop point: where the collector parks to unload, and the origin of its
-// rock line. Also the initial home published to the drive controller. On the harvest
-// lane, so it lands beside the stretch of wall the builder is about to build.
-inline chrono::ChVector3d InitialGroundPositionForRobot(int robot_index, int num_robots, int cycle = 0) {
+// The rank's DROP POINT: where the load has to end up, on the harvest lane, beside the
+// stretch of wall the builder is about to build. This is the pour line, not the tractor.
+inline chrono::ChVector3d HarvestDropPoint(int robot_index, int num_robots, int cycle = 0) {
     return PointOnHarvestLane(robot_index, num_robots, robot_start_radius, cycle);
+}
+
+// Where the collector PARKS to put its load on that point, and the origin of its rock
+// line: the drop point advanced by the length of its own rig, so the pour lip -- which
+// trails 2.4 m behind the tractor -- lands on the drop point rather than 2.4 m short of
+// it. This is what gets published as homePos. See trailer_pour_offset_m.
+inline chrono::ChVector3d InitialGroundPositionForRobot(int robot_index, int num_robots, int cycle = 0) {
+    const double angle =
+        HarvestLaneAngleRad(robot_index, num_robots, cycle) + RoverParkOffsetRad();
+    return chrono::ChVector3d(site_center_x + robot_start_radius * std::cos(angle),
+                              site_center_y + robot_start_radius * std::sin(angle), 0.0);
 }
 
 // Where the rover is placed at t=0 -- further out on its own cycle-0 lane, clear of the

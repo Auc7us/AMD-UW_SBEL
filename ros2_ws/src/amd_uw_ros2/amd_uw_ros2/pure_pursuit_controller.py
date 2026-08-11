@@ -120,7 +120,17 @@ class PurePursuitController(Node):
         # the drop point, so it can be held to a much tighter arc. 8 m of slack would now
         # be worse than useless -- the rover would enter the band and park 8 m short of
         # the pile it is meant to be building, right where the entry waypoint puts it.
-        self.declare_parameter("drop_arc_tolerance_m", 3.0)
+        # 1.0, not 3.0, and the difference matters more than it looks. Arrival is accepted
+        # the INSTANT the rover is inside this band, so the band is not a tolerance -- it is
+        # a systematic bias. Measured at 3.0 m, three rovers parked 2.73, 2.77 and 2.90 m
+        # short of their drop point, every time, because that is where the band starts. Add
+        # the 2.4 m the pour lip trails behind the tractor and the load landed ~5 m
+        # clockwise of the slot it was for, outside the arm's envelope.
+        #
+        # It can be this tight now for the same reason it had to be loose before: the rover
+        # arrives ALONG the circle rather than driving at the point, and in_drop_band also
+        # accepts on a stop line once committed, so undershooting cannot strand it.
+        self.declare_parameter("drop_arc_tolerance_m", 1.0)
         # Tangential approach to the collector circle. The rover comes home from a rock
         # line that runs radially OUTWARD from the drop point, so left to itself it
         # arrives radially -- nose-in at the circumference, with the trailer pointing out

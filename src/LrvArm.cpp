@@ -578,13 +578,18 @@ void LrvArm::Update(double time) {
         //
         // Settled-but-short now keeps waiting -- the joint motors are constraint motors
         // and do converge -- and only a timeout fails it, with the error named.
-        // Unscaled: a finger-scale quantity, and set BETWEEN the two measured populations
-        // rather than by taste. Grabs that go on to lock arrive at 0.016-0.116 m (one
-        // locked from 0.1159, and 0.1385 was rejected by a first cut at 0.12 that was
-        // plainly too tight); grabs that close on air arrive at 0.726-0.760 m. There is
-        // half a metre of clear air between those, so anything in 0.2-0.5 separates them.
-        // 0.20 takes the low end, staying well under the 0.27 m the lock itself needs.
-        constexpr double grab_accept_dist = 0.20;
+        // Unscaled: a finger-scale quantity. This gate exists to catch a GROSS miss, and
+        // that is the only job it should do -- deciding whether the pads will actually
+        // close on the rock is the lock test's job, one phase later, and it measures the
+        // fingers directly. So this belongs just ABOVE lock_finger_dist, not below it:
+        // anything that could physically lock must be allowed to try.
+        //
+        // Converged on empirically, and the two wrong values are worth keeping because
+        // they bracket it. 0.12 rejected three grabs at 0.138-0.161 m. 0.20 then rejected
+        // one at 0.248 m -- inside the 0.27 m the lock needs, so it would have gripped.
+        // Meanwhile the gross misses this is here for land at 0.726-0.760 m. 0.35 clears
+        // the lock limit with margin and is still half the smallest gross miss.
+        constexpr double grab_accept_dist = 0.35;
         if (err > grab_accept_dist) {
             if (elapsed < close_timeout)
                 return;  // still converging; give it the rest of its window

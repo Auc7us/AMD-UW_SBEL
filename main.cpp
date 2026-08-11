@@ -1047,7 +1047,10 @@ int main(int argc, char* argv[]) {
             // Each load lands at HarvestDropSlot(c) and is eaten over the next
             // harvest_rocks_per_load slots, so check both ends of that run.
             for (int cycle = 0; HarvestDropSlot(cycle) < wall_slot_count; ++cycle) {
-                const ChVector3d drop = InitialGroundPositionForRobot(builder_index, num_robot_ranks, cycle);
+                // HarvestDropPoint, not InitialGroundPositionForRobot: the audit has to
+                // measure where the ROCKS land, and the latter is where the tractor parks
+                // -- 2.4 m of arc further on, so the rig's pour lip lands here.
+                const ChVector3d drop = HarvestDropPoint(builder_index, num_robot_ranks, cycle);
                 for (int k = 0; k < harvest_rocks_per_load; ++k) {
                     const double d = (drop - arm_base_at_slot(HarvestDropSlot(cycle) + k)).Length();
                     drop_min = std::min(drop_min, d);
