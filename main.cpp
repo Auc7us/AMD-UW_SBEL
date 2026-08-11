@@ -84,7 +84,9 @@ const double terrain_height_offset = 0.0;
 const double terrain_min_height = -25.0;
 const double terrain_max_height = 25.0;
 const double terrain_height_probe_clearance = 10.0;
-const RockFieldConfig rock_field_config;
+// NOT const: --rock_first_distance / --rock_distance_step override the line geometry so
+// a harvest cycle can be exercised in a fraction of the sim time. Defaults are unchanged.
+RockFieldConfig rock_field_config;
 const float global_camera_update_rate = 30.0f;
 // 1080p. Same 16:9 aspect as the previous 1280x720, so the framing is unchanged and only
 // the pixel count moves -- 0.92 Mpx to 2.07 Mpx, so budget ~2.25x the OptiX render cost
@@ -797,6 +799,17 @@ void AddCommandLineOptions(ChCLI& cli) {
     // bodies, so the two can legitimately differ.
     cli.AddOption<std::string>("Diagnostics", "sensor_frame_dir",
                                "Save global-camera frames as PNG to this directory instead of opening a window", "");
+    // Shorten the harvest round trip for testing. The whole collector-to-builder hand-off
+    // -- return leg, tangential run-in, dump, freeze, builder pick -- cannot be exercised
+    // without a complete harvest cycle, and at the defaults that is about 400 s of SIM per
+    // cycle, nearly all of it a loaded rover crawling back from 87 m at 0.2-0.5 m/s. That
+    // is 2.5 hours of wall time per attempt at this machine's ~22x, which is not a
+    // practical edit-test loop for anything downstream of the dump. These move the rocks
+    // in without touching any default.
+    cli.AddOption<double>("Diagnostics", "rock_first_distance",
+                          "Metres from the drop point to the first rock (default 20)", "20.0");
+    cli.AddOption<double>("Diagnostics", "rock_distance_step",
+                          "Metres between successive rocks on a rank's line (default 30)", "30.0");
 }
 
 }  // namespace
@@ -828,6 +841,8 @@ int main(int argc, char* argv[]) {
     const std::string sensor_frame_dir = cli.GetAsType<std::string>("sensor_frame_dir");
     const std::string solver_name = cli.GetAsType<std::string>("solver");
     const int solver_iterations = cli.GetAsType<int>("solver_iterations");
+    rock_field_config.first_distance = cli.GetAsType<double>("rock_first_distance");
+    rock_field_config.distance_step = cli.GetAsType<double>("rock_distance_step");
     syn_manager.SetHeartbeat(heartbeat);
 
     // Use AMD-UW data as the Chrono data root and its vehicle subfolder for vehicle JSON assets.

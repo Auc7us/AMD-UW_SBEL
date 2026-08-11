@@ -132,13 +132,16 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 "drop_arc_tolerance_m",
-                default_value="3.0",
+                default_value="1.0",
                 description=(
                     "How far along the collector circle the rover may stop from its "
-                    "drop point. Without this the whole ring would count as arrived. "
-                    "Was 8 m, which the tangential run-in made both unnecessary and "
-                    "harmful -- the rover would accept the band at the entry waypoint "
-                    "and park 8 m short of the pile it is meant to be building."
+                    "drop point. This is a BIAS, not a tolerance: arrival is accepted "
+                    "the instant the rover is inside the band, so it parks this far "
+                    "short every time (measured 2.73-2.90 m at 3.0). It can be tight "
+                    "because the run-in arrives ALONG the circle and in_drop_band also "
+                    "accepts on a stop line, so undershooting cannot strand it. This "
+                    "MUST match the node default in pure_pursuit_controller.py -- the "
+                    "launch value wins, so changing only the node changes nothing."
                 ),
             ),
             DeclareLaunchArgument(
