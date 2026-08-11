@@ -1336,22 +1336,31 @@ int main(int argc, char* argv[]) {
                 // offset either way, instead of the builder parking exactly on its slot and
                 // staring at a pile it cannot quite reach. Clamped, so a stray rock across
                 // the site can never drag a builder off its course.
+                //
+                // The station is the SLOT's station and nothing else. It is a function of
+                // one monotonically increasing integer, so it can only ever advance --
+                // which is the invariant the drive law depends on, because the builder
+                // orbits one way and a station that retreats by any amount costs it a full
+                // lap (207 m at 0.9 m/s, ~230 s of sim) to reach a point it was already
+                // standing on.
+                //
+                // It briefly also carried a term pulling it half way toward whichever rock
+                // was on offer, as insurance against a tipped load landing off its nominal
+                // slot. That was unnecessary and it was harmful. Unnecessary: the audit
+                // puts a delivered pile 3.91-4.04 m from the arm base against a 5.0 m
+                // limit, so the envelope already absorbs sqrt(5.0^2 - 3.9^2) = 3.1 m of
+                // arc, about three slots of scatter, with the hull parked exactly on its
+                // slot. Harmful: the pull collapses to zero the moment that rock leaves
+                // reach, and a collapsing pull is a retreating station -- measured on
+                // builder 3, which held at 186.1 deg and then stepped back to 184.3 deg,
+                // buying itself a lap. Latching the maximum fixed the retreat but left the
+                // station ratcheted up to a slot ahead of its own wall slot, which is the
+                // wrong pose to place from. Simplest correct answer: no pull.
                 if (builder) {
                     const int idx = robot->GetRobotIndex();
                     const double slot_angle = RankRayAngleRad(idx, num_robot_ranks) +
                                               builder->GetPlacedCount() * wall_slot_pitch_rad;
-                    double serve_angle = slot_angle;
-                    const double feed_angle = builder->GetFeedstockAngle();
-                    if (std::isfinite(feed_angle)) {
-                        // Unwrap onto slot_angle's branch before averaging, or a pile at
-                        // -179 deg and a slot at +179 deg average to 0.
-                        double delta = std::remainder(feed_angle - slot_angle, CH_2PI);
-                        constexpr double max_pull_slots = 2.0;
-                        const double limit = max_pull_slots * wall_slot_pitch_rad;
-                        delta = std::clamp(delta, -limit, limit);
-                        serve_angle = slot_angle + 0.5 * delta;
-                    }
-                    builder->SetStationAngle(serve_angle + BuilderArmLeadRad());
+                    builder->SetStationAngle(slot_angle + BuilderArmLeadRad());
                     builder->Synchronize(time);
                 }
             }

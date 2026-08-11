@@ -169,15 +169,15 @@ def generate_launch_description():
             # locked track means the hull pivots instead of translating, so it can no
             # longer correct its path. This cap is what keeps it driving.
             DeclareLaunchArgument("steering_limit", default_value="0.5"),
-            # How far off the lane still counts as on-station. Oscillation about the lane
-            # is expected and harmless; the arm's reach is what actually constrains it.
+            # How far off the lane still counts as on-station. Sized by the arm: at
+            # 1.09 m inside the lane the builder can no longer reach its own wall slot.
             DeclareLaunchArgument("station_radius_tol_m", default_value="0.9"),
             # Radial band at which an already-held station is GIVEN UP. Wider than the
             # band to take one, because dropping station keeping also releases the
             # sim-side anchor that pulls the hull back onto the lane -- so a single band
             # turns the drift that follows parking into a lap round the site. That is
             # what had rank 3 laying one rock to its neighbours' four.
-            DeclareLaunchArgument("station_radius_release_m", default_value="1.05"),
+            DeclareLaunchArgument("station_radius_release_m", default_value="1.3"),
             # Station keeping, retuned for the build cycle. The station now steps ONE WALL
             # SLOT at a time -- 0.9 m of course, 0.99 m of lane -- where it used to jump 30
             # degrees per harvest cycle, so the old bands are the wrong size by an order of

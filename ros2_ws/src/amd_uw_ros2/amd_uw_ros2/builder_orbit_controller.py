@@ -209,9 +209,15 @@ class BuilderOrbitController(Node):
         # limit is physical: the wall slot sits 3.095 m from the arm base on the lane, and
         # LrvArm rejects a grab closer than 2.0 m, so the builder can be about 1.09 m
         # inside the lane before its own wall slot goes out of reach. 0.9 keeps margin.
+        # How far off the lane the builder may be and still TAKE station.
+        #
+        # Sized by the arm, not by taste: on station the wall slot sits 3.095 m from the
+        # arm base and LrvArm refuses a grab closer than 2.0 m, so at 1.09 m inside the
+        # lane the builder can no longer reach the slot it is there to fill. 0.9 keeps a
+        # little margin under that.
         self.declare_parameter("station_radius_tol_m", 0.9)
-        # Radial band at which an ALREADY-HELD station is given up, as opposed to the
-        # band required to take it. Hysteresis, and it is what stops one builder laying a
+        # Radial band at which an ALREADY-HELD station is given up, as opposed to the band
+        # required to take one. Hysteresis, and it is what stops one builder laying a
         # quarter of what its neighbours lay.
         #
         # Measured on rank 3, terrain tilt 5.2 deg: "holding station at 186.1 deg", then
@@ -221,12 +227,24 @@ class BuilderOrbitController(Node):
         # it back, so the correction it needs is the thing that dropping station keeping
         # switches off. It was not slow at anything; it kept being sent away.
         #
-        # The anchor now walks the hull radially back onto the lane while it holds (see
-        # BuilderRig::Synchronize), so the right response to a drift inside this band is to
-        # keep holding and let it. Sized just inside the hard limit: the wall slot is
-        # 3.095 m from the arm base and LrvArm refuses a grab under 2.0 m, so 1.09 m inside
-        # the lane is where the builder's own slot leaves its envelope.
-        self.declare_parameter("station_radius_release_m", 1.05)
+        # 0.4 m of hysteresis, and both ends of it are constrained.
+        #
+        # It cannot be much tighter. At 1.05 the release band sat 0.15 m from the take
+        # band, which is inside the drift the builder picks up in a single 1 m creep, so
+        # rank 3 chattered across it -- take station, drift, give it up, drive a lap,
+        # repeat. That is what had one builder laying a quarter of what its neighbours did.
+        #
+        # It cannot be much looser either, and 3.0 proved that the expensive way: builder 3
+        # drifted to -3.00 m before anything reacted, which is r = 30.0 -- it had driven
+        # onto the work circle, on top of the wall it had just laid. The hull is 2.686 m
+        # wide, so the true ceiling is about 1.5 m.
+        #
+        # The builder cannot correct radial error while parked -- see the anchor note in
+        # BuilderRig::Synchronize, which cannot beat 15.3 kN of braked-track friction -- so
+        # giving up station and driving the lane IS the correction. This band decides when
+        # that is worth a lap, and 1.3 m is where the arm has just stopped being able to
+        # reach its own slot.
+        self.declare_parameter("station_radius_release_m", 1.3)
         # Active station keeping. Inside the deadband the builder sits on the brake;
         # outside it, it creeps forward along its arc at gain * error, capped.
         self.declare_parameter("station_keep_deadband_m", 0.25)

@@ -259,7 +259,11 @@ LrvArm::LrvArm(chrono::ChSystem* system,
                double geometry_scale)
     : m_system(system),
       m_chassis_body(std::move(chassis_body)),
-      m_geometry_scale(geometry_scale) {
+      m_geometry_scale(geometry_scale),
+      // Every rank writes to one stdout, so an untagged "[LrvArm]" line cannot be
+      // attributed to a machine. Four builders interleaving grab diagnostics in one
+      // file is how a 0.76 m miss on one of them gets read as a property of another.
+      m_log_tag(name_prefix.empty() ? std::string("rover") : name_prefix) {
     if (m_geometry_scale <= 0.0)
         throw std::invalid_argument("Arm geometry scale must be positive.");
     if (m_chassis_body)
@@ -415,7 +419,7 @@ LrvArm::LrvArm(chrono::ChSystem* system,
 
 #ifdef AMD_UW_USE_SOLIDWORKS_IMPORTER
     if (imported)
-        std::cout << "[LrvArm] imported SolidWorks arm via ChPythonEngine: " << arm_file << "\n";
+        std::cout << "[LrvArm " + m_log_tag + "] imported SolidWorks arm via ChPythonEngine: " << arm_file << "\n";
 #endif
 }
 
@@ -463,12 +467,12 @@ bool LrvArm::StartPickPlace(double command_seq,
     // removed, so a command that is missing a solved pose fails cleanly instead
     // of silently self-solving with a different solver/frame.
     if (!grab_theta_override) {
-        std::cout << "[LrvArm] no grab theta in command -> failing (C++ IK removed)\n";
+        std::cout << "[LrvArm " + m_log_tag + "] no grab theta in command -> failing (C++ IK removed)\n";
         FinishFailed(2);
         return false;
     }
     if (!place_theta_override) {
-        std::cout << "[LrvArm] no place theta in command -> failing (C++ IK removed)\n";
+        std::cout << "[LrvArm " + m_log_tag + "] no place theta in command -> failing (C++ IK removed)\n";
         FinishFailed(2);
         return false;
     }
@@ -484,7 +488,7 @@ bool LrvArm::StartPickPlace(double command_seq,
         const chrono::ChVector3d local = GetIkFrameRot().RotateBack(grab_target_world - GetIkFramePos());
         const double reach_xy = std::hypot(local.x(), local.y());
         if (reach_xy < min_reach || reach_xy > max_reach || local.z() < min_local_z) {
-            std::cout << "[LrvArm] grab target OUT OF ENVELOPE: local=(" << local.x() << ", " << local.y()
+            std::cout << "[LrvArm " + m_log_tag + "] grab target OUT OF ENVELOPE: local=(" << local.x() << ", " << local.y()
                       << ", " << local.z() << ") reach_xy=" << reach_xy << " m, allowed [" << min_reach
                       << ", " << max_reach << "] and z >= " << min_local_z << " (geometry_scale "
                       << m_geometry_scale
@@ -498,7 +502,7 @@ bool LrvArm::StartPickPlace(double command_seq,
     m_grab_theta = *grab_theta_override;
     m_place_theta = *place_theta_override;
 
-    std::cout << "[LrvArm] grab_theta=(" << m_grab_theta[0] << "," << m_grab_theta[1] << ","
+    std::cout << "[LrvArm " + m_log_tag + "] grab_theta=(" << m_grab_theta[0] << "," << m_grab_theta[1] << ","
               << m_grab_theta[2] << "," << m_grab_theta[3] << ") -> starting APPROACH\n";
 
     CommandJointAngles({m_grab_theta[0], m_grab_theta[1], 0.0, 0.0});
@@ -549,14 +553,50 @@ void LrvArm::Update(double time) {
         // the pose was bad (unreachable / wrong frame); fail cleanly instead of
         // clamping the fingers onto empty space.
         if (err > divergence_abort * m_geometry_scale) {
-            std::cout << "[LrvArm] grab pose diverged err=" << err << " (limit "
+            std::cout << "[LrvArm " + m_log_tag + "] grab pose diverged err=" << err << " (limit "
                       << divergence_abort * m_geometry_scale << ") -> failing\n";
             FinishFailed(2);
             return;
         }
 
+        // ARRIVAL is a different question from DIVERGENCE, and it needs its own number.
+        //
+        // This used to be the only test, so anything inside divergence_abort proceeded to
+        // close -- 2.0 m for the builder, since that constant scales with the arm. But the
+        // jaws can only take a rock their pads actually touch: lock_finger_dist is 0.27 m
+        // and does NOT scale, because the fingers stay 1x on the 2x builder arm. So the
+        // gate that decided "I have arrived" was nearly eight times looser than the gate
+        // that decides "I can grip", and the gap between them is a grab that closes on air.
+        //
+        // Measured, three times, on two builders and across runs -- the miss is remarkably
+        // repeatable because it is a threshold and not a drift:
+        //   [builder_2_] miss_xy=0.726 miss_z=-0.082  pad_force=0
+        //   [builder_3_] miss_xy=0.735 miss_z=+0.089  pad_force=0
+        //   APPROACH->CLOSING |gripper-target|=0.760615
+        // Each time the aim point was exactly the rock's x/y, so nothing upstream was
+        // wrong: the arm simply had not got there, and was told that was close enough.
+        //
+        // Settled-but-short now keeps waiting -- the joint motors are constraint motors
+        // and do converge -- and only a timeout fails it, with the error named.
+        // Unscaled: a finger-scale quantity, and set BETWEEN the two measured populations
+        // rather than by taste. Grabs that go on to lock arrive at 0.016-0.116 m (one
+        // locked from 0.1159, and 0.1385 was rejected by a first cut at 0.12 that was
+        // plainly too tight); grabs that close on air arrive at 0.726-0.760 m. There is
+        // half a metre of clear air between those, so anything in 0.2-0.5 separates them.
+        // 0.20 takes the low end, staying well under the 0.27 m the lock itself needs.
+        constexpr double grab_accept_dist = 0.20;
+        if (err > grab_accept_dist) {
+            if (elapsed < close_timeout)
+                return;  // still converging; give it the rest of its window
+            std::cout << "[LrvArm " + m_log_tag + "] grab pose never arrived: err=" << err
+                      << " m after " << elapsed << " s (accept " << grab_accept_dist
+                      << " m, lock needs " << lock_finger_dist << " m) -> failing\n";
+            FinishFailed(2);
+            return;
+        }
+
         const auto rref = m_target_rock ? m_target_rock->GetFrameRefToAbs().GetPos() : chrono::VNULL;
-        std::cout << "[LrvArm] APPROACH->CLOSING t=" << time
+        std::cout << "[LrvArm " + m_log_tag + "] APPROACH->CLOSING t=" << time
                   << " |gripper-target|=" << err
                   << " |gripper-rockREF|xy=" << std::hypot(gc.x() - rref.x(), gc.y() - rref.y()) << "\n";
         m_phase = Phase::CLOSING;
@@ -587,7 +627,7 @@ void LrvArm::Update(double time) {
             m_close_pos = std::min(finger_close_pos, 0.5 * (finger_open_sep - actual_sep) + 0.002);
             CommandFingerPosition(m_close_pos);
             if (TryLockRock()) {
-                std::cout << "[LrvArm] LOCKED t=" << time << " actual_sep=" << actual_sep
+                std::cout << "[LrvArm " + m_log_tag + "] LOCKED t=" << time << " actual_sep=" << actual_sep
                           << " pad_force=" << pad_force << "\n";
                 // Unfreezing and disabling collision now happen inside TryLockRock,
                 // BEFORE the weld is built rather than one line after it -- see the
@@ -602,8 +642,26 @@ void LrvArm::Update(double time) {
         if (m_close_pos >= finger_close_pos) {
             const double d1 = m_target_rock ? (m_target_rock->GetPos() - m_finger_1->GetPos()).Length() : -1.0;
             const double d2 = m_target_rock ? (m_target_rock->GetPos() - m_finger_2->GetPos()).Length() : -1.0;
-            std::cout << "[LrvArm] GRAB FAILED(3) t=" << time << " actual_sep=" << actual_sep
+            // Split the miss into its horizontal and vertical parts, and report where the
+            // rock and the aim point actually are. A single 3D distance cannot tell a
+            // gripper that went to the wrong PLACE from one that went to the right place
+            // at the wrong HEIGHT, and those have nothing to do with each other: the first
+            // is a targeting fault, the second is the grab_z_offset calibration. Reading
+            // one as the other has cost this project two wrong diagnoses.
+            double dxy = -1.0, dz = 0.0;
+            chrono::ChVector3d rock_pos, mid;
+            if (m_target_rock) {
+                rock_pos = m_target_rock->GetPos();
+                mid = 0.5 * (m_finger_1->GetPos() + m_finger_2->GetPos());
+                dxy = std::hypot(rock_pos.x() - mid.x(), rock_pos.y() - mid.y());
+                dz = mid.z() - rock_pos.z();
+            }
+            std::cout << "[LrvArm " + m_log_tag + "] GRAB FAILED(3) t=" << time << " actual_sep=" << actual_sep
                       << " (grasp_sep=" << finger_grasp_sep << ")"
+                      << " miss_xy=" << dxy << " miss_z=" << dz
+                      << " rock=(" << rock_pos.x() << "," << rock_pos.y() << "," << rock_pos.z() << ")"
+                      << " aim=(" << m_grab_target_world.x() << "," << m_grab_target_world.y() << "," << m_grab_target_world.z()
+                      << ")"
                       << " dist_finger1_rock=" << d1 << " dist_finger2_rock=" << d2
                       << " pad_force=" << pad_force
                       << " (lock_dist=" << lock_finger_dist << ")\n";
@@ -642,7 +700,7 @@ void LrvArm::Update(double time) {
         // FLINGS the rock off the bed (seen as |rock-place|~1.8 with the rock
         // launched a meter away). Waiting for `settled` drops it straight down.
         if ((elapsed >= place_min_settle && settled) || elapsed > place_timeout) {
-            std::cout << "[LrvArm] PLACING->RELEASING t=" << time << " elapsed=" << elapsed
+            std::cout << "[LrvArm " + m_log_tag + "] PLACING->RELEASING t=" << time << " elapsed=" << elapsed
                       << " |gripper-place|=" << place_err << " gripper_speed=" << gripper_speed
                       << (elapsed > place_timeout ? " (timeout)" : "") << "\n";
             OpenGripper();
@@ -900,7 +958,7 @@ chrono::ChVector3d LrvArm::GripperCenter() const {
 void LrvArm::FinishDone() {
     if (m_target_rock) {
         const auto rp = m_target_rock->GetPos();
-        std::cout << "[LrvArm] DONE rock_final=(" << rp.x() << "," << rp.y() << "," << rp.z() << ")"
+        std::cout << "[LrvArm " + m_log_tag + "] DONE rock_final=(" << rp.x() << "," << rp.y() << "," << rp.z() << ")"
                   << " place_target=(" << m_place_target_world.x() << "," << m_place_target_world.y() << ","
                   << m_place_target_world.z() << ")"
                   << " |rock-place|=" << (rp - m_place_target_world).Length() << "\n";

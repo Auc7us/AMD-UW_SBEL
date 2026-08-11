@@ -121,6 +121,8 @@ class LrvArm {
     std::shared_ptr<chrono::ChBody> m_chassis_body;
     chrono::ChQuaternion<> m_mount_rot_chassis = chrono::QUNIT;
     double m_geometry_scale = 1.0;
+    // Identifies which machine's arm a log line came from; see the constructor.
+    std::string m_log_tag;
     std::shared_ptr<chrono::ChBodyAuxRef> m_base;
     std::shared_ptr<chrono::ChBodyAuxRef> m_shoulder;
     std::shared_ptr<chrono::ChBodyAuxRef> m_biceps;

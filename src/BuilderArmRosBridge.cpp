@@ -54,6 +54,13 @@ constexpr double feedstock_reach_max = 5.0;
 // has to be visible in the log rather than inferred from the wall not growing.
 constexpr double starved_report_period = 30.0;
 
+// How close a feedstock rock must be to the position a pick/place command was solved for
+// to count as the rock that command meant. Neighbouring rocks in the seed heap sit 0.30 m
+// of clear air apart -- roughly 0.6 m centre to centre -- so this is comfortably tighter
+// than the gap it has to tell apart, and comfortably looser than the few millimetres a
+// fixed rock can move between the publish and the command arriving.
+constexpr double command_rock_match_tol = 0.25;
+
 void EnsureRosInitialized() {
     if (rclcpp::ok())
         return;
@@ -140,7 +147,6 @@ void BuilderArmRosBridge::UpdateFeedstock(double time) {
     }
 
     m_selected.reset();
-    m_feedstock_angle = std::numeric_limits<double>::quiet_NaN();
 
     const auto base = m_arm.GetIkFramePos();
     double best = std::numeric_limits<double>::max();
@@ -158,11 +164,24 @@ void BuilderArmRosBridge::UpdateFeedstock(double time) {
             m_selected = rock;
         }
     }
+}
 
-    if (m_selected) {
-        const auto pos = m_selected->GetPos();
-        m_feedstock_angle = std::atan2(pos.y() - site_center_y, pos.x() - site_center_x);
+std::shared_ptr<chrono::ChBodyAuxRef> BuilderArmRosBridge::FindFeedstockNear(double x, double y) const {
+    std::shared_ptr<chrono::ChBodyAuxRef> best;
+    double best_d2 = command_rock_match_tol * command_rock_match_tol;
+    for (const auto& rock : m_feedstock) {
+        if (!rock || m_consumed.count(rock.get()))
+            continue;
+        const auto pos = rock->GetPos();
+        const double dx = pos.x() - x;
+        const double dy = pos.y() - y;
+        const double d2 = dx * dx + dy * dy;
+        if (d2 <= best_d2) {
+            best_d2 = d2;
+            best = rock;
+        }
     }
+    return best;
 }
 
 int BuilderArmRosBridge::ReadySlot() const {
@@ -210,10 +229,18 @@ void BuilderArmRosBridge::Synchronize(double time, bool apply_commands) {
         // Accept only a command for the slot actually being worked. A stale or duplicate
         // command would otherwise re-pick a rock already laid -- which, because that rock
         // was re-fixed on the wall, means welding the gripper to the wall.
-        if (slot >= 0 && pick_place->target_index == slot) {
+        // Identify the rock by the POSITION the command was solved for, not by re-running
+        // the selection. The controller solved its IK against the pick_target this bridge
+        // published; m_selected is recomputed every step against a base that is still
+        // settling, so two nearly-equidistant heap rocks can swap between the publish and
+        // the command arriving. Handing the arm a rock 0.6 m from the one the joint angles
+        // were solved for is a miss by construction. The command already carries that
+        // position -- data[2..3] -- so use it.
+        const auto commanded = FindFeedstockNear(pick_place->rock_x, pick_place->rock_y);
+        if (slot >= 0 && pick_place->target_index == slot && commanded) {
             m_last_started_seq = pick_place->command_seq;
             m_active_slot = slot;
-            m_active_rock = m_selected;
+            m_active_rock = commanded;
             // Booked now, not on completion: the moment the arm starts for this rock,
             // no later selection may offer it again, whatever happens to the grab.
             m_consumed.insert(m_active_rock.get());
@@ -226,6 +253,11 @@ void BuilderArmRosBridge::Synchronize(double time, bool apply_commands) {
                         place_target.x(), place_target.y(), place_target.z());
             m_arm.StartPickPlace(pick_place->command_seq, slot, m_active_rock, grab_target, place_target, time,
                                  &pick_place->grab_theta, &pick_place->place_theta);
+        } else if (slot >= 0 && pick_place->target_index == slot && !commanded) {
+            RCLCPP_WARN(m_node->get_logger(),
+                        "Ignoring pick/place for slot %d; no un-consumed rock within %.2f m of the "
+                        "commanded (%.3f, %.3f). The pile moved or the command is stale.",
+                        slot, command_rock_match_tol, pick_place->rock_x, pick_place->rock_y);
         } else if (pick_place->target_index != slot) {
             RCLCPP_WARN(m_node->get_logger(),
                         "Ignoring pick/place for slot %d; the builder is %s.",
@@ -312,8 +344,11 @@ void BuilderArmRosBridge::OnCommand(const std_msgs::msg::Float64MultiArray::Shar
         PickPlaceCommand command;
         command.command_seq = msg->data[0];
         command.target_index = static_cast<int>(std::llround(msg->data[1]));
-        // data[2..3] are the rock's world x/y, carried for symmetry with the rover's
-        // command and for logging; the authoritative position is read off the body here.
+        // data[2..3] are the rock's world x/y: the position the controller solved this
+        // command's joint angles against, and therefore what identifies WHICH rock it
+        // means. The rock's exact pose is still read off the body at StartPickPlace.
+        command.rock_x = msg->data[2];
+        command.rock_y = msg->data[3];
         command.grab_theta = {msg->data[4], msg->data[5], msg->data[6], msg->data[7]};
         command.place_theta = {msg->data[8], msg->data[9], msg->data[10], msg->data[11]};
         std::lock_guard<std::mutex> lock(m_command_mutex);

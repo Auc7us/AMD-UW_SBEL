@@ -87,10 +87,6 @@ class BuilderRig {
     // simply never advances.
     int GetPlacedCount() const;
 
-    // Site-centre bearing of the rock the arm is currently being offered, or NaN if
-    // there is none. See BuilderArmRosBridge::GetFeedstockAngle.
-    double GetFeedstockAngle() const;
-
     // Where the builder's next rocks come from once its seed heap is gone: the loads its
     // collector has delivered. Wired by main, which owns both rigs -- BuilderRig itself
     // knows nothing about the collector, and this keeps it that way.
@@ -146,9 +142,6 @@ class BuilderRig {
     double m_anchor_yaw = 0.0;
     unsigned int m_anchor_accumulator = 0;
     bool m_anchor_accumulator_ready = false;
-    // Previous Synchronize time, so the anchor's re-centring slew is measured against
-    // real elapsed sim time rather than assuming a step size it is not told.
-    double m_last_sync_time = -1.0;
     // Diagnostic escape hatch (--no_build). The arm bridge only offers a pick while the
     // builder is parked, so with this off it drives its lane and never builds.
     bool m_hull_park_enabled = true;

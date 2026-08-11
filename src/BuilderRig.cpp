@@ -335,54 +335,24 @@ void BuilderRig::Synchronize(double time) {
             constexpr double anchor_k_yaw = 2.0e5;    // N.m/rad
             constexpr double anchor_c_yaw = 1.2e5;    // N.m.s/rad
 
-            // Walk the anchor point back ONTO the lane while it holds.
+            // The anchor HOLDS the parked pose. It does not correct it, and it cannot.
             //
-            // Latching the raw parked pose holds whatever radial error the builder
-            // arrived with, and on sloped regolith that error grows every time it parks.
-            // The orbit controller's radial gate then drops station keeping and sends the
-            // builder round to re-acquire the lane -- which is what a builder laying one
-            // rock to its neighbours' four was doing. Measured on rank 3 (terrain tilt
-            // 5.2 deg): "holding station at 186.1 deg", then 0.7 s of sim later
-            // "-0.90 m off the 33.0 m lane; driving the lane back before taking station".
-            // It was not slow at anything. It kept being sent away.
+            // It was briefly made to walk its setpoint radially back onto the lane, to
+            // undo the inward drift the builder accumulates while creeping between slots.
+            // That cannot work, and the arithmetic says so without needing a run: sliding
+            // a braked tracked hull sideways has to beat track-ground friction, which at
+            // mu = 0.9 on a 10483 kg machine in lunar gravity is 0.9 * 10483 * 1.62 =
+            // 15.3 kN. The anchor's ceiling is k * max_offset = 5e4 * 0.15 = 7.5 kN, under
+            // half of it. It was sized against the gravity component on a 5 deg slope
+            // (1.5 kN), which is the force it has to RESIST, not the one it would have to
+            // OVERCOME. Raising it past 15 kN is not the answer either: that is a large
+            // force fed into a braked single-pin track, which is how pinning destroyed the
+            // chain in the first place.
             //
-            // The gate cannot simply be widened: at station the wall slot is 3.09 m from
-            // the arm base and a delivered load ~3.95 m, so against the 2.0-5.2 m envelope
-            // the usable radial band is only [-1.1, +1.95] m. 0.9 m is already most of it.
+            // So radial error is the drive controller's problem, corrected by driving --
+            // and its release band is sized to react while the arm can still work and long
+            // before the hull reaches the wall it laid. See station_radius_release_m.
             //
-            // So correct the error instead of tolerating it. The setpoint slews radially
-            // toward builder_path_radius, and is never allowed more than anchor_max_offset
-            // from the hull -- which caps the spring at k*offset = 7.5 kN on a 10.5 t
-            // machine, about 0.7 m/s^2. That walks it back over a few seconds instead of
-            // yanking it, and it cannot fight the track.
-            constexpr double anchor_recentre_rate = 0.15;  // m/s of setpoint travel
-            constexpr double anchor_max_offset = 0.15;     // m of spring extension
-            {
-                const chrono::ChVector3d hull = chassis->GetPos();
-                const double bearing = std::atan2(m_anchor_pos.y() - site_center_y,
-                                                  m_anchor_pos.x() - site_center_x);
-                const double r = std::hypot(m_anchor_pos.x() - site_center_x,
-                                            m_anchor_pos.y() - site_center_y);
-                const double dt = (m_last_sync_time >= 0.0) ? std::max(0.0, time - m_last_sync_time) : 0.0;
-                if (r > 1.0 && dt > 0.0) {
-                    const double step = anchor_recentre_rate * dt;
-                    const double dr = std::clamp(builder_path_radius - r, -step, step);
-                    const double r_new = r + dr;
-                    chrono::ChVector3d target(site_center_x + r_new * std::cos(bearing),
-                                              site_center_y + r_new * std::sin(bearing),
-                                              m_anchor_pos.z());
-                    // Never pull harder than anchor_max_offset's worth.
-                    const chrono::ChVector3d lead(target.x() - hull.x(), target.y() - hull.y(), 0.0);
-                    const double lead_len = lead.Length();
-                    if (lead_len > anchor_max_offset) {
-                        const chrono::ChVector3d capped = lead * (anchor_max_offset / lead_len);
-                        target = chrono::ChVector3d(hull.x() + capped.x(), hull.y() + capped.y(),
-                                                    m_anchor_pos.z());
-                    }
-                    m_anchor_pos = target;
-                }
-            }
-
             // Horizontal only: the vertical direction is the suspension's job, and pulling
             // on it would fight the track's contact with the ground.
             const chrono::ChVector3d offset = chassis->GetPos() - m_anchor_pos;
@@ -429,7 +399,6 @@ void BuilderRig::Synchronize(double time) {
     // No terrain argument: a tracked vehicle interacts with rigid terrain purely
     // through contacts, and the rank's terrain is synchronized by its owner.
     m_m113->Synchronize(time, m_driver_inputs);
-    m_last_sync_time = time;
 }
 
 int BuilderRig::GetPlacedCount() const {
@@ -437,15 +406,6 @@ int BuilderRig::GetPlacedCount() const {
     return m_arm_ros_bridge ? m_arm_ros_bridge->GetPlacedCount() : 0;
 #else
     return 0;
-#endif
-}
-
-double BuilderRig::GetFeedstockAngle() const {
-#ifdef AMD_UW_ENABLE_ROS2
-    return m_arm_ros_bridge ? m_arm_ros_bridge->GetFeedstockAngle()
-                            : std::numeric_limits<double>::quiet_NaN();
-#else
-    return std::numeric_limits<double>::quiet_NaN();
 #endif
 }
 

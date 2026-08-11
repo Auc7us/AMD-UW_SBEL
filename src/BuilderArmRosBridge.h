@@ -80,11 +80,6 @@ class BuilderArmRosBridge {
     int GetPlacedCount() const { return m_placed_count; }
     bool BuildComplete() const { return m_placed_count >= static_cast<int>(m_wall_slots.size()); }
 
-    // Site-centre bearing of the feedstock rock currently being offered, or NaN when
-    // there is none in reach. The hull's station is pulled part-way toward this so a
-    // pile that lands off its nominal slot is still worked instead of stared at.
-    double GetFeedstockAngle() const { return m_feedstock_angle; }
-
   private:
     struct DirectCommand {
         std::array<double, 4> theta = {0.0, 0.0, 0.0, 0.0};
@@ -94,6 +89,10 @@ class BuilderArmRosBridge {
     struct PickPlaceCommand {
         double command_seq = 0.0;
         int target_index = -1;
+        // World x/y of the rock this command was solved against. Authoritative for
+        // WHICH rock it means -- see FindFeedstockNear.
+        double rock_x = 0.0;
+        double rock_y = 0.0;
         std::array<double, 4> grab_theta = {0.0, 0.0, 0.0, 0.0};
         std::array<double, 4> place_theta = {0.0, 0.0, 0.0, 0.0};
     };
@@ -106,8 +105,12 @@ class BuilderArmRosBridge {
     // in reach.
     int ReadySlot() const;
     // Fold whatever the collector has delivered into the feedstock pool, then choose the
-    // nearest un-consumed rock inside the arm's envelope. Sets m_selected/m_feedstock_angle.
+    // nearest un-consumed rock inside the arm's envelope. Sets m_selected.
     void UpdateFeedstock(double time);
+    // The un-consumed feedstock rock nearest (x, y), or null if none is within
+    // command_rock_match_tol. Used to identify the rock a pick/place command was
+    // actually solved for; see the call site.
+    std::shared_ptr<chrono::ChBodyAuxRef> FindFeedstockNear(double x, double y) const;
 
     int m_builder_id;
     LrvArm& m_arm;
@@ -118,7 +121,6 @@ class BuilderArmRosBridge {
     std::unordered_set<const chrono::ChBodyAuxRef*> m_consumed;
     DeliveredRockSource m_delivered_source;
     std::shared_ptr<chrono::ChBodyAuxRef> m_selected;  // rock currently on offer
-    double m_feedstock_angle = std::numeric_limits<double>::quiet_NaN();
     double m_last_feed_refresh = -1.0;
     std::vector<chrono::ChVector3d> m_wall_slots;
 

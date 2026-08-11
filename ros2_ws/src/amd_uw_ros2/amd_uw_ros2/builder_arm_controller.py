@@ -121,7 +121,9 @@ class BuilderArmController(Node):
         self.rocks_laid = 0
         self.reported_waiting = False
         self.reported_unsolvable_slot = -1
-        # The poses of the in-flight command, kept so it can be republished verbatim.
+        # The poses of the in-flight command. Re-solved on every republish rather than
+        # resent verbatim -- see supervise_active -- and kept only as the fallback for a
+        # republish whose fresh solve failed.
         self.pending_theta = None
 
         self.solver = RobotArmInverseKinematicsSolver(
@@ -264,14 +266,48 @@ class BuilderArmController(Node):
 
         # Republish until the sim acknowledges. A command that arrives while the arm is
         # still stowing from the previous slot is dropped, and nothing else would resend.
+        #
+        # RE-SOLVE, do not resend. Joint angles are only meaningful in the arm base frame
+        # they were solved in, and that frame moves: the hull creeps under full brake, and
+        # BuilderRig's anchor deliberately walks it back onto the lane at 0.15 m/s. A
+        # command can sit unacknowledged for seconds while that happens -- the sim only
+        # accepts one from a parked hull -- so resending the original angles aims the
+        # gripper at where the rock USED to be relative to the base.
+        #
+        # Measured, tagged, with the miss split by axis:
+        #   [LrvArm builder_2_] GRAB FAILED(3) miss_xy=0.726 miss_z=-0.082
+        #       rock=(-3.04275, 35.9807, 1.88634)  aim=(-3.04275, 35.9807, 1.75634)
+        # The aim point is exactly the rock's x/y and z-0.13, so the target was right and
+        # the height was right; the gripper simply went 0.73 m sideways of it, which is a
+        # stale frame and nothing else. Re-solving costs one BFGS minimisation per second.
         rate_hz = max(0.0, float(self.get_parameter("cmd_republish_rate_hz").value))
         if (
             rate_hz > 0.0
             and not self.active.status_seen
             and self.now_wall_s() - self.active.last_publish_wall_s >= 1.0 / rate_hz
-            and self.pending_theta is not None
         ):
-            self.publish_active(*self.pending_theta)
+            # Re-solve ONLY against a target the sim is still offering. ready=0 means the
+            # bridge has no rock selected, and its pick_target then carries (0, 0, 0) --
+            # the site centre, which from an arm base on the 33 m lane is a target 31 m
+            # away that the reach guard rejects once per republish. Honouring the flag here
+            # as the first-solve path already does is the whole fix; falling back to the
+            # last good pose keeps the republish doing its job, which is to cover a command
+            # the sim dropped because the arm was still stowing.
+            fresh = None
+            if (
+                self.arm_base_pose is not None
+                and self.pick_target is not None
+                and self.pick_target.ready
+                and self.place_target is not None
+            ):
+                grab = self.solve("grab", (self.pick_target.x, self.pick_target.y, self.pick_target.z))
+                place = self.solve("place", self.place_target)
+                if grab is not None and place is not None:
+                    fresh = (grab, place)
+            if fresh is not None:
+                self.pending_theta = fresh
+            if self.pending_theta is not None:
+                self.publish_active(*self.pending_theta)
 
         sim_timeout = max(0.0, float(self.get_parameter("command_timeout_sim_s").value))
         if sim_timeout > 0.0 and self.sim_time is not None and self.active_start_sim_s is not None:
