@@ -49,6 +49,7 @@ def launch_setup(context, *args, **kwargs):
             "speed_kp",
             "max_throttle",
             "station_radius_tol_m",
+            "station_radius_release_m",
             "station_tolerance_rad",
             "station_keep_deadband_m",
             "station_keep_speed_mps",
@@ -171,6 +172,12 @@ def generate_launch_description():
             # How far off the lane still counts as on-station. Oscillation about the lane
             # is expected and harmless; the arm's reach is what actually constrains it.
             DeclareLaunchArgument("station_radius_tol_m", default_value="0.9"),
+            # Radial band at which an already-held station is GIVEN UP. Wider than the
+            # band to take one, because dropping station keeping also releases the
+            # sim-side anchor that pulls the hull back onto the lane -- so a single band
+            # turns the drift that follows parking into a lap round the site. That is
+            # what had rank 3 laying one rock to its neighbours' four.
+            DeclareLaunchArgument("station_radius_release_m", default_value="1.05"),
             # Station keeping, retuned for the build cycle. The station now steps ONE WALL
             # SLOT at a time -- 0.9 m of course, 0.99 m of lane -- where it used to jump 30
             # degrees per harvest cycle, so the old bands are the wrong size by an order of

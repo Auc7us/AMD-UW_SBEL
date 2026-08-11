@@ -84,17 +84,46 @@ inline constexpr double robot_spawn_radius = 42.0;
 // radius it is a band around.
 inline constexpr double drop_band_half_width = 2.0;
 
-// Harvest cycles. Each time a collector finishes a load and dumps it, its whole
-// lane -- rock line, drop point, and the builder it feeds -- rotates one step
-// counter-clockwise about the site centre, and a fresh set of rocks is spawned on
-// the new line. Everything below therefore takes a cycle index, and every position
-// for a rank derives from the single angle RankRayAngleRad(rank, N, cycle). Nothing
-// else needs to know a cycle happened.
+// Arc between neighbouring rocks in the laid course, measured on the work circle. About
+// 2x a 0.2-scale rock's width, so the course reads as laid stones with a gap rather than
+// a fused kerb -- and it makes each build step 0.9/30*33 = 0.99 m of lane, which is the
+// "move a tiny bit and put the next one down beside it" the wall is built by.
 //
-// Note 360/30 = 12, so after 12 cycles a rank's lane lands on the lane another rank
-// started from. Ranks are separate ChSystems and never interact physically, so this
-// only means dumped piles overlap in the aggregated view.
-inline constexpr double cycle_rotation_rad = 30.0 * chrono::CH_DEG_TO_RAD;
+// Declared up here, ahead of the harvest cycle, because the harvest lane is measured in
+// these slots -- see HarvestDropSlot.
+inline constexpr double wall_slot_pitch_m = 0.9;
+inline constexpr double wall_slot_pitch_rad = wall_slot_pitch_m / work_circle_radius;
+
+// How many rocks the builder starts with, heaped beside its lane, and how many its
+// collector brings back per round trip.
+//
+// The seed heap exists only to give the builder something to do during the collector's
+// first outbound leg, which is minutes of sim long. After that the builder eats what the
+// collector delivers, and nothing else.
+inline constexpr int builder_seed_rock_count = 6;
+inline constexpr int harvest_rocks_per_load = 2;
+
+// Harvest cycles. Each time a collector finishes a load and dumps it, its whole lane --
+// rock line, drop point, and the rocks it will fetch next -- steps counter-clockwise
+// about the site centre, and a fresh set of rocks is spawned on the new line.
+//
+// The step is measured in WALL SLOTS, not in a round number of degrees, and that is the
+// point of this whole arrangement: the drop point lands exactly where the builder's wall
+// will have reached by the time that load arrives. Cycle c drops at slot
+// seed + c*load, and the builder is at slot seed + c*load once it has laid the seed and
+// every load before this one. So the pile is always within the arm's reach of the station
+// the builder is already driving to, and the builder clears each pile off the collector
+// circle before the collector comes back to that stretch of it.
+//
+// It was a flat 30 deg, which at 0.03 rad/slot is 17 slots -- a load of two rocks every
+// 17 slots leaves a wall that is 88% gaps, and puts every pile 15 m of arc from the
+// builder that is supposed to eat it.
+inline int HarvestDropSlot(int cycle) {
+    return builder_seed_rock_count + (cycle < 0 ? 0 : cycle) * harvest_rocks_per_load;
+}
+inline double HarvestLaneOffsetRad(int cycle) {
+    return HarvestDropSlot(cycle) * wall_slot_pitch_rad;
+}
 
 // One colour per rank, so a collector and the builder it feeds read as a matched pair
 // and the ranks can be told apart in a wide shot. Everything belonging to rank i is
@@ -152,23 +181,20 @@ inline chrono::ChColor ArmGrey() {
 // Both take the extents from here, or the copy would draw rocks resting in mid-air
 // over a bed of the wrong size. Masses, materials and joints are not shared.
 inline constexpr double trailer_bed_floor_x = 1.0;  // along the trailer
-// The tub is ASYMMETRIC across the trailer because it discharges to the left (+y).
+// The tub is SYMMETRIC across the trailer and discharges REARWARD, over the -x lip.
 //
-// The trailer's wheels sit at y = +/-0.5 with a 0.4089 m tire radius, so the left tire
-// spans y = 0.35..0.65 and its top is at z = +0.159 in the trailer chassis frame -- only
-// 21 mm below the old bed's lip at +0.18. A symmetric 1.2 m tub therefore discharges
-// straight onto its own wheel. Tilting harder makes it WORSE, not better: the horizontal
-// reach of a lip a distance d from the tilt axis is d*cos(theta), so at the 55 deg dump
-// angle a lip at 0.6 m ends up at 0.34 m -- further inboard, right over the tire.
-//
-// So the discharge side is extended to 0.8 m, clear of the tire's 0.65 m outer edge, and
-// the tilt axis is put ON that lip (see InitializeTrailerBed) so it does not move inboard
-// as the tub rotates. The right side is unchanged.
-inline constexpr double trailer_bed_right_y = 0.6;      // -y wall, unchanged
-inline constexpr double trailer_bed_discharge_y = 0.8;  // +y open lip, outboard of the tire
-inline constexpr double trailer_bed_floor_y = trailer_bed_right_y + trailer_bed_discharge_y;
-// Centre of the tub in the trailer frame: offset left by the extra overhang.
-inline constexpr double trailer_bed_center_y = 0.5 * (trailer_bed_discharge_y - trailer_bed_right_y);
+// It spent a while discharging to the left instead, which forced the tub off-centre: the
+// trailer's wheels sit at y = +/-0.5 with a 0.4089 m tire radius, so the left tire spans
+// y = 0.35..0.65 and its top is only 21 mm below the bed lip -- a symmetric tub pouring
+// sideways empties onto its own wheel, and the discharge side had to be pushed out to
+// 0.8 m to clear it. Rear discharge has no such conflict (nothing is behind the tailgate
+// but ground), so the tub goes back to sitting on the trailer centreline, which is also
+// where RosArmBridge's 4x4 placement grid has always aimed.
+inline constexpr double trailer_bed_half_y = 0.6;
+inline constexpr double trailer_bed_floor_y = 2.0 * trailer_bed_half_y;
+inline constexpr double trailer_bed_center_y = 0.0;
+// Half-length along the trailer; the rear lip (-x) is the pour line and the tilt axis.
+inline constexpr double trailer_bed_half_x = 0.5 * trailer_bed_floor_x;
 inline constexpr double trailer_bed_wall_height = 0.15;
 inline constexpr double trailer_bed_thickness = 0.03;
 
@@ -178,65 +204,76 @@ struct TrailerBedBox {
     chrono::ChVector3d center;
 };
 
-// Floor, both end (+/-x) walls and the right (-y) wall. The LEFT (+y) side is open,
-// closed by the hinged tailgate -- see TrailerTailgateBox. The trailer used to discharge
-// rearward (-x open, tailgate across the back); it now discharges to the left so the
-// collector can pour while running tangentially past its drop point instead of turning
-// around next to its own builder.
+// Floor, the +x front wall and both (+/-y) side walls. The REAR (-x) side is open,
+// closed by the hinged tailgate -- see TrailerTailgateBox.
 inline std::array<TrailerBedBox, 4> TrailerBedBoxes() {
     const double ex = trailer_bed_floor_x;
     const double ey = trailer_bed_floor_y;
-    const double cy = trailer_bed_center_y;
     const double h = trailer_bed_wall_height;
     const double t = trailer_bed_thickness;
     return {{
-        {chrono::ChVector3d(ex, ey, t), chrono::ChVector3d(0.0, cy, 0.0)},           // floor
-        {chrono::ChVector3d(t, ey, h), chrono::ChVector3d(ex / 2.0, cy, h / 2.0)},   // +x front wall
-        {chrono::ChVector3d(t, ey, h), chrono::ChVector3d(-ex / 2.0, cy, h / 2.0)},  // -x rear wall
-        {chrono::ChVector3d(ex, t, h),
-         chrono::ChVector3d(0.0, -trailer_bed_right_y, h / 2.0)},                    // -y right wall
+        {chrono::ChVector3d(ex, ey, t), chrono::ChVector3d(0.0, 0.0, 0.0)},                    // floor
+        {chrono::ChVector3d(t, ey, h), chrono::ChVector3d(trailer_bed_half_x, 0.0, h / 2.0)},  // +x front
+        {chrono::ChVector3d(ex, t, h), chrono::ChVector3d(0.0, trailer_bed_half_y, h / 2.0)},  // +y side
+        {chrono::ChVector3d(ex, t, h), chrono::ChVector3d(0.0, -trailer_bed_half_y, h / 2.0)}, // -y side
     }};
 }
 
-// The hinged left wall, in ITS OWN body frame. It runs along the trailer (ex long) rather
-// than across it, because it now closes the long open side rather than the short back.
+// The hinged rear wall, in ITS OWN body frame. It runs ACROSS the trailer (ey wide),
+// closing the short open end.
 inline TrailerBedBox TrailerTailgateBox() {
-    return {chrono::ChVector3d(trailer_bed_floor_x, trailer_bed_thickness, trailer_bed_wall_height),
+    return {chrono::ChVector3d(trailer_bed_thickness, trailer_bed_floor_y, trailer_bed_wall_height),
             chrono::ChVector3d(0.0, 0.0, 0.0)};
 }
 
-// Angle of the ray owned by one rank. The rank's builder and its collector share
-// this angle, which is what puts the collector on the line joining the site
-// centre to its builder.
-inline double RankRayAngleRad(int rank_index, int num_ranks, int cycle = 0) {
+// Angle of the ray owned by one rank -- the BASE ray, which never moves. The builder's
+// wall starts on it (slot 0) and grows counter-clockwise from there.
+//
+// This deliberately takes no cycle argument any more. The builder's course is fixed
+// site geometry; only the COLLECTOR's lane walks, and it walks along the builder's own
+// slots rather than in a step of its own -- see HarvestLaneAngleRad. Passing a cycle
+// here was how the builder's whole plan used to get dragged along with the harvest.
+inline double RankRayAngleRad(int rank_index, int num_ranks) {
     if (num_ranks <= 0)
         return 0.0;
-    return chrono::CH_2PI * static_cast<double>(rank_index) / static_cast<double>(num_ranks) +
-           static_cast<double>(cycle) * cycle_rotation_rad;
+    return chrono::CH_2PI * static_cast<double>(rank_index) / static_cast<double>(num_ranks);
 }
 
-inline chrono::ChVector3d PointOnSiteRay(int rank_index, int num_ranks, double radius, int cycle = 0) {
-    const double angle = RankRayAngleRad(rank_index, num_ranks, cycle);
+// Angle of the COLLECTOR's lane on a given harvest cycle: the base ray, advanced by the
+// wall slots the builder will have laid by the time that load lands. See HarvestDropSlot.
+inline double HarvestLaneAngleRad(int rank_index, int num_ranks, int cycle) {
+    return RankRayAngleRad(rank_index, num_ranks) + HarvestLaneOffsetRad(cycle);
+}
+
+inline chrono::ChVector3d PointOnSiteRay(int rank_index, int num_ranks, double radius) {
+    const double angle = RankRayAngleRad(rank_index, num_ranks);
+    return chrono::ChVector3d(site_center_x + radius * std::cos(angle),
+                              site_center_y + radius * std::sin(angle), 0.0);
+}
+
+inline chrono::ChVector3d PointOnHarvestLane(int rank_index, int num_ranks, double radius, int cycle) {
+    const double angle = HarvestLaneAngleRad(rank_index, num_ranks, cycle);
     return chrono::ChVector3d(site_center_x + radius * std::cos(angle),
                               site_center_y + radius * std::sin(angle), 0.0);
 }
 
 // The rank's drop point: where the collector parks to unload, and the origin of its
-// rock line. Also the initial home published to the drive controller.
+// rock line. Also the initial home published to the drive controller. On the harvest
+// lane, so it lands beside the stretch of wall the builder is about to build.
 inline chrono::ChVector3d InitialGroundPositionForRobot(int robot_index, int num_robots, int cycle = 0) {
-    return PointOnSiteRay(robot_index, num_robots, robot_start_radius, cycle);
+    return PointOnHarvestLane(robot_index, num_robots, robot_start_radius, cycle);
 }
 
-// Where the rover is placed at t=0 -- further out on the same ray, clear of the
+// Where the rover is placed at t=0 -- further out on its own cycle-0 lane, clear of the
 // builder. See robot_spawn_radius.
 inline chrono::ChVector3d InitialSpawnPositionForRobot(int robot_index, int num_robots, int cycle = 0) {
-    return PointOnSiteRay(robot_index, num_robots, robot_spawn_radius, cycle);
+    return PointOnHarvestLane(robot_index, num_robots, robot_spawn_radius, cycle);
 }
 
 // Radially outward, away from the site: the rock line runs into open field
 // instead of back across the build area and its own builder.
 inline double InitialHeadingRadForRobot(int robot_index, int num_robots, int cycle = 0) {
-    return RankRayAngleRad(robot_index, num_robots, cycle);
+    return HarvestLaneAngleRad(robot_index, num_robots, cycle);
 }
 
 inline chrono::ChVector3d RockLineForwardForRobot(int robot_index, int num_robots, int cycle = 0) {
@@ -250,13 +287,13 @@ inline chrono::ChVector3d GroundPositionAlongRockLine(int robot_index, int num_r
            RockLineForwardForRobot(robot_index, num_robots, cycle) * distance;
 }
 
-inline chrono::ChVector3d BuilderOrbitGroundPosition(int builder_index, int num_builders, int cycle = 0) {
-    return PointOnSiteRay(builder_index, num_builders, builder_path_radius, cycle);
+inline chrono::ChVector3d BuilderOrbitGroundPosition(int builder_index, int num_builders) {
+    return PointOnSiteRay(builder_index, num_builders, builder_path_radius);
 }
 
-inline double BuilderOrbitHeadingRad(int builder_index, int num_builders, int cycle = 0) {
+inline double BuilderOrbitHeadingRad(int builder_index, int num_builders) {
     // Counter-clockwise tangent to the orbit.
-    return RankRayAngleRad(builder_index, num_builders, cycle) + 0.5 * chrono::CH_PI;
+    return RankRayAngleRad(builder_index, num_builders) + 0.5 * chrono::CH_PI;
 }
 
 // ---------------------------------------------------------------------------
@@ -264,15 +301,22 @@ inline double BuilderOrbitHeadingRad(int builder_index, int num_builders, int cy
 //
 // The builder runs this on its OWN schedule -- it is not triggered by, gated on, or
 // indexed by the collector's harvest cycle. It walks counter-clockwise along its lane
-// laying a course of rocks on the work circle, one slot at a time, taking each rock
-// from a feedstock heap sitting outboard of its lane.
+// laying a course of rocks on the work circle, one slot at a time.
 //
 // EVERYTHING here is derived from one integer, the wall slot index k, so the arm, the
 // drive station and the feedstock all agree by construction rather than by tuning:
 //
 //   wall slot k   -> work_circle_radius,      angle ray + k*slot_pitch_rad
 //   station k     -> builder_path_radius,     angle ray + k*slot_pitch_rad + arm_lead
-//   heap for k    -> builder_pile_radius,     angle of the station at the heap's centre
+//   seed heap     -> builder_pile_radius,     angle of the station at its centre
+//   load c        -> robot_start_radius,      angle of slot HarvestDropSlot(c)
+//
+// The last two are the SOURCES of rock, and there is only one of the first: a single
+// seed heap of builder_seed_rock_count rocks. After that the builder eats what its
+// collector drops on the collector circle, which HarvestDropSlot puts at the slot the
+// builder will have reached. So both sources land in the same place relative to the
+// arm base -- radially outboard of the station it is already driving to -- and neither
+// needs the arm to leave its lane.
 //
 // arm_lead exists because the arm is mounted 2.5 m BACK along a hull parked tangentially,
 // so the arm base sits at hypot(33, 2.5) = 33.095 m, trailing the hull's own station angle
@@ -281,24 +325,21 @@ inline double BuilderOrbitHeadingRad(int builder_index, int num_builders, int cy
 // work circle (3.095 m) and the reach to the heap (3.5 m) land mid-band every time.
 // ---------------------------------------------------------------------------
 
-// Arc between neighbouring rocks in the laid course, measured on the work circle. About
-// 2x a 0.2-scale rock's width, so the course reads as laid stones with a gap rather than
-// a fused kerb -- and it makes each build step 0.9/30*33 = 0.99 m of lane, which is the
-// "move a tiny bit and put the next one down beside it" the wall is built by.
-inline constexpr double wall_slot_pitch_m = 0.9;
-inline constexpr double wall_slot_pitch_rad = wall_slot_pitch_m / work_circle_radius;
+// wall_slot_pitch_m / wall_slot_pitch_rad are declared with the harvest cycle above,
+// because the harvest lane is measured in these slots.
 
-// Where the feedstock heaps sit: 3.5 m radially outboard of the arm base, mid-way through
-// the 2.78-4.44 m band the arm proved in service.
+// Where the seed heap sits: 3.5 m radially outboard of the arm base, mid-way through
+// the 2.78-4.44 m band the arm proved in service. Close to robot_start_radius (37.0) on
+// purpose -- the heap is standing in for a delivered load, so it should sit where one does.
 inline constexpr double builder_pile_radius = 36.6;
 
-// One heap serves this many consecutive slots. The builder creeps ~1 m per slot, so over
-// four of them the heap goes from 1.5 m ahead to 1.5 m behind the arm base -- reach
-// hypot(3.5, 1.5) = 3.81 m at worst, still inside the band. Then it moves to the next heap.
-inline constexpr int wall_slots_per_pile = 4;
-
-// How many heaps to lay out per builder, before the sector cap below applies.
-inline constexpr int builder_pile_count = 6;
+// The seed heap serves the first builder_seed_rock_count slots and is centred on the
+// middle of that run, so the builder reaches it from either end. The builder creeps
+// ~1 m of lane per slot, so across six slots the heap goes from 2.5 slots ahead of the
+// arm base to 2.5 behind: reach hypot(3.5, 2.7) = 4.4 m at the extremes, inside the
+// 5.2 m guard, mid-band at the centre.
+inline constexpr int wall_slots_per_pile = builder_seed_rock_count;
+inline constexpr int builder_pile_count = 1;
 
 // Trailing angle from the hull's station to its arm base. See the block comment.
 inline constexpr double builder_arm_mount_back_m = 2.5;
@@ -306,16 +347,19 @@ inline double BuilderArmLeadRad() {
     return std::atan2(builder_arm_mount_back_m, builder_path_radius);
 }
 
-// Total slots this builder may lay. Capped so a rank's course never runs into the next
-// rank's sector: with N builders each owns 2*pi/N of lane, and 0.7 of it leaves room for
-// the machine itself (2.686 m wide) at either end.
+// Total slots this builder may lay. No longer tied to how many heaps were laid out --
+// the feedstock is a stream now, not a fixed larder -- so this is purely the sector cap:
+// with N builders each owns 2*pi/N of lane, and 0.7 of it leaves room for the machine
+// itself (2.686 m wide) at either end. A rank's course must never run into the next
+// rank's sector.
 inline int BuilderWallSlotCount(int num_builders) {
-    const int desired = builder_pile_count * wall_slots_per_pile;
+    // Enough wall for a very long run; the cap below is what actually binds for N > 1.
+    constexpr int desired = 200;
     if (num_builders <= 1)
         return desired;
     const double sector_rad = chrono::CH_2PI / static_cast<double>(num_builders);
     const int cap = static_cast<int>(0.7 * sector_rad / wall_slot_pitch_rad);
-    return std::max(wall_slots_per_pile, std::min(desired, cap));
+    return std::max(builder_seed_rock_count, std::min(desired, cap));
 }
 
 // Ground position of wall slot k, z left at 0 for the caller to probe against terrain.
@@ -338,8 +382,8 @@ inline double BuilderStationAngleRad(int builder_index, int num_builders, int sl
 // hull, since it is the origin of the IK frame.
 inline constexpr double builder_arm_base_radius_approx = 33.0946;  // hypot(33, 2.5)
 
-// Centre of the feedstock heap serving slots [pile*P, pile*P + P), placed at the middle
-// of that run so it is never more than ~1.5 m of lane from the arm base working it.
+// Centre of the seed heap serving slots [pile*P, pile*P + P), placed at the middle
+// of that run so it is never more than ~2.7 m of lane from the arm base working it.
 //
 // NO arm_lead here. The heap must be radially outboard of the ARM BASE, and the arm base
 // already sits at the slot's own angle -- adding the lead again shifts the heap a further

@@ -78,9 +78,15 @@ class RobotRig {
     }
     void ResetGuardStats() { m_guard_steps = m_guard_limited_steps = 0; }
     double GetSpeed() const { return m_vehicle->GetSpeed(); }
-    // Current harvest cycle. The rank's lane angle is
-    // RankRayAngleRad(robot_index, num_robots, GetHarvestCycle()).
+    // Current harvest cycle. The collector's lane angle is
+    // HarvestLaneAngleRad(robot_index, num_robots, GetHarvestCycle()).
     int GetHarvestCycle() const { return m_harvest_cycle; }
+
+    // Rocks this rank's collector has delivered: dumped out of the bed, come to rest,
+    // and frozen. These are the builder's feedstock once its seed heap is gone -- they
+    // stay fixed exactly as the seed heap's rocks do, so the pile does not creep, and
+    // LrvArm unfixes whichever one its gripper locks on to.
+    std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> GetDeliveredRocks() const;
     // True once this rank's physics has produced a non-finite value. Nothing this
     // rig reports afterwards is meaningful, so the caller should stop the run
     // rather than spend hours simulating a dead rank.
@@ -119,10 +125,9 @@ class RobotRig {
 #endif
     void Settle(chrono::vehicle::ChTerrain& terrain, double settle_time, double step_size);
     void UpdateRockCollisionActivation();
-    // Freeze rocks that have been dumped and come to rest, so they stop creeping
-    // away from the pile, and release them when the builder engages them.
+    // Freeze rocks that have been dumped and come to rest, so they stop creeping away
+    // from the pile. They stay frozen: see the comment above GetDeliveredRocks.
     void UpdateDumpedRockFreeze(double time);
-    bool BuilderIsNear(const std::shared_ptr<chrono::ChBodyAuxRef>& rock, double radius) const;
     // Watches each trailer wheel for the two things that can launch one wheel out
     // of nowhere: a discontinuous terrain-height query under it, and a tire
     // vertical force far above its own settled load. See the definition.
@@ -188,19 +193,12 @@ class RobotRig {
     // can report whether they actually left it. See ReportDumpOutcome.
     std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> m_carried_rocks;
     // Per-wheel sunk latch (tractor wheels first, then trailer). See CheckWheelSinkage.
-    // Dumped rocks waiting to come to rest, then the ones frozen in place. See
-    // UpdateDumpedRockFreeze.
+    // Dumped rocks waiting to come to rest. See UpdateDumpedRockFreeze.
     std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> m_settling_rocks;
-    // A frozen rock plus when it was frozen and the contact force it carries at
-    // rest. The resting load has to be measured a moment AFTER the freeze and then
-    // subtracted, or the ground reaction the rock was already carrying reads as the
-    // builder having touched it. See UpdateDumpedRockFreeze.
-    struct FrozenRock {
-        std::shared_ptr<chrono::ChBodyAuxRef> rock;
-        double frozen_at = 0.0;
-        double baseline_force = -1.0;  // negative until measured
-    };
-    std::vector<FrozenRock> m_frozen_rocks;
+    // Delivered feedstock: dumped, settled, frozen, and offered to the builder. Grows
+    // by one load per harvest cycle and is never pruned -- the builder tracks which of
+    // them it has already consumed.
+    std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> m_delivered_rocks;
     std::map<const chrono::ChBody*, double> m_rock_still_since;
     std::vector<bool> m_wheel_sunk;
     int m_sink_reports = 0;

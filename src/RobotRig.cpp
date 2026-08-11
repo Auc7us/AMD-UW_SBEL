@@ -52,9 +52,6 @@ constexpr int divergence_max_reports = 6;
 // Dumped-rock freeze. See RobotRig::UpdateDumpedRockFreeze.
 constexpr double dumped_rock_settle_speed = 0.05;   // m/s below which it counts as at rest
 constexpr double dumped_rock_settle_dwell = 1.0;    // s it must stay there before freezing
-constexpr double dumped_rock_baseline_delay = 0.25; // s after freezing before trusting a force reading
-constexpr double dumped_rock_release_margin = 40.0; // N above the rock's resting load = pushed
-constexpr double dumped_rock_release_radius = 3.0;  // m from a builder body: backstop release
 
 bool IsFinite(const chrono::ChVector3d& v) {
     return std::isfinite(v.x()) && std::isfinite(v.y()) && std::isfinite(v.z());
@@ -434,8 +431,8 @@ void RobotRig::InitializeTrailerBed() {
     const chrono::ChVector3d offset(0.0, 0.0, 0.03);  // bed floor just above the trailer chassis
     const chrono::ChVector3d bed_pos = chassis->GetPos() + chassis->GetRot().Rotate(offset);
 
-    // Open dumping tub (floor + both +/-x end walls + the -y right wall, open on the
-    // LEFT +y side), a DYNAMIC body carried by the trailer through a longitudinal-axis
+    // Open dumping tub (floor + the +x front wall + both +/-y side walls, open at the
+    // REAR -x end), a DYNAMIC body carried by the trailer through a lateral-axis
     // revolute motor held flat. Unlike the old fixed/teleported plate, a jointed dynamic
     // bed has real velocity, so friction keeps placed rocks aboard while driving.
     // Extents come from RobotLayout so the sensor rank's visual-only copy of this bed
@@ -475,7 +472,7 @@ void RobotRig::InitializeTrailerBed() {
         visual->SetColor(bed_color);
         body->AddVisualShape(visual, frame);
     };
-    // Floor, +x front wall, +/-y side walls. Rear is open for the tailgate.
+    // Floor, +x front wall, +/-y side walls. The rear (-x) is open for the tailgate.
     for (const auto& box : TrailerBedBoxes()) {
         add_box(m_trailer_bed, box.size.x(), box.size.y(), box.size.z(), box.center.x(), box.center.y(),
                 box.center.z());
@@ -483,12 +480,11 @@ void RobotRig::InitializeTrailerBed() {
     m_trailer_bed->EnableCollision(true);
     GetSystem()->AddBody(m_trailer_bed);
 
-    // Hinged LEFT tailgate (+y): a separate dynamic body, connected to the bed with a
-    // revolute joint about the trailer longitudinal (X) axis. It sits on the discharge
-    // lip, outboard of the left wheel.
-    const chrono::ChVector3d tailgate_center_local(0.0, trailer_bed_discharge_y + t / 2.0,
+    // Hinged REAR tailgate (-x): a separate dynamic body, connected to the bed with a
+    // revolute joint about the trailer lateral (Y) axis, sitting on the rear pour lip.
+    const chrono::ChVector3d tailgate_center_local(-(trailer_bed_half_x + t / 2.0), 0.0,
                                                    t / 2.0 + wall_h / 2.0);
-    const chrono::ChVector3d tailgate_hinge_local(0.0, trailer_bed_discharge_y + t / 2.0, t / 2.0);
+    const chrono::ChVector3d tailgate_hinge_local(-(trailer_bed_half_x + t / 2.0), 0.0, t / 2.0);
     const chrono::ChVector3d tailgate_pos = bed_pos + chassis->GetRot().Rotate(tailgate_center_local);
 
     m_trailer_tailgate = chrono_types::make_shared<chrono::ChBody>();
@@ -497,11 +493,11 @@ void RobotRig::InitializeTrailerBed() {
     m_trailer_tailgate->SetRot(chassis->GetRot());
     const double tailgate_mass = 5.0;
     m_trailer_tailgate->SetMass(tailgate_mass);
-    // Gate box is (ex, t, wall_h) now that it runs along the trailer, not across it.
+    // Gate box is (t, ey, wall_h): it runs ACROSS the trailer, closing the open rear end.
     m_trailer_tailgate->SetInertiaXX(
-        chrono::ChVector3d(tailgate_mass / 12.0 * (t * t + wall_h * wall_h),
-                           tailgate_mass / 12.0 * (ex * ex + wall_h * wall_h),
-                           tailgate_mass / 12.0 * (ex * ex + t * t)));
+        chrono::ChVector3d(tailgate_mass / 12.0 * (ey * ey + wall_h * wall_h),
+                           tailgate_mass / 12.0 * (t * t + wall_h * wall_h),
+                           tailgate_mass / 12.0 * (t * t + ey * ey)));
     {
         const auto gate = TrailerTailgateBox();
         add_box(m_trailer_tailgate, gate.size.x(), gate.size.y(), gate.size.z(), gate.center.x(), gate.center.y(),
@@ -512,11 +508,11 @@ void RobotRig::InitializeTrailerBed() {
 
     // Tailgate hinge as a rotation motor held at angle 0 -> the gate stays CLOSED
     // (a free revolute here just dangled open, since a bottom-hinged flap is
-    // unstable upright under gravity). Motor turns about frame Z, so rotate -90 deg
-    // about Y to put Z on the trailer's -X axis: about -X, the gate's top (+z) swings
-    // toward +y, i.e. the gate falls OUTWARD into a chute. About +X it would swing
-    // inward into the tub.
-    const chrono::ChQuaternion<> tailgate_hinge_rot = chassis->GetRot() * chrono::QuatFromAngleY(-chrono::CH_PI_2);
+    // unstable upright under gravity). Motor turns about frame Z, so rotate +90 deg
+    // about X to put Z on the trailer's -Y axis: about -Y, the gate's top (+z) swings
+    // toward -x, i.e. the gate falls REARWARD and outward into a chute. About +Y it
+    // would swing forward into the tub.
+    const chrono::ChQuaternion<> tailgate_hinge_rot = chassis->GetRot() * chrono::QuatFromAngleX(chrono::CH_PI_2);
     const chrono::ChVector3d tailgate_hinge_pos = bed_pos + chassis->GetRot().Rotate(tailgate_hinge_local);
     m_trailer_tailgate_hinge = chrono_types::make_shared<chrono::ChLinkMotorRotationAngle>();
     m_trailer_tailgate_hinge->SetName("trailer_tailgate_hinge");
@@ -525,21 +521,21 @@ void RobotRig::InitializeTrailerBed() {
     m_trailer_tailgate_hinge->SetAngleFunction(chrono_types::make_shared<chrono::ChFunctionConst>(0.0));
     GetSystem()->AddLink(m_trailer_tailgate_hinge);
 
-    // Revolute motor about the chassis longitudinal (-X) axis, positioned ON THE
-    // DISCHARGE LIP rather than at the tub centre. Held at 0 => bed stays flat.
+    // Revolute motor about the chassis lateral (-Y) axis, positioned ON THE REAR POUR
+    // LIP rather than at the tub centre. Held at 0 => bed stays flat.
     //
-    // The axis placement is the whole trick. Hinge at the tub centre and the lip sweeps
-    // inboard as d*cos(theta) -- at the 55 deg dump angle a lip at 0.8 m ends up at
-    // 0.46 m, back over the left tire (0.35..0.65). Hinging ON the lip leaves it fixed in
-    // space: the tub's right side lifts, the floor slopes left, and the load pours over a
-    // pour line that stays at y = +0.8, clear of the wheel. That is how a real side-dump
-    // body works, and it is why this is not simply the old rear-dump with a different axis.
+    // The axis placement matters as much as its direction. Hinge at the tub centre and
+    // the rear lip sweeps forward as d*cos(theta), so at the 55 deg dump angle a lip
+    // 0.5 m behind the centre ends up 0.29 m behind it -- the pour line walks under the
+    // trailer as the tub rises. Hinging ON the lip leaves it fixed in space: the front
+    // of the tub lifts, the floor slopes back, and the load pours over a pour line that
+    // stays put behind the tailgate.
     //
-    // -X, not +X: about -X a positive angle lifts the -y side, tipping the floor toward
-    // the open +y lip. About +X the same angle would tip it into the closed right wall.
-    const chrono::ChQuaternion<> frame_rot = chassis->GetRot() * chrono::QuatFromAngleY(-chrono::CH_PI_2);
+    // -Y, not +Y: about -Y a positive angle lifts the +x front, tipping the floor toward
+    // the open rear. About +Y the same angle would tip it into the closed front wall.
+    const chrono::ChQuaternion<> frame_rot = chassis->GetRot() * chrono::QuatFromAngleX(chrono::CH_PI_2);
     const chrono::ChVector3d bed_hinge_pos =
-        bed_pos + chassis->GetRot().Rotate(chrono::ChVector3d(0.0, trailer_bed_discharge_y, 0.0));
+        bed_pos + chassis->GetRot().Rotate(chrono::ChVector3d(-trailer_bed_half_x, 0.0, 0.0));
     m_trailer_bed_motor = chrono_types::make_shared<chrono::ChLinkMotorRotationAngle>();
     m_trailer_bed_motor->Initialize(m_trailer_bed, chassis, chrono::ChFramed(bed_hinge_pos, frame_rot));
     m_trailer_bed_motor->SetAngleFunction(chrono_types::make_shared<chrono::ChFunctionConst>(0.0));
@@ -550,8 +546,8 @@ namespace {
 
 // Dump cycle geometry and timing.
 //
-// The bed is hinged about the trailer longitudinal axis, on the open LEFT lip, so a
-// positive tilt of this size lifts the right side and the load slides out sideways
+// The bed is hinged about the trailer lateral axis, on the open REAR lip, so a
+// positive tilt of this size lifts the front and the load slides out backwards
 // over that lip. The angle MUST exceed the friction angle of the bed material, and the
 // previous 40 deg did not: the bed is mu = 0.9, a rock slides only when
 // tan(theta) > mu, and arctan(0.9) = 42.0 deg. At 40 deg (tan = 0.839) the load is
@@ -575,9 +571,8 @@ constexpr double dump_dwell_time = 3.0;
 // Matches the placement grid in RosArmBridge (bed floor ~1.0 x 1.2 m), with a little
 // margin so a rock resting against a wall still counts as in the bed.
 constexpr double bed_half_length = 0.7;
-// The tub is offset left (see trailer_bed_center_y), so this half-width is measured
-// about that centre, not about the trailer centreline -- otherwise a rock sitting
-// against the new +0.8 m discharge lip reads as having already left the bed.
+// The tub is centred on the trailer (trailer_bed_center_y = 0), so this is measured
+// about the centreline, with margin so a rock resting against a side wall still counts.
 constexpr double bed_half_width = 0.5 * trailer_bed_floor_y + 0.2;
 constexpr double bed_clear_height = 1.2;
 // Stuck detector: throttle applied but not moving. See CheckStuck.
@@ -689,7 +684,7 @@ void RobotRig::AdvanceDumpCycle(double time) {
                 // closed front wall. Getting the motor axis sign wrong here does not
                 // fail loudly -- it just presses the load against the front wall and
                 // silently dumps nothing -- so report the two lip heights.
-                const double half_x = 0.5;  // bed floor is 1.0 m along the trailer
+                const double half_x = trailer_bed_half_x;
                 const auto& bed_rot = m_trailer_bed->GetRot();
                 const double front_z = (m_trailer_bed->GetPos() + bed_rot.Rotate({half_x, 0.0, 0.0})).z();
                 const double rear_z = (m_trailer_bed->GetPos() + bed_rot.Rotate({-half_x, 0.0, 0.0})).z();
@@ -734,9 +729,10 @@ void RobotRig::StartNextHarvestCycle(double time) {
     if (!m_terrain)
         return;
 
-    // Rotate this rank's whole lane one step counter-clockwise and spawn a fresh set
-    // of rocks on it. Everything -- rock line, drop point, builder station -- comes
-    // from RankRayAngleRad(rank, N, cycle), so rotating is just advancing the index.
+    // Step this rank's COLLECTOR lane counter-clockwise and spawn a fresh set of rocks
+    // on it. Rock line and drop point both come from HarvestLaneAngleRad(rank, N, cycle),
+    // so stepping the lane is just advancing the index. The builder's course does not
+    // move with it -- the lane steps ALONG that course; see HarvestDropSlot.
     const size_t first_new = m_rocks.size();
     auto new_rocks = AddRockFields(GetSystem(), *m_terrain, m_rock_mat, m_chrono_data_path, m_amd_uw_data_path,
                                    m_robot_index, m_num_robots, m_height_probe_z, m_rock_field_config,
@@ -781,7 +777,8 @@ void RobotRig::StartNextHarvestCycle(double time) {
         ros_driver->SetHomePosition(home);
 #endif
 
-    const double angle_deg = RankRayAngleRad(m_robot_index, m_num_robots, m_harvest_cycle) * chrono::CH_RAD_TO_DEG;
+    const double angle_deg =
+        HarvestLaneAngleRad(m_robot_index, m_num_robots, m_harvest_cycle) * chrono::CH_RAD_TO_DEG;
     std::cout << "[RobotRig] rank " << m_rank << " harvest cycle " << m_harvest_cycle << " at t=" << time
               << ": lane rotated to " << angle_deg << " deg, spawned " << (m_rocks.size() - first_new)
               << " rock(s), new drop point (" << home.x() << ", " << home.y() << "), "
@@ -864,81 +861,37 @@ void RobotRig::UpdateDumpedRockFreeze(double time) {
         rock->SetFixed(true);
         rock->EnableCollision(true);
         const auto p = rock->GetPos();
-        std::cout << "[RobotRig] rank " << m_rank << " dumped rock FROZEN at t=" << time << " at (" << p.x()
-                  << ", " << p.y() << ", " << p.z() << "); it will unfreeze when the builder touches it\n";
-        // Baseline is captured LATER, not now: on this step GetContactForce() still
-        // holds the value from when the rock was dynamic and being held up by the
-        // ground, which is tens of newtons. Reading it here and calling it "touched"
-        // released every rock on the same step it was frozen.
-        m_frozen_rocks.push_back({rock, time, -1.0});
+        std::cout << "[RobotRig] rank " << m_rank << " delivered rock FROZEN at t=" << time << " at (" << p.x()
+                  << ", " << p.y() << ", " << p.z() << "); it stays put until the builder's gripper takes it\n";
+        m_delivered_rocks.push_back(rock);
         m_rock_still_since.erase(rock.get());
         it = m_settling_rocks.erase(it);
     }
-
-    // Release when something movable pushes the rock, measured against the rock's OWN
-    // resting load, not against zero -- a frozen rock still reports the tens of
-    // newtons of ground support it was carrying. So settle after the freeze, record
-    // that resting force, and trigger only on a rise above it. Self-calibrating, like
-    // CheckTrailerWheelAnomalies' per-wheel Fz reference.
-    for (auto it = m_frozen_rocks.begin(); it != m_frozen_rocks.end();) {
-        auto& entry = *it;
-        const auto& rock = entry.rock;
-        if (!rock || !rock->IsFixed()) {
-            it = m_frozen_rocks.erase(it);
-            continue;
-        }
-        const double contact = rock->GetContactForce().Length();
-
-        if (entry.baseline_force < 0.0) {
-            if (time - entry.frozen_at < dumped_rock_baseline_delay) {
-                ++it;  // still settling; the reading is not trustworthy yet
-                continue;
-            }
-            entry.baseline_force = std::isfinite(contact) ? contact : 0.0;
-            const auto p = rock->GetPos();
-            std::cout << "[RobotRig] rank " << m_rank << " frozen rock resting load |F|=" << entry.baseline_force
-                      << " N at (" << p.x() << ", " << p.y() << ", " << p.z()
-                      << "); release needs " << dumped_rock_release_margin << " N above that\n";
-            ++it;
-            continue;
-        }
-
-        const bool touched =
-            std::isfinite(contact) && contact > entry.baseline_force + dumped_rock_release_margin;
-        const bool near_builder = BuilderIsNear(rock, dumped_rock_release_radius);
-        if (!touched && !near_builder) {
-            ++it;
-            continue;
-        }
-        rock->SetFixed(false);
-        const auto p = rock->GetPos();
-        std::cout << "[RobotRig] rank " << m_rank << " dumped rock RELEASED at t=" << time << " at (" << p.x()
-                  << ", " << p.y() << ", " << p.z() << "): "
-                  << (touched ? "pushed" : "builder within range") << " |F|=" << contact << " N vs resting "
-                  << entry.baseline_force << " N\n";
-        it = m_frozen_rocks.erase(it);
-    }
 }
 
-// Is any body of the builder that shares this rank's system within `radius` of the
-// rock, measured in the ground plane? The builder lives in the same ChSystem as
-// this rig, so it is found by name rather than by holding a pointer to BuilderRig
-// -- the two are siblings owned by main, and wiring them together for one distance
-// test would couple them for good.
-bool RobotRig::BuilderIsNear(const std::shared_ptr<chrono::ChBodyAuxRef>& rock, double radius) const {
-    if (!rock)
-        return false;
-    const double radius2 = radius * radius;
-    const auto rock_pos = rock->GetPos();
-    for (const auto& body : GetSystem()->GetBodies()) {
-        const std::string name = body->GetName();
-        if (name.find("builder") == std::string::npos && name.find("M113") == std::string::npos &&
-            name.find("m113") == std::string::npos)
-            continue;
-        if (PlanarDistance2(body->GetPos(), rock_pos) <= radius2)
-            return true;
+// A delivered rock is FEEDSTOCK, and feedstock stays where it was put.
+//
+// This used to release a frozen rock again -- unfixing it when its contact force rose
+// above its own resting load, or as a backstop when any builder body came within 3 m --
+// on the theory that a builder driving into a dumped pile should not hit immovable
+// objects. That theory belonged to the version where the pile was in the builder's way.
+// Now the pile IS the builder's larder: it parks beside it deliberately, and both
+// triggers fire exactly then. The proximity one fires as the hull arrives on station,
+// and the force one fires as the gripper's own fingers close on the rock -- so the rock
+// would be unfixed and rolling off down the slope at the precise moment the arm is
+// trying to take hold of it.
+//
+// The invariant is the seed heap's: every rock is fixed, and the only dynamic one is
+// the one the gripper has locked. LrvArm::TryLockRock does that unfixing, and
+// BuilderArmRosBridge re-fixes the rock once it has been laid.
+std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> RobotRig::GetDeliveredRocks() const {
+    std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> out;
+    out.reserve(m_delivered_rocks.size());
+    for (const auto& rock : m_delivered_rocks) {
+        if (rock)
+            out.push_back(rock);
     }
-    return false;
+    return out;
 }
 
 void RobotRig::DumpTrailerBed() {
@@ -1174,6 +1127,14 @@ void RobotRig::UpdateRockCollisionActivation() {
 
     for (const auto& rock : m_rocks) {
         if (rock == active_rock)
+            continue;
+        // A FROZEN rock is delivered feedstock: it is fixed, sitting at the drop point,
+        // waiting for the builder. This loop must not touch it. Deactivation exists to
+        // keep distant DYNAMIC rocks out of the broadphase, and a fixed body is already
+        // free -- but the rover drives away from its own drop point on the very next
+        // cycle, so the distance test would switch off collision on exactly the pile the
+        // gripper is about to close on, and the fingers would pass straight through it.
+        if (rock->IsFixed())
             continue;
         const auto rock_pos = rock->GetPos();
         const double dist2 = std::min(PlanarDistance2(rock_pos, vehicle_pos), PlanarDistance2(rock_pos, trailer_pos));

@@ -113,7 +113,33 @@ class PurePursuitController(Node):
         self.declare_parameter("site_center_x", 0.0)
         self.declare_parameter("site_center_y", 0.0)
         self.declare_parameter("drop_band_half_width_m", 2.0)
-        self.declare_parameter("drop_arc_tolerance_m", 8.0)
+        # Was 8 m, because a rover driving STRAIGHT AT the drop point cannot converge on
+        # it -- pure pursuit orbits a target inside its own turning radius -- so it had to
+        # be accepted from a long way out. The tangential run-in (see home_approach_target)
+        # removes that constraint: the rover arrives moving ALONG the circle, straight at
+        # the drop point, so it can be held to a much tighter arc. 8 m of slack would now
+        # be worse than useless -- the rover would enter the band and park 8 m short of
+        # the pile it is meant to be building, right where the entry waypoint puts it.
+        self.declare_parameter("drop_arc_tolerance_m", 3.0)
+        # Tangential approach to the collector circle. The rover comes home from a rock
+        # line that runs radially OUTWARD from the drop point, so left to itself it
+        # arrives radially -- nose-in at the circumference, with the trailer pointing out
+        # into open field and the load tipping wherever the rover happened to stop.
+        #
+        # Instead it is given two waypoints. The first is on the collector circle,
+        # approach_arc_m of arc CLOCKWISE of the drop point (clockwise = behind it, since
+        # the lane walks counter-clockwise). The second is the drop point itself, reached
+        # by following the circle. By the time the rover has run that arc its heading is
+        # tangential, so the rear-discharging trailer pours a line of rock along the
+        # circumference rather than a heap across it.
+        #
+        # approach_arc_m has to be long enough for the heading to settle -- the rover
+        # turns at ~5 m radius -- and short enough that it is not a detour. Reaching the
+        # entry waypoint is not required to be precise: approach_capture_m accepts it
+        # generously, and everything after that is circle-following.
+        self.declare_parameter("approach_arc_m", 12.0)
+        self.declare_parameter("approach_capture_m", 5.0)
+        self.declare_parameter("approach_lookahead_m", 6.0)
         self.declare_parameter("home_approach_speed_mps", 1.0)
         # Matches pickup_slowdown_offset_m, and for the same reason: on this soil the
         # rover sheds speed slowly, so a short taper means arriving hot and braking
@@ -182,6 +208,9 @@ class PurePursuitController(Node):
         self.sim_time: Optional[float] = None
         # Speed at which the drop band was entered on this cycle: see drive_home.
         self._drop_entry_speed: Optional[float] = None
+        # Latched once the rover has reached the entry waypoint and turned onto the
+        # collector circle: see home_approach_target.
+        self._approach_committed = False
         # When the rover first got within switch_radius of the current drive target
         # while still outside the pickup angle sector: see on_timer.
         # When the active target was selected. One deadline per target (see
@@ -264,6 +293,7 @@ class PurePursuitController(Node):
             self.parked_at_home = False
             self.straighten_until_time_s = None
             self._drop_entry_speed = None
+            self._approach_committed = False
         if not self.have_targets:
             self.have_targets = True
             self.get_logger().info(f"Received {len(self.targets)} targetPos points.")
@@ -322,12 +352,18 @@ class PurePursuitController(Node):
         if len(msg.data) < 2:
             self.get_logger().warn("Ignoring homePos; expected at least [x, y].")
             return
-        self.home = (float(msg.data[0]), float(msg.data[1]))
+        home = (float(msg.data[0]), float(msg.data[1]))
+        if self.home is None or math.hypot(home[0] - self.home[0], home[1] - self.home[1]) > 1e-3:
+            # The drop point moved: the lane stepped to the next harvest cycle. The
+            # run-in has to be flown again for the new one.
+            self._approach_committed = False
+        self.home = home
 
     def on_mission_done(self, msg: Bool) -> None:
         if not msg.data or self.returning_home:
             return
         self.returning_home = True
+        self._approach_committed = False
         self.get_logger().info(
             "mission_done=true; every target is collected or skipped, returning to spawn."
         )
@@ -358,6 +394,67 @@ class PurePursuitController(Node):
         here_angle = math.atan2(self.state.y - cy, self.state.x - cx)
         arc_err = abs(wrap_to_pi(here_angle - home_angle)) * home_radius
         return (radial_err, arc_err, band, arc_tol)
+
+    def home_approach_target(self) -> Tuple[float, float]:
+        """Where to steer on the return leg, so the rover arrives ALONG the circle.
+
+        Two stages, latched by _approach_committed so the switch cannot chatter:
+
+          not committed -- steer at the entry waypoint, approach_arc_m of arc clockwise
+                           of the drop point on the collector circle. Commit once within
+                           approach_capture_m of it, or once the rover is already on the
+                           circle somewhere in the arc between it and the drop point.
+          committed     -- steer at a point ON the circle, approach_lookahead_m of arc
+                           ahead of the rover's own bearing, never past the drop point.
+                           That is pure pursuit with the path as the target instead of
+                           the goal, which is what makes the final heading tangential
+                           rather than radial.
+
+        Falls back to the drop point itself if the geometry cannot be evaluated -- which
+        is the old behaviour, so a missing parameter degrades rather than strands.
+        """
+        if self.home is None or self.state is None:
+            return self.home if self.home is not None else (self.state.x, self.state.y)
+
+        cx = float(self.get_parameter("site_center_x").value)
+        cy = float(self.get_parameter("site_center_y").value)
+        radius = math.hypot(self.home[0] - cx, self.home[1] - cy)
+        arc = abs(float(self.get_parameter("approach_arc_m").value))
+        if radius < 1e-6 or arc <= 0.0:
+            return self.home
+
+        def on_circle(angle: float) -> Tuple[float, float]:
+            return (cx + radius * math.cos(angle), cy + radius * math.sin(angle))
+
+        home_angle = math.atan2(self.home[1] - cy, self.home[0] - cx)
+        here_angle = math.atan2(self.state.y - cy, self.state.x - cx)
+        here_radius = math.hypot(self.state.x - cx, self.state.y - cy)
+        # Signed arc from here to the drop point, positive counter-clockwise -- the
+        # direction the lane walks, and so the direction the run-in travels.
+        arc_to_home = wrap_to_pi(home_angle - here_angle) * radius
+
+        if not self._approach_committed:
+            entry = on_circle(home_angle - arc / radius)
+            capture = abs(float(self.get_parameter("approach_capture_m").value))
+            band = abs(float(self.get_parameter("drop_band_half_width_m").value))
+            near_entry = math.hypot(entry[0] - self.state.x, entry[1] - self.state.y) <= capture
+            # Already on the circle, in the run-in arc: nothing is gained by driving back
+            # to a waypoint the rover has effectively reached.
+            in_run_in = 0.0 <= arc_to_home <= arc and abs(here_radius - radius) <= 2.0 * band
+            if near_entry or in_run_in:
+                self._approach_committed = True
+                self.get_logger().info(
+                    f"On the collector circle {arc_to_home:.1f} m of arc short of the drop "
+                    f"point; running in tangentially."
+                )
+            else:
+                return entry
+
+        lookahead = abs(float(self.get_parameter("approach_lookahead_m").value))
+        # Never aim past the drop point: the run-in ends there, and a lookahead that
+        # overshoots it would carry the rover on round the circle past its own pile.
+        step = max(0.0, min(lookahead, arc_to_home))
+        return on_circle(here_angle + step / radius)
 
     def distance_to_drop_band(self) -> float:
         """Metres still to travel before the drop band is entered; 0 once inside.
@@ -407,8 +504,33 @@ class PurePursuitController(Node):
         if errors is None:
             return (False, "band unavailable")
         radial_err, arc_err, band, arc_tol = errors
-        ok = radial_err <= band and arc_err <= arc_tol
-        return (ok, f"radial {radial_err:.2f}/{band:.2f} m, arc {arc_err:.2f}/{arc_tol:.2f} m")
+        if radial_err <= band and arc_err <= arc_tol:
+            return (True, f"radial {radial_err:.2f}/{band:.2f} m, arc {arc_err:.2f}/{arc_tol:.2f} m")
+
+        # STOP LINE. Once the rover has committed to the tangential run-in it is travelling
+        # along the circle straight at the drop point, so "have I passed it" is a better
+        # arrival test than "am I near it" -- and it is the one that cannot be missed. A
+        # proximity test alone lets a rover that is carrying a little too much speed sail
+        # through the tolerance in a single control period and then spend the rest of the
+        # cycle turning back for a point behind it.
+        if self._approach_committed and self.home is not None and self.state is not None:
+            cx = float(self.get_parameter("site_center_x").value)
+            cy = float(self.get_parameter("site_center_y").value)
+            radius = math.hypot(self.home[0] - cx, self.home[1] - cy)
+            if radius > 1e-6:
+                home_angle = math.atan2(self.home[1] - cy, self.home[0] - cx)
+                here_angle = math.atan2(self.state.y - cy, self.state.x - cx)
+                arc_to_home = wrap_to_pi(home_angle - here_angle) * radius
+                # Radial slack is looser here than the band, because having crossed the
+                # line the rover is where it was going to be and stopping it is better
+                # than sending it round again.
+                if arc_to_home <= 0.0 and radial_err <= 2.0 * band:
+                    return (
+                        True,
+                        f"passed the drop point by {-arc_to_home:.2f} m of arc, "
+                        f"radial {radial_err:.2f}/{band:.2f} m",
+                    )
+        return (False, f"radial {radial_err:.2f}/{band:.2f} m, arc {arc_err:.2f}/{arc_tol:.2f} m")
 
     def drive_home(self) -> None:
         """Drive back to the spawn point, stop there, and report arrival."""
@@ -464,7 +586,9 @@ class PurePursuitController(Node):
         # traction guard only has mu*g ~ 1.3 m/s^2 to give: at 0.6 steering that caps the
         # corner at ~2.9 m/s, above which the guard cuts throttle and adds brake, and the
         # rover oscillates instead of turning. So the turn runs at its own fixed speed.
-        steering = self.compute_steering(self.home)
+        # Not self.home: the return leg follows a two-waypoint path onto the collector
+        # circle so the rover arrives running ALONG it. See home_approach_target.
+        steering = self.compute_steering(self.home_approach_target())
         if self._hard_turning:
             target_speed = min(target_speed, float(self.get_parameter("reverse_turn_speed_mps").value))
         command = self.compute_speed_command(target_speed_override=target_speed)

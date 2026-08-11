@@ -210,6 +210,23 @@ class BuilderOrbitController(Node):
         # LrvArm rejects a grab closer than 2.0 m, so the builder can be about 1.09 m
         # inside the lane before its own wall slot goes out of reach. 0.9 keeps margin.
         self.declare_parameter("station_radius_tol_m", 0.9)
+        # Radial band at which an ALREADY-HELD station is given up, as opposed to the
+        # band required to take it. Hysteresis, and it is what stops one builder laying a
+        # quarter of what its neighbours lay.
+        #
+        # Measured on rank 3, terrain tilt 5.2 deg: "holding station at 186.1 deg", then
+        # 0.7 s of sim later "-0.90 m off the 33.0 m lane". A single band means the drift
+        # that follows parking immediately un-parks the builder and sends it round to
+        # re-acquire -- and un-parking releases the sim-side anchor that would have pulled
+        # it back, so the correction it needs is the thing that dropping station keeping
+        # switches off. It was not slow at anything; it kept being sent away.
+        #
+        # The anchor now walks the hull radially back onto the lane while it holds (see
+        # BuilderRig::Synchronize), so the right response to a drift inside this band is to
+        # keep holding and let it. Sized just inside the hard limit: the wall slot is
+        # 3.095 m from the arm base and LrvArm refuses a grab under 2.0 m, so 1.09 m inside
+        # the lane is where the builder's own slot leaves its envelope.
+        self.declare_parameter("station_radius_release_m", 1.05)
         # Active station keeping. Inside the deadband the builder sits on the brake;
         # outside it, it creeps forward along its arc at gain * error, capped.
         self.declare_parameter("station_keep_deadband_m", 0.25)
@@ -440,14 +457,19 @@ class BuilderOrbitController(Node):
         # Radial error is computed above, with the steering law that uses it. Part of the
         # arrival test too -- see station_radius_tol_m -- because being at the right
         # bearing is not the same as being in the right place, and the arm needs the place.
-        on_lane = abs(radius_error) <= abs(float(self.get_parameter("station_radius_tol_m").value))
-        if not on_lane and not self.reported_off_lane:
+        radius_tol = abs(float(self.get_parameter("station_radius_tol_m").value))
+        radius_release = max(radius_tol, abs(float(self.get_parameter("station_radius_release_m").value)))
+        # Two bands, not one: what it takes to TAKE station, and what it takes to give one
+        # up. See station_radius_release_m.
+        on_lane = abs(radius_error) <= radius_tol
+        stay_on_lane = abs(radius_error) <= radius_release
+        if not stay_on_lane and not self.reported_off_lane:
             self.reported_off_lane = True
             self.get_logger().warn(
                 f"{radius_error:+.2f} m off the {radius:.1f} m lane; driving the lane back "
                 f"before taking station."
             )
-        elif on_lane and self.reported_off_lane:
+        elif stay_on_lane and self.reported_off_lane:
             self.reported_off_lane = False
             self.get_logger().info(f"back on the lane ({radius_error:+.2f} m).")
 
@@ -465,12 +487,16 @@ class BuilderOrbitController(Node):
                 self.get_logger().info(
                     f"holding station at {math.degrees(self.station_angle):.1f} deg."
                 )
-            elif self.holding_station and (abs(wrap_to_pi(error)) > release or not on_lane):
+            elif self.holding_station and (abs(wrap_to_pi(error)) > release or not stay_on_lane):
                 self.holding_station = False
-                self.get_logger().info(
+                why = (
                     f"pushed {math.degrees(abs(wrap_to_pi(error))):.1f} deg off station, past the "
-                    f"{math.degrees(release):.1f} deg release band; driving round to re-acquire."
+                    f"{math.degrees(release):.1f} deg release band"
+                    if abs(wrap_to_pi(error)) > release
+                    else f"pushed {radius_error:+.2f} m off the lane, past the "
+                    f"{radius_release:.2f} m release band"
                 )
+                self.get_logger().info(f"{why}; driving round to re-acquire.")
 
         if self.holding_station:
             # Station keeping is ACTIVE, not just the brake.

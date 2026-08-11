@@ -144,11 +144,11 @@ std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> AddBuilderPileRocks(
     const std::string& amd_uw_data_path,
     int builder_index,
     int num_builders,
-    int slot_count,
+    int rock_count,
     double height_probe_z,
     const RockFieldConfig& config) {
     std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> rocks;
-    if (slot_count <= 0)
+    if (rock_count <= 0)
         return rocks;
 
     const std::array<std::string, 3> rock_visual_obj_files = {
@@ -193,7 +193,7 @@ std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> AddBuilderPileRocks(
     std::mt19937 rng(51413u + 6151u * static_cast<unsigned>(builder_index));
     std::uniform_real_distribution<double> yaw_offset(-chrono::CH_PI, chrono::CH_PI);
 
-    for (int slot = 0; slot < slot_count; slot++) {
+    for (int slot = 0; slot < rock_count; slot++) {
         const int pile = slot / wall_slots_per_pile;
         const int within = slot % wall_slots_per_pile;
         const chrono::ChVector3d center = BuilderPileCenter(builder_index, num_builders, pile);

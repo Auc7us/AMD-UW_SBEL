@@ -1,9 +1,12 @@
 #pragma once
 
 #include <array>
+#include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <unordered_set>
 #include <vector>
 
 #include "chrono/core/ChVector3.h"
@@ -42,15 +45,24 @@ class LrvArm;
 // demo, and the arm has to hit a 0.2-scale rock with a gripper whose jaws open 0.388 m.
 class BuilderArmRosBridge {
   public:
-    // `pile_rocks[k]` is the rock intended for `wall_slots[k]`; both are indexed by wall
-    // slot and must be the same length. Rocks are FIXED at rest -- this class unfixes
-    // nothing itself, but it re-fixes each one once it has been laid, so at most the one
-    // in the gripper is ever a dynamic body.
+    // `seed_rocks` is the one heap the builder starts with; `wall_slots[k]` is where the
+    // k-th rock laid goes. They are NOT indexed together -- the seed heap runs out long
+    // before the course does, and everything after it comes from SetDeliveredRockSource.
+    //
+    // Rocks are FIXED at rest. This class unfixes nothing itself (LrvArm does that when
+    // its gripper locks on) but it re-fixes each one once it has been laid, so at most
+    // the one in the gripper is ever a dynamic body.
     BuilderArmRosBridge(int builder_id,
                         LrvArm& arm,
-                        std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> pile_rocks,
+                        std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> seed_rocks,
                         std::vector<chrono::ChVector3d> wall_slots);
     ~BuilderArmRosBridge();
+
+    // Rocks the collector has delivered since the last call, appended to whatever the
+    // builder can already see. Called every publish, so a load that lands mid-run is
+    // picked up without anything having to signal it.
+    using DeliveredRockSource = std::function<std::vector<std::shared_ptr<chrono::ChBodyAuxRef>>()>;
+    void SetDeliveredRockSource(DeliveredRockSource source) { m_delivered_source = std::move(source); }
 
     // apply_commands=false spins the executor and publishes state but DISCARDS any
     // command, so the arm holds its pose. Used during the builder's settle window: a
@@ -67,6 +79,11 @@ class BuilderArmRosBridge {
     // now be. BuilderRig turns this into the station angle it publishes.
     int GetPlacedCount() const { return m_placed_count; }
     bool BuildComplete() const { return m_placed_count >= static_cast<int>(m_wall_slots.size()); }
+
+    // Site-centre bearing of the feedstock rock currently being offered, or NaN when
+    // there is none in reach. The hull's station is pulled part-way toward this so a
+    // pile that lands off its nominal slot is still worked instead of stared at.
+    double GetFeedstockAngle() const { return m_feedstock_angle; }
 
   private:
     struct DirectCommand {
@@ -86,12 +103,23 @@ class BuilderArmRosBridge {
     void PublishState();
     void PublishBuildTopics(double time);
     // Slot ready to be worked, or -1. Requires a parked hull, an unlaid slot, and a rock
-    // still in the heap.
+    // in reach.
     int ReadySlot() const;
+    // Fold whatever the collector has delivered into the feedstock pool, then choose the
+    // nearest un-consumed rock inside the arm's envelope. Sets m_selected/m_feedstock_angle.
+    void UpdateFeedstock(double time);
 
     int m_builder_id;
     LrvArm& m_arm;
-    std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> m_pile_rocks;
+    // Everything this builder may pick from: the seed heap, then each delivered load.
+    // Grows; never shrinks. m_consumed is what has already been laid (or failed and been
+    // written off), keyed by raw pointer because the pool holds the owning references.
+    std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> m_feedstock;
+    std::unordered_set<const chrono::ChBodyAuxRef*> m_consumed;
+    DeliveredRockSource m_delivered_source;
+    std::shared_ptr<chrono::ChBodyAuxRef> m_selected;  // rock currently on offer
+    double m_feedstock_angle = std::numeric_limits<double>::quiet_NaN();
+    double m_last_feed_refresh = -1.0;
     std::vector<chrono::ChVector3d> m_wall_slots;
 
     int m_placed_count = 0;
@@ -99,8 +127,12 @@ class BuilderArmRosBridge {
     double m_last_started_seq = -1.0;
     double m_settled_seq = -2.0;  // command_seq whose completion was already booked
     int m_active_slot = -1;
+    std::shared_ptr<chrono::ChBodyAuxRef> m_active_rock;
     double m_last_time = 0.0;
     bool m_reported_complete = false;
+    // Diagnostics for a builder that is parked with nothing in reach.
+    double m_starved_since = -1.0;
+    double m_last_starved_report = -1.0e9;
 
     rclcpp::Node::SharedPtr m_node;
     std::unique_ptr<rclcpp::executors::SingleThreadedExecutor> m_executor;

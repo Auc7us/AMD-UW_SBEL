@@ -40,6 +40,7 @@ def launch_setup(context, *args, **kwargs):
     home_slowdown_distance_m = ParameterValue(
         LaunchConfiguration("home_slowdown_distance_m"), value_type=float
     )
+    approach_arc_m = ParameterValue(LaunchConfiguration("approach_arc_m"), value_type=float)
     rear_reference_offset_m = ParameterValue(LaunchConfiguration("rear_reference_offset_m"), value_type=float)
     pickup_request_rate_hz = ParameterValue(LaunchConfiguration("pickup_request_rate_hz"), value_type=float)
     skip_failed_targets = ParameterValue(LaunchConfiguration("skip_failed_targets"), value_type=bool)
@@ -69,6 +70,7 @@ def launch_setup(context, *args, **kwargs):
                         "drop_band_half_width_m": drop_band_half_width_m,
                         "drop_arc_tolerance_m": drop_arc_tolerance_m,
                         "home_slowdown_distance_m": home_slowdown_distance_m,
+                        "approach_arc_m": approach_arc_m,
                     }
                 ],
             )
@@ -130,10 +132,23 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 "drop_arc_tolerance_m",
-                default_value="8.0",
+                default_value="3.0",
                 description=(
                     "How far along the collector circle the rover may stop from its "
-                    "drop point. Without this the whole ring would count as arrived."
+                    "drop point. Without this the whole ring would count as arrived. "
+                    "Was 8 m, which the tangential run-in made both unnecessary and "
+                    "harmful -- the rover would accept the band at the entry waypoint "
+                    "and park 8 m short of the pile it is meant to be building."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "approach_arc_m",
+                default_value="12.0",
+                description=(
+                    "Arc of collector circle the rover follows into its drop point, so "
+                    "it arrives running ALONG the circumference instead of nose-in at "
+                    "it. The rear-discharging trailer then pours a line of rock along "
+                    "the circle rather than a heap across it."
                 ),
             ),
             DeclareLaunchArgument(

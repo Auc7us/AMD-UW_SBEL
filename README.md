@@ -120,11 +120,11 @@ the 1024 m heightmap; those last few rocks rest on the flat extension strips tha
 
 ### What the builder does
 
-The builder **builds**, on its own schedule. It is not triggered by, gated on, or
-positioned by its collector's harvest cycle. One wall slot per iteration:
+The builder **builds**, at its own pace. Its course, its station and its rate are its
+own; the only thing it takes from its collector is rock. One wall slot per iteration:
 
-1. The sim publishes `/builder_N/pick_target` with `ready=1` — the hull is parked and
-   pinned, slot `k` is unlaid, and its feedstock rock is still in the heap.
+1. The sim publishes `/builder_N/pick_target` with `ready=1` — the hull is parked, slot
+   `k` is unlaid, and a rock is within the arm's envelope.
 2. `builder_arm_controller` solves grab and place IK in the arm base frame and sends one
    12-element `/builder_N/arm_cmd`.
 3. `LrvArm`'s pick/place machine runs it: approach, close on contact, lock, lift, swing
@@ -139,21 +139,51 @@ the drive station and the feedstock cannot disagree:
 |---|---|---|
 | wall slot `k` | 30.0 | `ray + k·pitch` |
 | station for `k` | 33.0 | `ray + k·pitch + arm_lead` |
-| feedstock heap | 36.6 | heap-centre slot angle, **no** `arm_lead` |
+| seed heap | 36.6 | heap-centre slot angle, **no** `arm_lead` |
+| collector load `c` | 37.0 | `ray + HarvestDropSlot(c)·pitch` |
 
 `pitch = 0.9 m / 30 m`, so one slot is 0.9 m of course and 0.99 m of lane. `arm_lead =
 atan(2.5/33)` exists because the arm mounts 2.5 m *back* along a tangentially parked
 hull; adding it to the station puts the *arm base*, not the hull origin, radially
 opposite the slot it serves. That is why the heap must **not** also carry it — doing so
 pushed every heap to 5.62 m from the arm base, past the 5.2 m guard, and no rock was
-reachable. `main.cpp` now prints a reach audit at startup so that class of error shows
-up at t=0 rather than after the machine has driven to its first station.
+reachable. `main.cpp` prints a reach audit at startup so that class of error shows
+up at t=0 rather than after the machine has driven to its first station. Measured at
+4 ranks: seed heap 3.54–4.37 m, collector load 3.91–4.04 m, wall slot 3.09 m, all
+inside the 2.0–5.2 m envelope.
 
-**Feedstock rocks are fixed except the one in the gripper.** They are created
-`SetFixed(true)` with collision on, so a couple of dozen extra bodies per rank cost the
-solver nothing; `LrvArm::TryLockRock` unfixes exactly one when the fingers make contact,
+#### Where the rock comes from
+
+There is **one** seed heap of six rocks per builder, and that is all the site places.
+It exists only to give the builder something to lay during its collector's first
+outbound leg, which is minutes of sim long. Everything after it is delivered.
+
+That works because the harvest lane advances in **wall slots**, not in a round number
+of degrees. Load `c` is dropped at slot `HarvestDropSlot(c) = 6 + 2c` — exactly where
+the builder's wall will have reached, having laid the six seed rocks and the two rocks
+of every earlier load. So each pile lands within reach of the station the builder is
+already driving to, and the builder clears each pile off the collector circle before
+the collector comes back to that stretch of it. The step used to be a flat 30°, which
+at 0.03 rad/slot is 17 slots — a two-rock load every 17 slots leaves a wall that is 88%
+gaps and every pile 15 m of arc from the builder meant to eat it.
+
+The arm bridge does not index its feedstock. It takes the **nearest un-consumed rock
+inside the envelope**, from the seed heap and every delivered load pooled together. That
+has to be a search rather than a lookup, because a load is tipped out of a moving
+trailer and lands where it lands; running both sources through one rule also means the
+changeover from heap to delivery needs no handling at all. The hull's station is pulled
+half way toward the rock on offer (clamped to ±2 slots), so a pile that lands a metre or
+two off its nominal slot is still worked rather than stared at.
+
+**Every rock is fixed except the one in the gripper.** Seed rocks are created
+`SetFixed(true)` with collision on; delivered rocks are frozen the same way once they
+come to rest. `LrvArm::TryLockRock` unfixes exactly one when the fingers make contact,
 and the arm bridge re-fixes it once laid — it is part of the wall then, and must not be
-nudged by the next stone landing beside it.
+nudged by the next stone landing beside it. Delivered rocks used to be *released* again
+when a builder came within 3 m or pushed hard enough on them; both triggers fire exactly
+when the arm is trying to take hold, so the rock would be unfixed and rolling downhill at
+the worst possible moment. `UpdateRockCollisionActivation` also skips fixed rocks, or the
+distance test would switch collision off on the pile the gripper is about to close on.
 
 Start both halves together (they are a pair; the drive half alone holds slot 0 forever):
 
@@ -172,19 +202,27 @@ The orbit controller reads `/builder_N/vehicle_state` (`[x, y, yaw, speed]`) and
 publishes `/builder_N/vehicle_cmd` (`[steering, throttle, braking]`). A builder starts
 braked and holds until its first valid ROS command arrives.
 
-Its hull **is** pinned while parked, and released the moment it is asked to move — full
-brake with zero throttle is the park signal, which is exactly what the orbit controller
-publishes on station, so no extra topic is needed. A braked M113 does not stay put (the
-reference scenario measured up to 0.9 m / 17° of drift over 8 s at the headings ours
-uses), and station keeping closes the loop on orbit *angle* only, so radial creep is
-invisible to it.
+Its hull is held by a **virtual anchor** while parked, and released the moment it is
+asked to move — full brake with zero throttle is the park signal, which is exactly what
+the orbit controller publishes on station, so no extra topic is needed. A braked M113
+does not stay put: measured here, it creeps at 0.22–0.27 m/s on full brake, so `m_parked`
+never went true and the arm was never offered a pick. The anchor is a spring-damper
+*force* on the chassis (5e4 N/m, 4.5e4 N·s/m, plus a yaw pair), horizontal only —
+vertical is the suspension's job.
 
-This used to be fatal and the reason must not be lost: pinning a **level** hull on this
-heightmap made it fight 0.24–0.33 m of terrain spread across its own footprint, and the
-single-pin track threw shoes and went NaN within about a second on every rank. What made
-it safe was seating the hull on a *fitted terrain plane* (`SeatBuilderOnTerrainPlane`,
-worst-case error 0.02–0.08 m) and pinning only **after** the settle window, at whatever
-pose it actually settled into, so no strain is injected.
+It is a force and not a constraint for a reason that must not be lost. `SetFixed(true)`
+does hold the hull, and it **destroys the track**: it removes the body from the solve, so
+its velocity goes to zero in one step while ~130 shoes are still solving against the
+velocity it had last step. Bisected at 3 ranks with no controllers: pinning on brake died
+at t=2.115, pinning only below 0.02 m/s died at t=6.085 (the velocity gate was a
+hypothesis, and it was wrong — it only delayed the failure), and `--no_hull_park` ran
+clean past t=21. A force has no velocity discontinuity, so it holds station without
+shocking the chain.
+
+Seating the hull on a *fitted terrain plane* (`SeatBuilderOnTerrainPlane`, worst-case
+error 0.02–0.08 m against 0.24–0.33 m for a single-probe level placement) is still
+needed, and still done — that is about not injecting strain at t=0, and it is orthogonal
+to how the hull is held once parked.
 
 ### One system per rank
 
@@ -268,9 +306,8 @@ reports completion or, by default, after a failed target is skipped.
 
 ### End of mission: return home and dump
 
-Once every rock is either collected or skipped, the collector drives back to its
-spawn point, stops, tips its bed to drop the load, resets, and stays put. The
-chain is:
+Once every rock is either collected or skipped, the collector drives back to its drop
+point, stops, tips its bed to drop the load, resets, and stays put. The chain is:
 
 ```text
 manipulator_controller  all targets resolved   -> /robot_N/mission_done
@@ -283,15 +320,56 @@ C++ RobotRig            runs the dump cycle    -> /robot_N/trailer_state
 `/robot_N/trailer_state` is `[state, bed_angle_rad, tailgate_angle_rad]`, where
 state is `0` idle, `1` opening gate, `2` tilting, `3` dwell, `4` levelling,
 `5` closing gate, `6` done. `/robot_N/homePos` is published by the C++ drive
-bridge so the spawn point is not recomputed in Python.
+bridge so the drop point is not recomputed in Python.
+
+**The last leg is tangential.** The rock line runs radially *outward* from the drop
+point, so a rover left to itself comes home radially — nose-in at the circumference,
+trailer pointing out into open field, load tipped wherever it happened to stop. Instead
+it is given two waypoints: one on the collector circle `approach_arc_m` (12 m) of arc
+*clockwise* of the drop point, then the drop point itself, reached by following the
+circle. By the time it has run that arc its heading is tangential, so the rear-
+discharging trailer pours a line of rock *along* the circumference — which is the shape
+the builder eats from, working one slot at a time along the same circle.
+
+The run-in comes down the circle *over the builder's own seed heap*, which sits at 36.6 m
+on slot 2.5 — 0.4 m off the 37 m path. That is intended, not overlooked: the builder eats
+the six seed rocks in the first ~60 s of sim and its collector does not get home until
+~250 s, so the ground is clear long before anything drives over it. It is the same
+property the whole layout is built on — the builder clears each pile off the collector
+circle before the collector comes back to that stretch of it.
+
+That also let `drop_arc_tolerance_m` come down from 8 m to 3 m. The 8 m existed because
+a rover driving straight at the drop point cannot converge on it — pure pursuit orbits a
+target inside its own turning radius — so arrival had to be accepted from a long way
+out. With the run-in, 8 m of slack would be actively harmful: the rover would enter the
+band at the entry waypoint and park 8 m short of the pile it is meant to be building.
+Arrival is also accepted on a **stop line** — committed to the run-in and past the drop
+point in arc — because "have I passed it" cannot be missed by a rover carrying a little
+too much speed, whereas "am I near it" can be sailed through in one control period.
 
 The cycle runs in C++ at the simulation step rate, and it has to. Both the bed and
 the tailgate are `ChLinkMotorRotationAngle`, so re-setting the commanded angle is
 a *position* discontinuity — an instantaneous velocity that throws the rocks out
 of the tub instead of tipping them out. The cycle therefore slews each angle at a
-bounded rate (bed 12 deg/s to 40 deg, gate 60 deg/s to 95 deg, 3 s dwell at full
+bounded rate (bed 12 deg/s to 55 deg, gate 60 deg/s to 95 deg, 3 s dwell at full
 tilt), which cannot be driven from a 10 Hz controller. A controller only asks for
 a cycle; repeat requests during one are ignored.
+
+55° and not 40°: the load has to *slide*, and a rock on the bed slides only when
+tan θ > μ. The bed is μ = 0.9, so the threshold is arctan(0.9) = 42.0°. At 40° the
+load is below it and is not supposed to move at all — the dumps that appeared to work
+were rocks rolling or being nudged by the tilt, which is why three ranks emptied and
+the fourth kept its rock sitting 0.28 m from the bed centre. Gravity cancels out of
+tan θ > μ entirely, so lunar gravity never entered into this and it failed exactly as
+it would on Earth.
+
+The tub is **centred on the trailer and discharges rearward**, over the -x lip, with
+the tilt axis *on* that lip so the pour line stays put instead of walking forward under
+the trailer as the tub rises. It spent a while discharging to the left instead, which
+forced the tub off-centre — the left tire spans y = 0.35–0.65 with its top only 21 mm
+below the bed lip, so a symmetric tub pouring sideways empties onto its own wheel.
+Nothing is behind the tailgate but ground, so rear discharge has no such conflict, and
+the tub sits where `RosArmBridge`'s 4×4 placement grid has always aimed.
 
 The gate opens before the bed tilts and closes after it levels, so the load is
 never pressed against a closed gate and then released all at once.

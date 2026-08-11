@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -44,11 +45,13 @@ class BuilderRig {
     struct Options {
         // Skip the manipulator entirely.
         bool with_arm = true;
-        // The builder's own build plan: feedstock rock k is laid on wall slot k. Both
-        // are indexed by wall slot and are handed straight to BuilderArmRosBridge, which
-        // owns the cycle. Empty means the builder has an arm but nothing to build with,
-        // which is the pre-existing behaviour.
-        std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> pile_rocks;
+        // The builder's own build plan, handed straight to BuilderArmRosBridge, which
+        // owns the cycle: the one seed heap it starts with, and the course of wall slots
+        // to fill. The two are NOT indexed together -- the seed heap runs out after a few
+        // slots and the rest of the course is fed by the collector. Empty seed_rocks means
+        // the builder has an arm but nothing to start with, which is fine; it will build
+        // as soon as its first load lands.
+        std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> seed_rocks;
         std::vector<chrono::ChVector3d> wall_slots;
     };
 
@@ -83,6 +86,15 @@ class BuilderRig {
     // Zero without an arm bridge, so a builder built with --no_builder-style options
     // simply never advances.
     int GetPlacedCount() const;
+
+    // Site-centre bearing of the rock the arm is currently being offered, or NaN if
+    // there is none. See BuilderArmRosBridge::GetFeedstockAngle.
+    double GetFeedstockAngle() const;
+
+    // Where the builder's next rocks come from once its seed heap is gone: the loads its
+    // collector has delivered. Wired by main, which owns both rigs -- BuilderRig itself
+    // knows nothing about the collector, and this keeps it that way.
+    void SetDeliveredRockSource(std::function<std::vector<std::shared_ptr<chrono::ChBodyAuxRef>>()> source);
 
     // Sim time before which Synchronize() holds full brake and DISCARDS ROS commands.
     // A single-pin track needs to reach equilibrium on the terrain before anything
@@ -134,6 +146,9 @@ class BuilderRig {
     double m_anchor_yaw = 0.0;
     unsigned int m_anchor_accumulator = 0;
     bool m_anchor_accumulator_ready = false;
+    // Previous Synchronize time, so the anchor's re-centring slew is measured against
+    // real elapsed sim time rather than assuming a step size it is not told.
+    double m_last_sync_time = -1.0;
     // Diagnostic escape hatch (--no_build). The arm bridge only offers a pick while the
     // builder is parked, so with this off it drives its lane and never builds.
     bool m_hull_park_enabled = true;

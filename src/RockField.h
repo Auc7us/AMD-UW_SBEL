@@ -47,9 +47,13 @@ std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> AddRockFields(
     // gets a different scatter instead of replaying the same one on a new bearing.
     int cycle = 0);
 
-// Adds one builder's FEEDSTOCK: real, pickable rocks heaped outboard of its lane, one
-// heap per run of wall slots (see BuilderPileCenter). Returned in slot order, so
-// element k is the rock intended for wall slot k.
+// Adds one builder's SEED HEAP: real, pickable rocks heaped outboard of its lane at
+// BuilderPileCenter, in a ring so the pile reads as dumped rather than arranged.
+//
+// This is the only feedstock placed by the site. It exists to give the builder something
+// to lay during its collector's first outbound leg, which is minutes of sim long;
+// everything after it is delivered by that collector and found by the arm bridge's reach
+// search, not by an index. So the order this returns them in carries no meaning.
 //
 // Every one of them is created FIXED with collision on. That is the whole point: a
 // couple of dozen extra bodies per rank would otherwise each carry six DOF, generate
@@ -70,7 +74,7 @@ std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> AddBuilderPileRocks(
     const std::string& amd_uw_data_path,
     int builder_index,
     int num_builders,
-    int slot_count,
+    int rock_count,
     double height_probe_z,
     const RockFieldConfig& config);
 

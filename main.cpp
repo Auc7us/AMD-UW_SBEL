@@ -909,7 +909,11 @@ int main(int argc, char* argv[]) {
     AddOrbitVisualRing(system, terrain, site_center_x, site_center_y, robot_start_radius, height_probe_z,
                        ChColor(0.20f, 0.90f, 0.35f), "collector_ring");
     AddCenterPad(system, terrain, height_probe_z);
-    AddSpawnRockClumps(system, terrain, chrono_data_path, num_robot_ranks, height_probe_z);
+    // AddSpawnRockClumps is deliberately NOT called. It puts ~90 decorative rocks per rank
+    // in the builder's working area, and now that the builder works from a single seed heap
+    // and then from whatever its collector actually delivers, that dressing reads as
+    // feedstock the builder is ignoring. The function is kept -- it is the site-dressing
+    // pass to re-enable for a wide establishing shot, where nothing is being picked up.
     AddPlacedWallRocks(system, terrain, chrono_data_path, num_robot_ranks, height_probe_z);
     AddRockLineTerrainExtensions(terrain, ground_mat, num_robot_ranks, height_probe_z, terrain_length, terrain_width,
                                  rock_field_config);
@@ -981,15 +985,16 @@ int main(int argc, char* argv[]) {
                  << " deg, worst error level=" << seating.level_error << " m -> plane="
                  << seating.plane_error << " m, lift=" << seating.lift << " m.\n";
 
-        // The builder's own build plan, entirely independent of the collector: a course
-        // of slots to fill on the work circle and a heap of real rocks to fill them from.
-        // Slot k's rock is pile_rocks[k]. See RobotLayout's build-plan block.
+        // The builder's own build plan: a course of slots to fill on the work circle, and
+        // ONE seed heap to start filling them from. Everything after the seed comes from
+        // this rank's collector -- see BuilderRig::SetDeliveredRockSource below and
+        // RobotLayout's build-plan block.
         BuilderRig::Options plan_options = builder_options;
         const int wall_slot_count = BuilderWallSlotCount(num_robot_ranks);
-        builder_pile_rocks = AddBuilderPileRocks(system, terrain, rock_mat, chrono_data_path, amd_uw_data_path,
-                                                 builder_index, num_robot_ranks, wall_slot_count, height_probe_z,
-                                                 rock_field_config);
-        plan_options.pile_rocks = builder_pile_rocks;
+        builder_pile_rocks =
+            AddBuilderPileRocks(system, terrain, rock_mat, chrono_data_path, amd_uw_data_path, builder_index,
+                                num_robot_ranks, builder_seed_rock_count, height_probe_z, rock_field_config);
+        plan_options.seed_rocks = builder_pile_rocks;
         for (int slot = 0; slot < wall_slot_count; ++slot) {
             ChVector3d p = BuilderWallSlotPosition(builder_index, num_robot_ranks, slot);
             // Release height above the terrain at that slot: the rock is let go from rest
@@ -999,8 +1004,9 @@ int main(int argc, char* argv[]) {
             plan_options.wall_slots.push_back(p);
         }
         SynLog() << "Rank " << rank << " build plan: " << wall_slot_count << " wall slots at "
-                 << wall_slot_pitch_m << " m pitch (" << builder_pile_rocks.size() << " feedstock rocks in "
-                 << ((wall_slot_count + wall_slots_per_pile - 1) / wall_slots_per_pile) << " heaps), "
+                 << wall_slot_pitch_m << " m pitch, " << builder_pile_rocks.size()
+                 << " seed rocks in 1 heap, then " << harvest_rocks_per_load
+                 << " per collector load every " << harvest_rocks_per_load << " slots; "
                  << wall_slot_count * wall_slot_pitch_rad * builder_path_radius << " m of lane to walk.\n";
 
         // Reach audit, at t=0, against the NOMINAL arm base for each slot. Every target in
@@ -1009,36 +1015,57 @@ int main(int argc, char* argv[]) {
         // to its first station, tens of minutes into a run. A first cut at the heap angle
         // put every heap 5.62 m out, past the 5.2 m guard, and nothing said so until then.
         // Bounds are LrvArm's scaled envelope: [1.0, 2.6] m * arm_geometry_scale 2.0.
+        //
+        // THREE things are audited, because there are three ways to be out of reach now:
+        // the wall slot (inboard), the seed heap (outboard, over the slots it serves), and
+        // the collector's drop point for each harvest cycle (outboard, over the slot
+        // HarvestDropSlot puts it at). The last is the one that decides whether the
+        // builder can actually eat what its collector brings.
         {
             constexpr double envelope_min = 2.0;
             constexpr double envelope_max = 5.2;
-            double heap_min = 1e9, heap_max = 0.0, slot_min = 1e9, slot_max = 0.0;
-            for (int slot = 0; slot < wall_slot_count; ++slot) {
+            auto arm_base_at_slot = [&](double slot) {
                 // The hull leads its slot by arm_lead precisely so the ARM BASE lands on
                 // the slot's own angle; see BuilderStationAngleRad.
-                const double base_angle = RankRayAngleRad(builder_index, num_robot_ranks) +
-                                          slot * wall_slot_pitch_rad;
-                const ChVector3d base(site_center_x + builder_arm_base_radius_approx * std::cos(base_angle),
-                                      site_center_y + builder_arm_base_radius_approx * std::sin(base_angle), 0.0);
-                const ChVector3d heap =
-                    BuilderPileCenter(builder_index, num_robot_ranks, slot / wall_slots_per_pile);
+                const double a = RankRayAngleRad(builder_index, num_robot_ranks) + slot * wall_slot_pitch_rad;
+                return ChVector3d(site_center_x + builder_arm_base_radius_approx * std::cos(a),
+                                  site_center_y + builder_arm_base_radius_approx * std::sin(a), 0.0);
+            };
+            double heap_min = 1e9, heap_max = 0.0, slot_min = 1e9, slot_max = 0.0;
+            double drop_min = 1e9, drop_max = 0.0;
+            for (int slot = 0; slot < wall_slot_count; ++slot) {
+                const ChVector3d base = arm_base_at_slot(slot);
                 const ChVector3d wall = BuilderWallSlotPosition(builder_index, num_robot_ranks, slot);
-                const double dh = (heap - base).Length();
-                const double dw = (wall - base).Length();
-                heap_min = std::min(heap_min, dh);
-                heap_max = std::max(heap_max, dh);
-                slot_min = std::min(slot_min, dw);
-                slot_max = std::max(slot_max, dw);
+                slot_min = std::min(slot_min, (wall - base).Length());
+                slot_max = std::max(slot_max, (wall - base).Length());
+                if (slot < builder_seed_rock_count) {
+                    const ChVector3d heap = BuilderPileCenter(builder_index, num_robot_ranks, 0);
+                    heap_min = std::min(heap_min, (heap - base).Length());
+                    heap_max = std::max(heap_max, (heap - base).Length());
+                }
             }
-            SynLog() << "Rank " << rank << " reach audit: heap " << heap_min << "-" << heap_max
-                     << " m, wall slot " << slot_min << "-" << slot_max << " m (arm envelope "
-                     << envelope_min << "-" << envelope_max << " m).\n";
-            if (heap_min < envelope_min || heap_max > envelope_max || slot_min < envelope_min ||
-                slot_max > envelope_max) {
+            // Each load lands at HarvestDropSlot(c) and is eaten over the next
+            // harvest_rocks_per_load slots, so check both ends of that run.
+            for (int cycle = 0; HarvestDropSlot(cycle) < wall_slot_count; ++cycle) {
+                const ChVector3d drop = InitialGroundPositionForRobot(builder_index, num_robot_ranks, cycle);
+                for (int k = 0; k < harvest_rocks_per_load; ++k) {
+                    const double d = (drop - arm_base_at_slot(HarvestDropSlot(cycle) + k)).Length();
+                    drop_min = std::min(drop_min, d);
+                    drop_max = std::max(drop_max, d);
+                }
+            }
+            SynLog() << "Rank " << rank << " reach audit: seed heap " << heap_min << "-" << heap_max
+                     << " m, drop point " << drop_min << "-" << drop_max << " m, wall slot " << slot_min
+                     << "-" << slot_max << " m (arm envelope " << envelope_min << "-" << envelope_max
+                     << " m).\n";
+            const bool out = heap_min < envelope_min || heap_max > envelope_max ||
+                             slot_min < envelope_min || slot_max > envelope_max ||
+                             drop_min < envelope_min || drop_max > envelope_max;
+            if (out) {
                 SynLog() << "Rank " << rank
                          << " BUILD PLAN OUT OF REACH: the builder will refuse targets it is parked "
-                            "beside. Check builder_pile_radius / wall_slot_pitch_m / the arm_lead "
-                            "convention in RobotLayout.h.\n";
+                            "beside. Check builder_pile_radius / wall_slot_pitch_m / HarvestDropSlot / "
+                            "the arm_lead convention in RobotLayout.h.\n";
             }
         }
 
@@ -1050,6 +1077,15 @@ int main(int argc, char* argv[]) {
         // builder never had one.
         builder->SetCommandEnableTime(builder_settle_time);
         builder->SetHullParkEnabled(!no_build);
+
+        // The other half of the feedstock: whatever this rank's collector has delivered.
+        // Wired here because main owns both rigs; neither knows about the other, and the
+        // builder pulls rather than the rover pushing, so a load that lands while the arm
+        // is mid-carry is simply seen on the next selection.
+        if (robot) {
+            RobotRig* rig = robot.get();
+            builder->SetDeliveredRockSource([rig]() { return rig->GetDeliveredRocks(); });
+        }
     }
 
     if (owns_robot) {
@@ -1290,9 +1326,32 @@ int main(int argc, char* argv[]) {
                 // angle, and its arm had nothing to do at either end. Now it steps one
                 // wall slot -- 0.9 m of course, 0.99 m of lane -- each time it lays a
                 // rock, which is a thing it does entirely on its own.
+                //
+                // One refinement on top of that: the station is pulled HALF WAY toward the
+                // rock actually on offer. Nominally the two agree -- HarvestDropSlot puts
+                // each load on the slot the builder will be at -- but a load is tipped out
+                // of a moving trailer, so where it lands has a metre or two of scatter in
+                // it. Splitting the difference keeps the wall slot (3.1 m inboard) and the
+                // rock (~3.9 m outboard) both inside the arm's 5.2 m envelope for an
+                // offset either way, instead of the builder parking exactly on its slot and
+                // staring at a pile it cannot quite reach. Clamped, so a stray rock across
+                // the site can never drag a builder off its course.
                 if (builder) {
-                    builder->SetStationAngle(BuilderStationAngleRad(robot->GetRobotIndex(), num_robot_ranks,
-                                                                    builder->GetPlacedCount()));
+                    const int idx = robot->GetRobotIndex();
+                    const double slot_angle = RankRayAngleRad(idx, num_robot_ranks) +
+                                              builder->GetPlacedCount() * wall_slot_pitch_rad;
+                    double serve_angle = slot_angle;
+                    const double feed_angle = builder->GetFeedstockAngle();
+                    if (std::isfinite(feed_angle)) {
+                        // Unwrap onto slot_angle's branch before averaging, or a pile at
+                        // -179 deg and a slot at +179 deg average to 0.
+                        double delta = std::remainder(feed_angle - slot_angle, CH_2PI);
+                        constexpr double max_pull_slots = 2.0;
+                        const double limit = max_pull_slots * wall_slot_pitch_rad;
+                        delta = std::clamp(delta, -limit, limit);
+                        serve_angle = slot_angle + 0.5 * delta;
+                    }
+                    builder->SetStationAngle(serve_angle + BuilderArmLeadRad());
                     builder->Synchronize(time);
                 }
             }

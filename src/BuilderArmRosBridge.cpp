@@ -2,10 +2,12 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <string>
 #include <utility>
 
 #include "LrvArm.h"
+#include "RobotLayout.h"
 
 namespace amd_uw {
 
@@ -37,6 +39,21 @@ constexpr double place_z_clearance = 0.20;
 // node doing a blocking IK solve; publishing every 5e-4 s step is what buried it.
 constexpr double build_publish_period = 0.02;
 
+// Envelope a feedstock rock must be inside, measured from the arm's IK frame origin.
+// LrvArm's own grab guard is [1.0, 2.6] m * geometry_scale 2.0 = [2.0, 5.2] m; this is
+// that band pulled in slightly at the top so a rock is not offered at the exact radius
+// where the solve is about to be refused. Nothing outside it is a candidate, which is
+// also what keeps the builder from reaching for rocks still out on the collector's rock
+// line 20 m away -- the reach test is the only filter needed.
+constexpr double feedstock_reach_min = 2.0;
+constexpr double feedstock_reach_max = 5.0;
+
+// How long a parked builder may sit with an unlaid slot and nothing in reach before it
+// says so. Not an error -- waiting for the collector is the normal state between loads --
+// but a builder that waits forever is the failure this whole arrangement risks, so it
+// has to be visible in the log rather than inferred from the wall not growing.
+constexpr double starved_report_period = 30.0;
+
 void EnsureRosInitialized() {
     if (rclcpp::ok())
         return;
@@ -54,19 +71,15 @@ std::string TopicForBuilder(int builder_id, const std::string& suffix) {
 
 BuilderArmRosBridge::BuilderArmRosBridge(int builder_id,
                                          LrvArm& arm,
-                                         std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> pile_rocks,
+                                         std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> seed_rocks,
                                          std::vector<chrono::ChVector3d> wall_slots)
     : m_builder_id(builder_id),
       m_arm(arm),
-      m_pile_rocks(std::move(pile_rocks)),
+      m_feedstock(std::move(seed_rocks)),
       m_wall_slots(std::move(wall_slots)) {
     EnsureRosInitialized();
 
-    // Slot k's rock is m_pile_rocks[k]; a length mismatch would silently lay the wrong
-    // rock on the wrong slot, so take the shorter of the two rather than trusting either.
-    const size_t usable = std::min(m_pile_rocks.size(), m_wall_slots.size());
-    m_pile_rocks.resize(usable);
-    m_wall_slots.resize(usable);
+    m_feedstock.erase(std::remove(m_feedstock.begin(), m_feedstock.end(), nullptr), m_feedstock.end());
 
     m_executor = std::make_unique<rclcpp::executors::SingleThreadedExecutor>();
     m_node = rclcpp::Node::make_shared("chrono_builder_" + std::to_string(m_builder_id) + "_arm");
@@ -87,9 +100,9 @@ BuilderArmRosBridge::BuilderArmRosBridge(int builder_id,
     m_executor->add_node(m_node);
 
     RCLCPP_INFO(m_node->get_logger(),
-                "Builder arm bridge ready: %zu wall slots to lay from %zu heaped rocks; "
-                "subscribing %s, publishing %s / %s / %s",
-                m_wall_slots.size(), m_pile_rocks.size(),
+                "Builder arm bridge ready: %zu wall slots to lay, %zu seed rocks to start from "
+                "(the rest arrive by collector); subscribing %s, publishing %s / %s / %s",
+                m_wall_slots.size(), m_feedstock.size(),
                 TopicForBuilder(m_builder_id, "arm_cmd").c_str(),
                 TopicForBuilder(m_builder_id, "pick_target").c_str(),
                 TopicForBuilder(m_builder_id, "place_target").c_str(),
@@ -101,12 +114,63 @@ BuilderArmRosBridge::~BuilderArmRosBridge() {
         m_executor->remove_node(m_node);
 }
 
+// Take in whatever the collector has delivered, then pick the rock to work next.
+//
+// "Nearest un-consumed rock inside the envelope" is the whole selection rule. It has to
+// be a search rather than an index because the second source of rock is a load tipped
+// out of a moving trailer: those rocks land where they land, in whatever order they
+// leave the bed, and nothing upstream can promise which one ends up closest. The seed
+// heap could have kept its slot-indexed mapping, but running both sources through the
+// same rule means there is only one behaviour to reason about, and the changeover from
+// heap to delivery needs no handling at all -- the heap simply stops being the nearest
+// thing once it is empty.
+void BuilderArmRosBridge::UpdateFeedstock(double time) {
+    // Ask the collector at the publish rate, not at the 2 kHz step rate: the query
+    // allocates and copies a vector, and a load cannot land twice in 20 ms of sim.
+    // The reach search below still runs every step, so the rock on offer tracks the arm
+    // base as the hull settles.
+    if (m_delivered_source && (m_last_feed_refresh < 0.0 || time - m_last_feed_refresh >= build_publish_period)) {
+        m_last_feed_refresh = time;
+        for (auto& rock : m_delivered_source()) {
+            if (!rock)
+                continue;
+            if (std::find(m_feedstock.begin(), m_feedstock.end(), rock) == m_feedstock.end())
+                m_feedstock.push_back(rock);
+        }
+    }
+
+    m_selected.reset();
+    m_feedstock_angle = std::numeric_limits<double>::quiet_NaN();
+
+    const auto base = m_arm.GetIkFramePos();
+    double best = std::numeric_limits<double>::max();
+    for (const auto& rock : m_feedstock) {
+        if (!rock || m_consumed.count(rock.get()))
+            continue;
+        const auto pos = rock->GetPos();
+        if (!std::isfinite(pos.x()) || !std::isfinite(pos.y()) || !std::isfinite(pos.z()))
+            continue;
+        const double d = (pos - base).Length();
+        if (d < feedstock_reach_min || d > feedstock_reach_max)
+            continue;
+        if (d < best) {
+            best = d;
+            m_selected = rock;
+        }
+    }
+
+    if (m_selected) {
+        const auto pos = m_selected->GetPos();
+        m_feedstock_angle = std::atan2(pos.y() - site_center_y, pos.x() - site_center_x);
+    }
+}
+
 int BuilderArmRosBridge::ReadySlot() const {
-    if (!m_hull_parked)
+    if (!m_hull_parked || m_arm.IsBusy())
         return -1;
     if (m_placed_count >= static_cast<int>(m_wall_slots.size()))
         return -1;
-    if (!m_pile_rocks[m_placed_count])
+    if (!m_selected)
         return -1;
     return m_placed_count;
 }
@@ -114,6 +178,10 @@ int BuilderArmRosBridge::ReadySlot() const {
 void BuilderArmRosBridge::Synchronize(double time, bool apply_commands) {
     m_last_time = time;
     m_executor->spin_some();
+    // Before anything reads ReadySlot(): both the command path and the publish path
+    // depend on which rock is on offer, and they must agree within a step.
+    if (!m_arm.IsBusy())
+        UpdateFeedstock(time);
 
     std::optional<DirectCommand> direct;
     std::optional<PickPlaceCommand> pick_place;
@@ -145,21 +213,24 @@ void BuilderArmRosBridge::Synchronize(double time, bool apply_commands) {
         if (slot >= 0 && pick_place->target_index == slot) {
             m_last_started_seq = pick_place->command_seq;
             m_active_slot = slot;
-            auto rock = m_pile_rocks[slot];
-            const auto rock_pos = rock->GetPos();
+            m_active_rock = m_selected;
+            // Booked now, not on completion: the moment the arm starts for this rock,
+            // no later selection may offer it again, whatever happens to the grab.
+            m_consumed.insert(m_active_rock.get());
+            const auto rock_pos = m_active_rock->GetPos();
             const chrono::ChVector3d grab_target(rock_pos.x(), rock_pos.y(), rock_pos.z() + grab_z_offset);
             const chrono::ChVector3d place_target = m_wall_slots[slot];
             RCLCPP_INFO(m_node->get_logger(),
                         "build step %d/%zu: rock=(%.3f, %.3f, %.3f) -> slot=(%.3f, %.3f, %.3f)",
                         slot + 1, m_wall_slots.size(), grab_target.x(), grab_target.y(), grab_target.z(),
                         place_target.x(), place_target.y(), place_target.z());
-            m_arm.StartPickPlace(pick_place->command_seq, slot, rock, grab_target, place_target, time,
+            m_arm.StartPickPlace(pick_place->command_seq, slot, m_active_rock, grab_target, place_target, time,
                                  &pick_place->grab_theta, &pick_place->place_theta);
         } else if (pick_place->target_index != slot) {
             RCLCPP_WARN(m_node->get_logger(),
                         "Ignoring pick/place for slot %d; the builder is %s.",
                         pick_place->target_index,
-                        slot < 0 ? (m_hull_parked ? "out of rocks" : "still driving to station")
+                        slot < 0 ? (m_hull_parked ? "waiting for a rock in reach" : "still driving to station")
                                  : "working a different slot");
         }
     }
@@ -178,32 +249,37 @@ void BuilderArmRosBridge::Synchronize(double time, bool apply_commands) {
     if (m_active_slot >= 0 && status.command_seq == m_last_started_seq && m_settled_seq != m_last_started_seq &&
         (status.state == 2 || status.state == 3)) {
         m_settled_seq = m_last_started_seq;
-        auto rock = m_pile_rocks[m_active_slot];
+        auto rock = m_active_rock;
+        // Fixed again either way. On success it is part of the wall, so it must not be
+        // nudged by the next rock landing beside it. On failure it is back in the pile,
+        // where the invariant is the same: nothing moves but what the gripper holds.
+        if (rock) {
+            rock->SetFixed(true);
+            rock->EnableCollision(true);
+        }
         if (status.state == 2 && status.success) {
-            if (rock) {
-                rock->SetFixed(true);
-                rock->EnableCollision(true);
-            }
             m_placed_count = m_active_slot + 1;
-            RCLCPP_INFO(m_node->get_logger(), "laid rock %d of %zu; station advances to slot %d.",
-                        m_placed_count, m_wall_slots.size(), m_placed_count);
+            // Sim time, not the log's wall stamp: this runs ~30x slower than real time and
+            // the ratio moves with rank count, so wall stamps cannot be compared between
+            // builders or between runs. Every timing question about this cycle is asked
+            // of this number.
+            RCLCPP_INFO(m_node->get_logger(), "t=%.2f laid rock %d of %zu; station advances to slot %d.",
+                        time, m_placed_count, m_wall_slots.size(), m_placed_count);
         } else {
-            // A slot that could not be served must not stall the whole course. Put the
-            // rock back the way the heap holds them and move on; the gap in the wall is
-            // honest about what happened.
-            if (rock) {
-                rock->SetFixed(true);
-                rock->EnableCollision(true);
-            }
+            // A slot that could not be served must not stall the whole course. The rock
+            // stays consumed -- retrying the one the arm just failed on is how a builder
+            // spends the rest of a run on a single unreachable stone -- and the slot is
+            // skipped, so the gap in the wall is honest about what happened.
             m_placed_count = m_active_slot + 1;
             RCLCPP_WARN(m_node->get_logger(),
-                        "slot %d failed (error_code=%d); skipping it and moving to slot %d.",
-                        m_active_slot, status.error_code, m_placed_count);
+                        "t=%.2f slot %d failed (error_code=%d); writing that rock off and moving to slot %d.",
+                        time, m_active_slot, status.error_code, m_placed_count);
         }
         // This rock's state is ours now. Tell the arm to let go of its reference, or the
         // next StartPickPlace's RemoveRockLock() would unfix the stone we just laid.
         m_arm.ForgetTargetRock();
         m_active_slot = -1;
+        m_active_rock.reset();
     }
 
     if (!m_reported_complete && BuildComplete()) {
@@ -262,21 +338,44 @@ void BuilderArmRosBridge::PublishBuildTopics(double time) {
     base.data = {pos.x(), pos.y(), pos.z(), rot.e0(), rot.e1(), rot.e2(), rot.e3()};
     m_base_pose_pub->publish(base);
 
-    // ready=0 means "do not solve": the hull is still driving to station, the course is
-    // finished, or the heap is empty. The x/y/z are still sent so a stalled builder can
-    // be diagnosed from the topic instead of from the log.
+    // ready=0 means "do not solve": the hull is still driving to station, the arm is
+    // already working, the course is finished, or nothing is in reach. The x/y/z are
+    // still sent so a stalled builder can be diagnosed from the topic instead of the log.
     const int slot = ReadySlot();
     const int slot_for_geometry = std::min(std::max(m_placed_count, 0),
                                            static_cast<int>(m_wall_slots.size()) - 1);
     std_msgs::msg::Float64MultiArray pick;
-    if (slot_for_geometry >= 0 && m_pile_rocks[slot_for_geometry]) {
-        const auto rock_pos = m_pile_rocks[slot_for_geometry]->GetPos();
+    if (slot_for_geometry >= 0 && m_selected) {
+        const auto rock_pos = m_selected->GetPos();
         pick.data = {slot >= 0 ? 1.0 : 0.0, static_cast<double>(slot_for_geometry), rock_pos.x(), rock_pos.y(),
                      rock_pos.z() + grab_z_offset};
     } else {
         pick.data = {0.0, -1.0, 0.0, 0.0, 0.0};
     }
     m_pick_target_pub->publish(pick);
+
+    // Parked, still owing the wall a rock, and nothing in reach: the builder is waiting
+    // on its collector. Normal between loads, fatal if it never ends, so it is reported
+    // rather than left to be inferred from a wall that stopped growing.
+    if (m_hull_parked && !m_arm.IsBusy() && !m_selected && !BuildComplete()) {
+        if (m_starved_since < 0.0)
+            m_starved_since = time;
+        if (time - m_last_starved_report >= starved_report_period) {
+            m_last_starved_report = time;
+            size_t spare = 0;
+            for (const auto& rock : m_feedstock) {
+                if (rock && !m_consumed.count(rock.get()))
+                    ++spare;
+            }
+            RCLCPP_INFO(m_node->get_logger(),
+                        "waiting at slot %d for %.0f s: %zu rock(s) known, none within %.1f-%.1f m of the "
+                        "arm base.",
+                        m_placed_count, time - m_starved_since, spare, feedstock_reach_min,
+                        feedstock_reach_max);
+        }
+    } else {
+        m_starved_since = -1.0;
+    }
 
     std_msgs::msg::Float64MultiArray place;
     if (slot_for_geometry >= 0) {
