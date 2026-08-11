@@ -5,15 +5,18 @@
 
 #include <chrono>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 #include <memory>
+#include <random>
 #include <sstream>
 #include <string>
 #include <vector>
 
 #include "chrono/ChConfig.h"
 #include "chrono/assets/ChVisualShapeBox.h"
+#include "chrono/assets/ChVisualShapeTriangleMesh.h"
 #include "chrono/core/ChRealtimeStep.h"
 #include "chrono/core/ChDataPath.h"
 #include "chrono/core/ChTypes.h"
@@ -83,8 +86,13 @@ const double terrain_max_height = 25.0;
 const double terrain_height_probe_clearance = 10.0;
 const RockFieldConfig rock_field_config;
 const float global_camera_update_rate = 30.0f;
-const unsigned int global_camera_width = 1280;
-const unsigned int global_camera_height = 720;
+// 1080p. Same 16:9 aspect as the previous 1280x720, so the framing is unchanged and only
+// the pixel count moves -- 0.92 Mpx to 2.07 Mpx, so budget ~2.25x the OptiX render cost
+// on the sensor rank. That rank shares the SynChrono heartbeat with every robot rank, so
+// if it becomes the pacing rank the whole job slows; global_camera_update_rate is the
+// knob for that (24 Hz is still fine for video).
+const unsigned int global_camera_width = 1920;
+const unsigned int global_camera_height = 1080;
 const float global_camera_fov = static_cast<float>(CH_PI_3);
 const ChVector3d global_camera_position(-100.0, 30.0, 30.0);
 const ChVector3d global_camera_target(30.0, 0.0, 5.0);
@@ -100,6 +108,9 @@ const double vehicle_start_clearance = 1.50;
 // light trailer don't bounce.
 const double seat_clearance = 0.025;
 const double builder_ride_height = 0.7;
+// Sim time for which the builder holds full brake and ignores every ROS command, so its
+// single-pin track settles onto the terrain before a controller can move it.
+const double builder_settle_time = 1.5;
 // Site geometry (centre, work circle, builder orbit, collector ring) lives in
 // src/RobotLayout.h so the placement of every rank's builder and collector comes
 // from one source.
@@ -157,6 +168,114 @@ double DistanceToTerrainEdge(const ChVector3d& origin,
     return distance;
 }
 
+// Seat the builder on a FITTED TERRAIN PLANE rather than a single height probe.
+//
+// The old placement probed the terrain at the chassis centre only and set the hull level
+// (yaw only) at that height + builder_ride_height. Measured off terrain2.bmp, the ground
+// under the builder's 5.4 x 2.7 m footprint tilts 2.4-9.5 degrees depending on where the
+// lane puts it, so a level hull is out by 0.23-0.82 m across the footprint: the shoes at
+// the high end start buried and the ones at the low end start in the air. Under SMC a
+// buried shoe is a penalty force with nowhere to go, which is the same trap the pinned
+// hull hits (see BuilderRig's constructor) reached by a different route.
+//
+// Fitting a plane and matching pitch and roll to it cuts the worst-case seating error to
+// 0.019-0.077 m -- 6x to 20x better -- at every radius, which is the point: this is a fix
+// for the seating, not for one lucky lane radius.
+struct BuilderSeating {
+    ChCoordsys<> pose;
+    double level_error;  // worst seating error the old single-probe placement would give
+    double plane_error;  // worst residual about the fitted plane
+    double tilt_deg;
+    double lift;
+};
+
+BuilderSeating SeatBuilderOnTerrainPlane(RigidTerrain& terrain,
+                                         double center_x,
+                                         double center_y,
+                                         double yaw,
+                                         double ride_height,
+                                         double height_probe_z) {
+    // Hull footprint in the chassis frame, from Chassis.obj. Note it is NOT centred on
+    // the chassis reference (-4.903 .. +0.498), which is why the plane fit below has to
+    // centre on the sample centroid rather than on the builder's own origin.
+    constexpr double hull_x_min = -4.903;
+    constexpr double hull_x_max = 0.498;
+    constexpr double hull_y_half = 1.343;
+    constexpr int nx = 9;
+    constexpr int ny = 5;
+    const double cos_yaw = std::cos(yaw);
+    const double sin_yaw = std::sin(yaw);
+
+    std::vector<ChVector3d> samples;
+    samples.reserve(nx * ny);
+    for (int i = 0; i < nx; ++i) {
+        const double lx = hull_x_min + (hull_x_max - hull_x_min) * i / (nx - 1.0);
+        for (int j = 0; j < ny; ++j) {
+            const double ly = -hull_y_half + 2.0 * hull_y_half * j / (ny - 1.0);
+            const double wx = center_x + lx * cos_yaw - ly * sin_yaw;
+            const double wy = center_y + lx * sin_yaw + ly * cos_yaw;
+            samples.emplace_back(wx, wy, terrain.GetHeight(ChVector3d(wx, wy, height_probe_z)));
+        }
+    }
+
+    const double n = static_cast<double>(samples.size());
+    double mean_x = 0.0, mean_y = 0.0, mean_z = 0.0;
+    for (const auto& s : samples) {
+        mean_x += s.x();
+        mean_y += s.y();
+        mean_z += s.z();
+    }
+    mean_x /= n;
+    mean_y /= n;
+    mean_z /= n;
+
+    double sxx = 0.0, sxy = 0.0, syy = 0.0, sxz = 0.0, syz = 0.0;
+    for (const auto& s : samples) {
+        const double ex = s.x() - mean_x, ey = s.y() - mean_y, ez = s.z() - mean_z;
+        sxx += ex * ex;
+        sxy += ex * ey;
+        syy += ey * ey;
+        sxz += ex * ez;
+        syz += ey * ez;
+    }
+    const double det = sxx * syy - sxy * sxy;
+    double slope_x = 0.0, slope_y = 0.0;
+    if (std::abs(det) > 1e-12) {
+        slope_x = (syy * sxz - sxy * syz) / det;
+        slope_y = (sxx * syz - sxy * sxz) / det;
+    }
+    const auto plane_z = [&](double x, double y) {
+        return mean_z + slope_x * (x - mean_x) + slope_y * (y - mean_y);
+    };
+
+    const double center_probe = terrain.GetHeight(ChVector3d(center_x, center_y, height_probe_z));
+    double level_error = 0.0, plane_error = 0.0, max_residual = 0.0;
+    for (const auto& s : samples) {
+        level_error = std::max(level_error, std::abs(s.z() - center_probe));
+        const double residual = s.z() - plane_z(s.x(), s.y());
+        plane_error = std::max(plane_error, std::abs(residual));
+        max_residual = std::max(max_residual, residual);
+    }
+
+    // Local Z on the plane normal, yaw preserved: SetFromAxisZ orthogonalises the
+    // suggested X against the normal, so the tangential heading survives the tilt.
+    ChMatrix33<> rot;
+    rot.SetFromAxisZ(ChVector3d(-slope_x, -slope_y, 1.0).GetNormalized(),
+                     ChVector3d(cos_yaw, sin_yaw, 0.0));
+
+    BuilderSeating seating;
+    // Lift by the largest bump above the fitted plane so the highest sample only just
+    // touches, instead of starting inside a track shoe.
+    seating.pose = ChCoordsys<>(
+        ChVector3d(center_x, center_y, plane_z(center_x, center_y) + ride_height + max_residual),
+        rot.GetQuaternion());
+    seating.level_error = level_error;
+    seating.plane_error = plane_error;
+    seating.tilt_deg = std::atan(std::hypot(slope_x, slope_y)) * CH_RAD_TO_DEG;
+    seating.lift = max_residual;
+    return seating;
+}
+
 void AddOrbitVisualRing(ChSystem* system,
                         RigidTerrain& terrain,
                         double center_x,
@@ -174,7 +293,9 @@ void AddOrbitVisualRing(ChSystem* system,
         2.0 * radius * std::sin(0.5 * segment_angle) * 1.02;
 
     auto ring = chrono_types::make_shared<ChBody>();
-    ring->SetName(name);
+    // Radius is appended rather than baked into the caller's literal: the previous
+    // names said 30m/40m/50m for rings that were actually at 30/35/40.
+    ring->SetName(name + "_" + std::to_string(std::lround(radius)) + "m");
     ring->SetFixed(true);
     ring->EnableCollision(false);
 
@@ -239,6 +360,267 @@ void AddCenterPad(ChSystem* system, RigidTerrain& terrain, double height_probe_z
     }
 
     system->AddBody(pad);
+}
+
+// Scenery rock clumps inside each rank's BUILDER REACH -- pyramid piles and scattered
+// clusters, so a rank's work area reads as a real site rather than bare ground.
+//
+// VISUAL ONLY, and deliberately so. Everything goes on ONE fixed, collision-disabled body
+// per rank, exactly as AddCenterPad does: a fixed body with collision off contributes no
+// DOF to the solver and generates no contact pairs, so a few hundred rocks cost nothing
+// but render time.
+//
+// Placed by the ARM's reach, not by an offset from something else. The builder parks
+// tangentially at builder_path_radius with its arm base 2.5 m back along the hull, and the
+// band proven in service is 2.78-4.44 m from that base (see RobotLayout). Clumps are put
+// at 3.0-4.2 m from the base, fanned about the outward radial so they sit outboard of the
+// hull rather than under it. Two useful consequences fall out: they clear the builder's
+// tracks (which occupy builder_path_radius +/- 1.343 m), and because the arm base is
+// already 2.5 m off the rank's ray, they land off the collector's radial approach path
+// instead of in it.
+//
+// Every rank builds EVERY rank's clumps, like the rings, because the sensor rank has to
+// see all of them. Placement is seeded per rank rather than randomly, so a robot rank's
+// VSG and the global camera put the same rock in the same place.
+void AddSpawnRockClumps(ChSystem* system,
+                        RigidTerrain& terrain,
+                        const std::string& chrono_data_path,
+                        int num_robots,
+                        double height_probe_z) {
+    if (num_robots <= 0)
+        return;
+
+    // These are SCENERY -- background rubble, not feedstock. The rocks the builder
+    // actually picks up are real bodies laid out by AddBuilderPileRocks, in heaps on the
+    // outward radial at 36.6 m.
+    //
+    // Which is why this fan is now offset CLOCKWISE instead of centred on that radial.
+    // Centred, it put decorative clumps within 1.3 m of the first working heap -- closer
+    // than the sum of their spreads, so the two interpenetrated. The builder starts at
+    // slot 0 and works counter-clockwise, so everything clockwise of its ray is ground it
+    // never occupies; putting the rubble there keeps it out of both the heap line and the
+    // lane while still reading as debris beside the machine.
+    constexpr double reach_min = 3.4;
+    constexpr double reach_max = 5.0;
+    constexpr double arm_base_offset = -2.5;  // along the builder hull, from RobotLayout
+    constexpr double fan_center = -55.0 * CH_DEG_TO_RAD;
+    constexpr double fan_half_angle = 25.0 * CH_DEG_TO_RAD;
+    constexpr int pyramid_clumps = 2;
+    constexpr int cluster_clumps = 4;
+    constexpr double cluster_spread = 0.9;
+
+    // Three Curiosity rocks at three sizes, indexed [size][variant]. LoadRockMesh bakes the
+    // scale into the mesh and drops its base to z=0, so a shape placed at terrain height
+    // rests on the ground. Sizes are picked explicitly -- large on the bottom layer of a
+    // pyramid, small on top -- which is why this is a 2D table and not one flat list.
+    const std::array<std::string, 3> files = {
+        chrono_data_path + "robot/curiosity/rocks/rock1.obj",
+        chrono_data_path + "robot/curiosity/rocks/rock2.obj",
+        chrono_data_path + "robot/curiosity/rocks/rock3.obj",
+    };
+    const std::array<double, 3> scales = {0.12, 0.20, 0.30};  // small, medium, large
+
+    struct RockShape {
+        std::shared_ptr<ChVisualShapeTriangleMesh> shape;
+        double top = 0.0;     // scaled height, for stacking one layer on the next
+        double radius = 0.0;  // scaled horizontal half-extent, for nesting within a layer
+    };
+    auto rock_material = CreateLunarHapkeMaterial();
+    std::array<std::vector<RockShape>, 3> by_size;
+    for (size_t s = 0; s < scales.size(); ++s) {
+        for (const auto& file : files) {
+            auto mesh = LoadRockMesh(file, true, scales[s]);
+            if (!mesh)
+                continue;
+            RockShape entry;
+            for (const auto& v : mesh->GetCoordsVertices()) {
+                entry.top = std::max(entry.top, v.z());
+                entry.radius = std::max(entry.radius, std::hypot(v.x(), v.y()));
+            }
+            entry.shape = chrono_types::make_shared<ChVisualShapeTriangleMesh>();
+            entry.shape->SetMesh(mesh);
+            entry.shape->SetBackfaceCull(true);
+            entry.shape->SetMutable(false);
+            entry.shape->AddMaterial(rock_material);
+            by_size[s].push_back(entry);
+        }
+    }
+    if (by_size[0].empty() || by_size[1].empty() || by_size[2].empty())
+        return;
+
+    auto scenery = chrono_types::make_shared<ChBody>();
+    scenery->SetName("builder_reach_rock_clumps");
+    scenery->SetFixed(true);
+    scenery->EnableCollision(false);
+
+    int placed = 0;
+    for (int robot_index = 0; robot_index < num_robots; ++robot_index) {
+        // Same seed on every rank, different per rank.
+        std::mt19937 rng(90210u + 7919u * static_cast<unsigned>(robot_index));
+        std::uniform_real_distribution<double> unit(-1.0, 1.0);
+        std::uniform_real_distribution<double> yaw(-CH_PI, CH_PI);
+        std::uniform_real_distribution<double> reach(reach_min, reach_max);
+        std::uniform_real_distribution<double> fan(-fan_half_angle, fan_half_angle);
+        std::uniform_int_distribution<int> base_layer_count(3, 4);
+        std::uniform_int_distribution<int> mid_layer_count(2, 3);
+        std::uniform_int_distribution<int> cluster_count(7, 9);
+
+        const double ray = RankRayAngleRad(robot_index, num_robots);
+        const ChVector3d outward(std::cos(ray), std::sin(ray), 0.0);
+        // The builder parks tangent to its lane; its hull +X is the tangential direction.
+        const double hull_heading = BuilderOrbitHeadingRad(robot_index, num_robots);
+        const ChVector3d hull_axis(std::cos(hull_heading), std::sin(hull_heading), 0.0);
+        const ChVector3d arm_base =
+            BuilderOrbitGroundPosition(robot_index, num_robots) + hull_axis * arm_base_offset;
+
+        auto pick = [&](int size) -> const RockShape& {
+            std::uniform_int_distribution<int> v(0, static_cast<int>(by_size[size].size()) - 1);
+            return by_size[size][v(rng)];
+        };
+        auto place = [&](const RockShape& r, const ChVector3d& xy, double z) {
+            scenery->AddVisualShape(r.shape,
+                                    ChFramed(ChVector3d(xy.x(), xy.y(), z), QuatFromAngleZ(yaw(rng))));
+            ++placed;
+        };
+        // Clump centre: fanned clockwise of the outward radial, clear of the working heaps.
+        auto clump_center = [&]() {
+            const double angle = ray + fan_center + fan(rng);
+            return arm_base + ChVector3d(std::cos(angle), std::sin(angle), 0.0) * reach(rng);
+        };
+
+        for (int clump = 0; clump < pyramid_clumps; ++clump) {
+            const ChVector3d center = clump_center();
+            const double ground = terrain.GetHeight(ChVector3d(center.x(), center.y(), height_probe_z));
+
+            // Bottom layer: several LARGE rocks in a ring, spaced so neighbours just touch.
+            const int n_base = base_layer_count(rng);
+            double base_top = 0.0;
+            double base_radius = 0.0;
+            for (int i = 0; i < n_base; ++i) {
+                const RockShape& r = pick(2);
+                // Ring radius that makes n_base rocks of this size sit shoulder to shoulder.
+                const double ring = (n_base > 1) ? r.radius / std::sin(CH_PI / n_base) : 0.0;
+                const double a = CH_2PI * i / n_base + 0.3 * unit(rng);
+                place(r, center + ChVector3d(std::cos(a), std::sin(a), 0.0) * ring, ground);
+                base_top = std::max(base_top, r.top);
+                base_radius = std::max(base_radius, ring);
+            }
+
+            // Middle layer: MEDIUM rocks nested into the hollows of the layer below, so they
+            // sit at 70% of its height rather than perched on top of it.
+            const int n_mid = mid_layer_count(rng);
+            double mid_top = 0.0;
+            const double mid_z = ground + 0.70 * base_top;
+            for (int i = 0; i < n_mid; ++i) {
+                const RockShape& r = pick(1);
+                const double ring = 0.45 * base_radius;
+                const double a = CH_2PI * i / n_mid + CH_PI / n_mid + 0.3 * unit(rng);
+                place(r, center + ChVector3d(std::cos(a), std::sin(a), 0.0) * ring, mid_z);
+                mid_top = std::max(mid_top, r.top);
+            }
+
+            // Capstone: one SMALL rock.
+            place(pick(0), center + ChVector3d(0.12 * unit(rng), 0.12 * unit(rng), 0.0),
+                  mid_z + 0.70 * mid_top);
+        }
+
+        for (int clump = 0; clump < cluster_clumps; ++clump) {
+            const ChVector3d center = clump_center();
+            const int n = cluster_count(rng);
+            for (int i = 0; i < n; ++i) {
+                // Mixed sizes lying about, each settled a little into the regolith.
+                std::uniform_int_distribution<int> size(0, 2);
+                const RockShape& r = pick(size(rng));
+                const ChVector3d xy =
+                    center + ChVector3d(cluster_spread * unit(rng), cluster_spread * unit(rng), 0.0);
+                const double ground = terrain.GetHeight(ChVector3d(xy.x(), xy.y(), height_probe_z));
+                place(r, xy, ground - 0.15 * r.top);
+            }
+        }
+    }
+
+    system->AddBody(scenery);
+    SynLog() << "Builder-reach rock clumps: " << placed << " rocks on 1 fixed collision-free body ("
+             << pyramid_clumps << " pyramids + " << cluster_clumps << " clusters x " << num_robots
+             << " ranks).\n";
+}
+
+// Rocks already LAID on the work circle behind each builder -- the start of the wall it
+// is building, so the site reads as work in progress rather than untouched ground.
+//
+// Deliberately not scattered: these are placed, so they sit exactly on
+// work_circle_radius, evenly spaced by their own width, yaw aligned to the circle's
+// tangent. That reads as deliberate construction; jitter would make it look like spill.
+//
+// "Behind" means clockwise of the rank's ray, because builders orbit counter-clockwise --
+// so the laid section trails the machine that laid it.
+//
+// Visual only, on the same fixed collision-free body rationale as the clumps.
+void AddPlacedWallRocks(ChSystem* system,
+                        RigidTerrain& terrain,
+                        const std::string& chrono_data_path,
+                        int num_robots,
+                        double height_probe_z) {
+    if (num_robots <= 0)
+        return;
+    constexpr int rocks_per_rank = 5;
+    // Scale and pitch BOTH match the rocks the builder actually lays (rock_field_config's
+    // mesh_scale, wall_slot_pitch_rad), because these are the same course. The builder
+    // starts laying at slot 0 -- exactly on the rank's ray -- and works counter-clockwise
+    // from there; this is the section already behind it. At the old 0.30 scale and its own
+    // independent spacing, the decoration's leading stone sat 0.48 m from slot 0 and the
+    // first rock the builder laid landed on top of it.
+    const double wall_rock_scale = rock_field_config.mesh_scale;
+
+    auto material = CreateLunarHapkeMaterial();
+    const std::array<std::string, 3> files = {
+        chrono_data_path + "robot/curiosity/rocks/rock1.obj",
+        chrono_data_path + "robot/curiosity/rocks/rock2.obj",
+        chrono_data_path + "robot/curiosity/rocks/rock3.obj",
+    };
+    std::vector<std::shared_ptr<ChVisualShapeTriangleMesh>> shapes;
+    for (const auto& file : files) {
+        auto mesh = LoadRockMesh(file, true, wall_rock_scale);
+        if (!mesh)
+            continue;
+        auto shape = chrono_types::make_shared<ChVisualShapeTriangleMesh>();
+        shape->SetMesh(mesh);
+        shape->SetBackfaceCull(true);
+        shape->SetMutable(false);
+        shape->AddMaterial(material);
+        shapes.push_back(shape);
+    }
+    if (shapes.empty())
+        return;
+
+    auto wall = chrono_types::make_shared<ChBody>();
+    wall->SetName("work_circle_placed_rocks");
+    wall->SetFixed(true);
+    wall->EnableCollision(false);
+
+    int placed = 0;
+    for (int robot_index = 0; robot_index < num_robots; ++robot_index) {
+        const double ray = RankRayAngleRad(robot_index, num_robots);
+        for (int i = 0; i < rocks_per_rank; ++i) {
+            // Trailing the ray: i = 0 is the stone immediately before slot 0, running
+            // clockwise from there, one full pitch clear of the builder's first slot.
+            const double angle = ray - (i + 1) * wall_slot_pitch_rad;
+            const double x = site_center_x + work_circle_radius * std::cos(angle);
+            const double y = site_center_y + work_circle_radius * std::sin(angle);
+            const double z = terrain.GetHeight(ChVector3d(x, y, height_probe_z));
+            // Yaw follows the tangent so the course curves with the circle. Alternating
+            // meshes keeps five identical stones from looking cloned.
+            const auto& shape = shapes[(robot_index + i) % shapes.size()];
+            wall->AddVisualShape(shape, ChFramed(ChVector3d(x, y, z),
+                                                 QuatFromAngleZ(angle + CH_PI_2)));
+            ++placed;
+        }
+    }
+
+    system->AddBody(wall);
+    SynLog() << "Work-circle placed rocks: " << placed << " on 1 fixed collision-free body ("
+             << rocks_per_rank << " per rank x " << num_robots << " ranks, r=" << work_circle_radius
+             << " m).\n";
 }
 
 // The final rocks and builder centers lie beyond the finite terrain2 heightmap.
@@ -394,6 +776,17 @@ void AddCommandLineOptions(ChCLI& cli) {
                           "Sim-time period (s) of the per-rank instantaneous cost breakdown (0 disables it)",
                           std::to_string(perf_log_period));
     cli.AddOption<bool>("Diagnostics", "builder_no_arm", "Build the builder without its manipulator (cost bisection)");
+    // Divergence bisection: is the builder involved at all? Skipping it also skips its
+    // two AddAgent calls, which SHIFTS every later SynChrono agent id, so a rank that
+    // builds real zombies would mis-key them. Use with --no_sensor.
+    cli.AddOption<bool>("Diagnostics", "no_builder",
+                        "Omit the tracked builder entirely (divergence bisection; shifts SynChrono agent "
+                        "ids, so use with --no_sensor)");
+    // Separates the builder's DRIVE from its BUILD: the arm is only offered a pick while
+    // the builder counts as parked, so suppressing that leaves it orbiting and idle.
+    cli.AddOption<bool>("Diagnostics", "no_build",
+                        "Builder drives its lane but never picks or places (cost/divergence "
+                        "bisection)");
     cli.AddOption<std::string>("Diagnostics", "solver", "Robot-rank solver: bb, apgd, or default", "bb");
     cli.AddOption<int>("Diagnostics", "solver_iterations", "Max solver iterations for the robot ranks", "100");
     cli.AddOption<std::vector<int>>("VSG", "vsg", "MPI ranks that should open VSG visualization", "-1");
@@ -429,6 +822,8 @@ int main(int argc, char* argv[]) {
     perf_log_period = cli.GetAsType<double>("perf_log");
     BuilderRig::Options builder_options;
     builder_options.with_arm = !cli.CheckOption("builder_no_arm");
+    const bool no_builder = cli.CheckOption("no_builder");
+    const bool no_build = cli.CheckOption("no_build");
     const bool no_sensor = cli.CheckOption("no_sensor");
     const std::string sensor_frame_dir = cli.GetAsType<std::string>("sensor_frame_dir");
     const std::string solver_name = cli.GetAsType<std::string>("solver");
@@ -474,6 +869,11 @@ int main(int argc, char* argv[]) {
 
     std::unique_ptr<RobotRig> robot;
     std::unique_ptr<BuilderRig> builder;
+    // Where the builder was seated, so the perf log can report how far it has slid.
+    ChVector3d builder_spawn_pos(0.0, 0.0, 0.0);
+    // The builder's feedstock. Declared out here because SynRockAgent holds the ADDRESS
+    // of this vector for the whole run.
+    std::vector<std::shared_ptr<ChBodyAuxRef>> builder_pile_rocks;
     ChSystem* system = &sensor_system;
     if (owns_robot) {
         const int robot_index = rank - 1;
@@ -503,12 +903,14 @@ int main(int argc, char* argv[]) {
     // Probe from above the tallest possible terrain so the downward ray cast hits.
     const double height_probe_z = terrain_height_offset + terrain_max_height + terrain_height_probe_clearance;
     AddOrbitVisualRing(system, terrain, site_center_x, site_center_y, work_circle_radius, height_probe_z,
-                       ChColor(0.95f, 0.75f, 0.10f), "work_circle_30m");
+                       ChColor(0.95f, 0.75f, 0.10f), "work_circle");
     AddOrbitVisualRing(system, terrain, site_center_x, site_center_y, builder_path_radius, height_probe_z,
-                       ChColor(0.10f, 0.65f, 0.95f), "builder_path_40m");
+                       ChColor(0.10f, 0.65f, 0.95f), "builder_path");
     AddOrbitVisualRing(system, terrain, site_center_x, site_center_y, robot_start_radius, height_probe_z,
-                       ChColor(0.20f, 0.90f, 0.35f), "collector_ring_50m");
+                       ChColor(0.20f, 0.90f, 0.35f), "collector_ring");
     AddCenterPad(system, terrain, height_probe_z);
+    AddSpawnRockClumps(system, terrain, chrono_data_path, num_robot_ranks, height_probe_z);
+    AddPlacedWallRocks(system, terrain, chrono_data_path, num_robot_ranks, height_probe_z);
     AddRockLineTerrainExtensions(terrain, ground_mat, num_robot_ranks, height_probe_z, terrain_length, terrain_width,
                                  rock_field_config);
     auto rock_mat = MakeContactMaterial(contact_method, 0.9f, 0.0f);
@@ -567,19 +969,87 @@ int main(int argc, char* argv[]) {
             std::cout << "[main] solver=" << solver_name << " iterations=" << solver_iterations << "\n";
     }
 
-    if (owns_robot) {
+    if (owns_robot && !no_builder) {
         const int builder_index = robot->GetRobotIndex();
         const ChVector3d builder_ground = BuilderOrbitGroundPosition(builder_index, num_robot_ranks);
-        const double builder_ground_height =
-            terrain.GetHeight(ChVector3d(builder_ground.x(), builder_ground.y(), height_probe_z));
-        const double builder_z = builder_ground_height + builder_ride_height;
         const double builder_heading =
             BuilderOrbitHeadingRad(builder_index, num_robot_ranks);
-        builder = std::make_unique<BuilderRig>(
-            builder_index + 1, system, amd_uw_data_path,
-            ChCoordsys<>(ChVector3d(builder_ground.x(), builder_ground.y(), builder_z),
-                         QuatFromAngleZ(builder_heading)),
-            builder_options);
+        const BuilderSeating seating =
+            SeatBuilderOnTerrainPlane(terrain, builder_ground.x(), builder_ground.y(), builder_heading,
+                                      builder_ride_height, height_probe_z);
+        SynLog() << "Rank " << rank << " builder seating: terrain tilt " << seating.tilt_deg
+                 << " deg, worst error level=" << seating.level_error << " m -> plane="
+                 << seating.plane_error << " m, lift=" << seating.lift << " m.\n";
+
+        // The builder's own build plan, entirely independent of the collector: a course
+        // of slots to fill on the work circle and a heap of real rocks to fill them from.
+        // Slot k's rock is pile_rocks[k]. See RobotLayout's build-plan block.
+        BuilderRig::Options plan_options = builder_options;
+        const int wall_slot_count = BuilderWallSlotCount(num_robot_ranks);
+        builder_pile_rocks = AddBuilderPileRocks(system, terrain, rock_mat, chrono_data_path, amd_uw_data_path,
+                                                 builder_index, num_robot_ranks, wall_slot_count, height_probe_z,
+                                                 rock_field_config);
+        plan_options.pile_rocks = builder_pile_rocks;
+        for (int slot = 0; slot < wall_slot_count; ++slot) {
+            ChVector3d p = BuilderWallSlotPosition(builder_index, num_robot_ranks, slot);
+            // Release height above the terrain at that slot: the rock is let go from rest
+            // and drops the last little bit, so it seats itself instead of being pressed
+            // into the regolith by the fingers.
+            p.z() = terrain.GetHeight(ChVector3d(p.x(), p.y(), height_probe_z)) + 0.20;
+            plan_options.wall_slots.push_back(p);
+        }
+        SynLog() << "Rank " << rank << " build plan: " << wall_slot_count << " wall slots at "
+                 << wall_slot_pitch_m << " m pitch (" << builder_pile_rocks.size() << " feedstock rocks in "
+                 << ((wall_slot_count + wall_slots_per_pile - 1) / wall_slots_per_pile) << " heaps), "
+                 << wall_slot_count * wall_slot_pitch_rad * builder_path_radius << " m of lane to walk.\n";
+
+        // Reach audit, at t=0, against the NOMINAL arm base for each slot. Every target in
+        // this plan has to be inside the arm's envelope or the builder silently refuses
+        // rocks it is parked beside -- and that only shows up once the machine has driven
+        // to its first station, tens of minutes into a run. A first cut at the heap angle
+        // put every heap 5.62 m out, past the 5.2 m guard, and nothing said so until then.
+        // Bounds are LrvArm's scaled envelope: [1.0, 2.6] m * arm_geometry_scale 2.0.
+        {
+            constexpr double envelope_min = 2.0;
+            constexpr double envelope_max = 5.2;
+            double heap_min = 1e9, heap_max = 0.0, slot_min = 1e9, slot_max = 0.0;
+            for (int slot = 0; slot < wall_slot_count; ++slot) {
+                // The hull leads its slot by arm_lead precisely so the ARM BASE lands on
+                // the slot's own angle; see BuilderStationAngleRad.
+                const double base_angle = RankRayAngleRad(builder_index, num_robot_ranks) +
+                                          slot * wall_slot_pitch_rad;
+                const ChVector3d base(site_center_x + builder_arm_base_radius_approx * std::cos(base_angle),
+                                      site_center_y + builder_arm_base_radius_approx * std::sin(base_angle), 0.0);
+                const ChVector3d heap =
+                    BuilderPileCenter(builder_index, num_robot_ranks, slot / wall_slots_per_pile);
+                const ChVector3d wall = BuilderWallSlotPosition(builder_index, num_robot_ranks, slot);
+                const double dh = (heap - base).Length();
+                const double dw = (wall - base).Length();
+                heap_min = std::min(heap_min, dh);
+                heap_max = std::max(heap_max, dh);
+                slot_min = std::min(slot_min, dw);
+                slot_max = std::max(slot_max, dw);
+            }
+            SynLog() << "Rank " << rank << " reach audit: heap " << heap_min << "-" << heap_max
+                     << " m, wall slot " << slot_min << "-" << slot_max << " m (arm envelope "
+                     << envelope_min << "-" << envelope_max << " m).\n";
+            if (heap_min < envelope_min || heap_max > envelope_max || slot_min < envelope_min ||
+                slot_max > envelope_max) {
+                SynLog() << "Rank " << rank
+                         << " BUILD PLAN OUT OF REACH: the builder will refuse targets it is parked "
+                            "beside. Check builder_pile_radius / wall_slot_pitch_m / the arm_lead "
+                            "convention in RobotLayout.h.\n";
+            }
+        }
+
+        builder = std::make_unique<BuilderRig>(builder_index + 1, system, amd_uw_data_path, seating.pose,
+                                               plan_options);
+        builder_spawn_pos = builder->GetPosition();
+        // Nothing may command this builder until its track has found equilibrium on the
+        // terrain. The rover gets a careful settle and re-seat (RobotRig::Settle); the
+        // builder never had one.
+        builder->SetCommandEnableTime(builder_settle_time);
+        builder->SetHullParkEnabled(!no_build);
     }
 
     if (owns_robot) {
@@ -600,16 +1070,23 @@ int main(int argc, char* argv[]) {
         // Pass the ADDRESS of the rig's live rock vector. Passing it by value took a
         // snapshot of the two cycle-0 rocks that never grew, so every rock spawned
         // by a later harvest cycle was transmitted to nobody and drawn nowhere.
-        syn_manager.AddAgent(chrono_types::make_shared<SynRockAgent>(&robot->GetRocks(), chrono_data_path,
-                                                                     /*visualize_zombies=*/false, rock_field_config));
+        syn_manager.AddAgent(chrono_types::make_shared<SynRockAgent>(
+            &robot->GetRocks(), chrono_data_path, /*visualize_zombies=*/false, rock_field_config,
+            // The builder's feedstock rides the same agent rather than a new one, because
+            // a new AddAgent would shift every agent id declared above.
+            &builder_pile_rocks, BuilderWallSlotCount(num_robot_ranks)));
 
-        syn_manager.AddAgent(chrono_types::make_shared<AmdTrackedVehicleAgent>(
-            builder->GetVehicle(), amd_uw_data_path + "synchrono/vehicle/M113.json"));
-        syn_manager.AddAgent(chrono_types::make_shared<SynArmAgent>(
-            builder->GetArm() ? builder->GetArm()->GetBodies()
-                              : std::vector<std::shared_ptr<ChBodyAuxRef>>{},
-            amd_uw_data_path, builder_arm_shapes_dir, builder_arm_geometry_scale,
-            /*visualize_zombies=*/false));
+        // Skipped entirely under --no_builder, which is why that flag shifts the agent
+        // ids of everything registered after it.
+        if (builder) {
+            syn_manager.AddAgent(chrono_types::make_shared<AmdTrackedVehicleAgent>(
+                builder->GetVehicle(), amd_uw_data_path + "synchrono/vehicle/M113.json"));
+            syn_manager.AddAgent(chrono_types::make_shared<SynArmAgent>(
+                builder->GetArm() ? builder->GetArm()->GetBodies()
+                                  : std::vector<std::shared_ptr<ChBodyAuxRef>>{},
+                amd_uw_data_path, builder_arm_shapes_dir, builder_arm_geometry_scale,
+                /*visualize_zombies=*/false));
+        }
 
         syn_manager.AddAgent(chrono_types::make_shared<SynTrailerBedAgent>(
             robot->GetTrailerBed(), robot->GetTrailerTailgate(), /*visualize_zombies=*/false));
@@ -622,9 +1099,13 @@ int main(int argc, char* argv[]) {
             amd_uw_data_path, rover_arm_shapes_dir, rover_arm_geometry_scale,
             /*visualize_zombies=*/false));
 
-        const ChVector3d builder_pos = builder->GetPosition();
-        SynLog() << "Rank " << rank << " builder at (" << builder_pos.x() << ", " << builder_pos.y() << ", "
-                 << builder_pos.z() << ").\n";
+        if (builder) {
+            const ChVector3d builder_pos = builder->GetPosition();
+            SynLog() << "Rank " << rank << " builder at (" << builder_pos.x() << ", " << builder_pos.y() << ", "
+                     << builder_pos.z() << ").\n";
+        } else {
+            SynLog() << "Rank " << rank << " has NO builder (--no_builder).\n";
+        }
     } else {
         syn_manager.AddAgent(chrono_types::make_shared<SynEnvironmentAgent>(system));
         SynLog() << "Rank 0 is sensor/visualization only; robot physics starts on rank 1.\n";
@@ -645,8 +1126,11 @@ int main(int argc, char* argv[]) {
         }
 
         // A zombie owns no rocks of its own; it only receives poses.
+        // A zombie owns no rocks of its own; it only receives poses. The capacity must
+        // still match the sender's, or the tail of the message has nowhere to be drawn.
         syn_manager.AddZombie(chrono_types::make_shared<SynRockAgent>(
-                                  nullptr, chrono_data_path, /*visualize_zombies=*/true, rock_field_config),
+                                  nullptr, chrono_data_path, /*visualize_zombies=*/true, rock_field_config,
+                                  nullptr, BuilderWallSlotCount(num_robot_ranks)),
                               AgentKey(robot_rank, rock_agent_id));
         syn_manager.AddZombie(
             chrono_types::make_shared<SynArmAgent>(
@@ -795,13 +1279,22 @@ int main(int argc, char* argv[]) {
             }
             {
                 ScopedTimer timer(perf_accum.bldr_sync);
-                // Keep the builder stationed inboard of its collector's CURRENT drop
-                // point: both derive from the same rank lane angle, which advances one
-                // step per harvest cycle.
-                if (robot)
-                    builder->SetStationAngle(
-                        RankRayAngleRad(robot->GetRobotIndex(), num_robot_ranks, robot->GetHarvestCycle()));
-                builder->Synchronize(time);
+                // The builder's station is its OWN, driven by how much wall it has laid
+                // and by nothing else.
+                //
+                // It used to be RankRayAngleRad(..., robot->GetHarvestCycle()) -- the
+                // builder was parked on whatever bearing its collector's lane happened to
+                // be on, and it only ever moved when that collector finished a load and
+                // dumped. So a builder was idle for an entire harvest (minutes of sim),
+                // then teleported 30 degrees round the site in one step of the station
+                // angle, and its arm had nothing to do at either end. Now it steps one
+                // wall slot -- 0.9 m of course, 0.99 m of lane -- each time it lays a
+                // rock, which is a thing it does entirely on its own.
+                if (builder) {
+                    builder->SetStationAngle(BuilderStationAngleRad(robot->GetRobotIndex(), num_robot_ranks,
+                                                                    builder->GetPlacedCount()));
+                    builder->Synchronize(time);
+                }
             }
             const DriverInputs driver_inputs = robot->GetDriverInputs();
             {
@@ -815,7 +1308,8 @@ int main(int argc, char* argv[]) {
             // robot->Advance() is what issues that DoStepDynamics.
             {
                 ScopedTimer timer(perf_accum.bldr_adv);
-                builder->Advance(step_size);
+                if (builder)
+                    builder->Advance(step_size);
             }
             {
                 ScopedTimer timer(perf_accum.robot_adv);
@@ -902,7 +1396,12 @@ int main(int argc, char* argv[]) {
                      << " steer=" << inputs.m_steering << " thr=" << inputs.m_throttle
                      << " brk=" << inputs.m_braking << " speed=" << builder->GetSpeed() << " r="
                      << std::hypot(builder_pos.x() - site_center_x, builder_pos.y() - site_center_y)
-                     << " z=" << builder_pos.z() << " shoe_dmax=" << builder->GetMaxShoeDistance() << "\n";
+                     << " z=" << builder_pos.z() << " shoe_dmax=" << builder->GetMaxShoeDistance()
+                     << " parked=" << (builder->IsParked() ? 1 : 0)
+                     // Drift from where this builder was placed. The orbit controller only
+                     // closes the loop on orbit ANGLE, so radial drift shows up here and
+                     // nowhere else.
+                     << " drift=" << (builder_pos - builder_spawn_pos).Length() << "\n";
             }
             SynLog() << perf.str();
             perf_accum.Reset();

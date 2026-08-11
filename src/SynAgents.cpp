@@ -122,9 +122,13 @@ void SynTrailerAgent::Update() {
 SynRockAgent::SynRockAgent(const std::vector<std::shared_ptr<chrono::ChBodyAuxRef>>* rocks,
                            std::string chrono_data_path,
                            bool visualize_zombies,
-                           RockFieldConfig config)
+                           RockFieldConfig config,
+                           const std::vector<std::shared_ptr<chrono::ChBodyAuxRef>>* builder_rocks,
+                           int builder_rock_capacity)
     : chrono::synchrono::SynAgent(),
       m_rocks(rocks),
+      m_builder_rocks(builder_rocks),
+      m_builder_rock_capacity(builder_rock_capacity),
       m_chrono_data_path(std::move(chrono_data_path)),
       m_visualize_zombies(visualize_zombies),
       m_config(config),
@@ -155,7 +159,10 @@ void SynRockAgent::InitializeZombie(chrono::ChSystem* system) {
     // scene, since both bind their renderables at initialise time. Unused ones wait
     // below the terrain until a message places them.
     const int robot_index = m_agent_key.GetNodeID() - 1;
-    const int capacity = std::max(1, m_config.rocks_per_rank) * zombie_rock_cycle_capacity;
+    // Harvest rocks (rocks_per_rank per cycle) plus the builder's feedstock heap, which
+    // is sent on the same message and so needs zombies of its own at the end of the run.
+    const int capacity = std::max(1, m_config.rocks_per_rank) * zombie_rock_cycle_capacity +
+                         std::max(0, m_builder_rock_capacity);
     for (int i = 0; i < capacity; i++) {
         const int shape_index = (robot_index * m_config.rocks_per_rank + i) % static_cast<int>(rock_vis_shapes.size());
         auto rock = chrono_types::make_shared<chrono::ChBodyAuxRef>();
@@ -214,7 +221,7 @@ void SynRockAgent::Update() {
         m_agent_key, chrono::synchrono::AgentKey());
     rock_approach->time = m_state->time;
 
-    for (const auto& rock : *m_rocks) {
+    auto emit = [&rock_approach](const std::shared_ptr<chrono::ChBodyAuxRef>& rock) {
         const auto frame = rock->GetFrameRefToAbs();
         const auto p = frame.GetPos();
         const auto q = frame.GetRot();
@@ -224,7 +231,20 @@ void SynRockAgent::Update() {
                      chrono::ChVector3d(q.e0(), q.e1(), q.e2()),
                      chrono::ChVector3d(q.e3(), 0.0, 0.0),
                  });
+    };
+
+    // Builder feedstock FIRST, harvest rocks after. Order matters: the receiving side
+    // maps lane index to a fixed zombie body, and the harvest list GROWS every cycle. Put
+    // the feedstock last and every new harvest rock would shift the whole heap by one
+    // zombie, so the wall the builder had already laid would appear to shuffle itself
+    // each time its collector dumped. The feedstock list is fixed in length, so leading
+    // with it pins every index for the run and lets the harvest list grow behind it.
+    if (m_builder_rocks) {
+        for (const auto& rock : *m_builder_rocks)
+            emit(rock);
     }
+    for (const auto& rock : *m_rocks)
+        emit(rock);
 
     rock_intersection.approaches.push_back(rock_approach);
     m_state->intersections.push_back(rock_intersection);

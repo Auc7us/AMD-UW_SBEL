@@ -88,6 +88,17 @@ class LrvArm {
     // the approach cannot knock it), so the rig must not re-toggle its collision.
     std::shared_ptr<chrono::ChBodyAuxRef> GetActiveRock() const;
 
+    // Hand that ownership back once the caller has finished with the rock.
+    //
+    // Without this the arm keeps a reference to the LAST rock it handled, and the next
+    // StartPickPlace begins with RemoveRockLock() -- which unfixes whatever m_target_rock
+    // still points at. For the rover that is harmless (its rocks are dynamic anyway), but
+    // the builder re-FIXES each rock as it lays it into the wall, and starting the next
+    // slot would quietly undo that. Twenty-three of a twenty-four stone course would end
+    // up as free bodies. Call this after taking over the rock's state; it is a no-op
+    // while a rock is still welded to the gripper.
+    void ForgetTargetRock();
+
   private:
     enum class Phase { IDLE, APPROACH, CLOSING, LIFTING, PLACING, RELEASING, STOWING, DONE, FAILED };
 

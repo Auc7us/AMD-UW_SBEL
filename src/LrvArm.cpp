@@ -77,6 +77,14 @@ constexpr double total_timeout = 45.0;
 // The arm spans ~2.72 m from base origin to fingertip at geometry_scale 1, so the
 // upper bound is just inside full extension: a target beyond it can only be
 // reached by a solution that is straight-armed and singular.
+//
+// All three are LENGTHS, so they scale with the arm. The builder's arm is the same
+// model at geometry_scale 2.0: its links are twice as long, it spans 5.44 m instead of
+// 2.72 m, and it works a heap 3.5 m from its base. Left unscaled these bounds reject
+// every legitimate builder grab (3.5 > 2.6) with error_code 5 -- the arm would refuse
+// every rock it was parked next to. divergence_abort is the same kind of quantity (a
+// gripper position error) and scales for the same reason. The FINGER constants below do
+// NOT scale: finger geometry stays 1x on the builder (see BuilderRig).
 constexpr double min_grab_reach_xy = 1.0;
 constexpr double max_grab_reach_xy = 2.6;
 constexpr double min_grab_local_z = -1.2;
@@ -470,13 +478,17 @@ bool LrvArm::StartPickPlace(double command_seq,
     // target inside the rover means after the fingers have been driven into the
     // chassis. See min_grab_reach_xy.
     {
+        const double min_reach = min_grab_reach_xy * m_geometry_scale;
+        const double max_reach = max_grab_reach_xy * m_geometry_scale;
+        const double min_local_z = min_grab_local_z * m_geometry_scale;
         const chrono::ChVector3d local = GetIkFrameRot().RotateBack(grab_target_world - GetIkFramePos());
         const double reach_xy = std::hypot(local.x(), local.y());
-        if (reach_xy < min_grab_reach_xy || reach_xy > max_grab_reach_xy || local.z() < min_grab_local_z) {
+        if (reach_xy < min_reach || reach_xy > max_reach || local.z() < min_local_z) {
             std::cout << "[LrvArm] grab target OUT OF ENVELOPE: local=(" << local.x() << ", " << local.y()
-                      << ", " << local.z() << ") reach_xy=" << reach_xy << " m, allowed ["
-                      << min_grab_reach_xy << ", " << max_grab_reach_xy << "] and z >= " << min_grab_local_z
-                      << ". The rover is parked wrong for this rock; refusing to fold the arm through "
+                      << ", " << local.z() << ") reach_xy=" << reach_xy << " m, allowed [" << min_reach
+                      << ", " << max_reach << "] and z >= " << min_local_z << " (geometry_scale "
+                      << m_geometry_scale
+                      << "). The vehicle is parked wrong for this rock; refusing to fold the arm through "
                          "itself to reach it.\n";
             FinishFailed(5);
             return false;
@@ -536,8 +548,9 @@ void LrvArm::Update(double time) {
         // A grab pose Python solved should settle near the rock. A gross miss means
         // the pose was bad (unreachable / wrong frame); fail cleanly instead of
         // clamping the fingers onto empty space.
-        if (err > divergence_abort) {
-            std::cout << "[LrvArm] grab pose diverged err=" << err << " -> failing\n";
+        if (err > divergence_abort * m_geometry_scale) {
+            std::cout << "[LrvArm] grab pose diverged err=" << err << " (limit "
+                      << divergence_abort * m_geometry_scale << ") -> failing\n";
             FinishFailed(2);
             return;
         }
@@ -699,6 +712,15 @@ std::shared_ptr<chrono::ChBodyAuxRef> LrvArm::GetActiveRock() const {
         return m_target_rock;
     }
     return nullptr;
+}
+
+void LrvArm::ForgetTargetRock() {
+    // Refuse while the rock is still welded on: dropping the reference then would leave
+    // the weld pointing at a body nothing else tracks, and RemoveRockLock could never
+    // restore its collision.
+    if (m_rock_lock)
+        return;
+    m_target_rock.reset();
 }
 
 void LrvArm::SetJointTargets(const std::array<double, 4>& theta) {

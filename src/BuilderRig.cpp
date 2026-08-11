@@ -122,6 +122,13 @@ BuilderRig::BuilderRig(int rank,
     m_m113->SetInitPosition(init_pose);
     m_m113->Initialize();
 
+    // Do NOT rescale the idler tensioner for lunar gravity. It looks wrong on paper --
+    // the stock 2e4 N preload and 1e6 N/m spring are Earth numbers, and at 1.62 the
+    // tensioners push with more than the vehicle's whole weight -- but it was measured:
+    // scaling all three coefficients by g/9.81 moved this rank's divergence from clean
+    // to t=11.30, and combined with a 33 m builder lane from t=13.35 to t=6.44. The
+    // softer spring lets the chain go slack, which is worse than the hard preload.
+
     // Install a builder-specific, vertically squashed hull visual below. This
     // leaves the physical chassis and every tracked-running-gear visual intact.
     m_m113->SetChassisVisualizationType(VisualizationType::NONE);
@@ -165,7 +172,8 @@ BuilderRig::BuilderRig(int rank,
 
 #ifdef AMD_UW_ENABLE_ROS2
     if (m_arm)
-        m_arm_ros_bridge = std::make_unique<BuilderArmRosBridge>(rank, *m_arm);
+        m_arm_ros_bridge =
+            std::make_unique<BuilderArmRosBridge>(rank, *m_arm, options.pile_rocks, options.wall_slots);
     m_vehicle_ros_bridge =
         std::make_unique<BuilderVehicleRosBridge>(rank, m_m113->GetVehicle());
 #endif
@@ -225,18 +233,159 @@ void BuilderRig::SetDriverInputs(const chrono::vehicle::DriverInputs& inputs) {
 
 void BuilderRig::Synchronize(double time) {
 #ifdef AMD_UW_ENABLE_ROS2
-    // The builder starts braked and simply holds until ROS takes over; there is no
-    // hull to release, so a command is just a command.
-    if (const auto command = m_vehicle_ros_bridge->Synchronize())
+    // The builder holds the brake until ROS takes over -- see the initialiser on
+    // m_driver_inputs, which is what actually makes that true. Retaining the last
+    // command between messages is deliberate: the controller runs at 20 Hz and the sim
+    // steps at 2 kHz.
+    if (time < m_command_enable_time) {
+        // Settling window. The bridge is still spun so its subscription queue cannot
+        // back up, but whatever the controller sent is discarded and the brake stays on.
+        m_vehicle_ros_bridge->Synchronize(time);
+        m_driver_inputs = chrono::vehicle::DriverInputs{0.0, 0.0, 1.0, 0.0};
+    } else if (const auto command = m_vehicle_ros_bridge->Synchronize(time)) {
         m_driver_inputs = *command;
-    if (m_arm_ros_bridge)
-        m_arm_ros_bridge->Synchronize();
+    }
 #endif
+    // DO NOT PIN THE HULL. m_parked is a STATE, not an action: it means "the controller
+    // is holding the brake and the hull has actually stopped", which is the condition the
+    // arm bridge needs before it solves a pose against the arm base frame. Nothing here
+    // calls SetFixed, and it must not.
+    //
+    // Pinning was tried and measured, twice, and it tears the single-pin track apart.
+    // SetFixed does not decelerate a body, it removes it from the solve, so the chassis
+    // velocity is forced to zero in one step while ~130 track shoes, the road wheels and
+    // the idler tensioners are still solving against the velocity it had a step ago. Same
+    // signature every time: idler carriers at 140-364 rad/s and 25 m/s within ~0.6 s of
+    // the pin. Bisected at 3 ranks with no controllers running:
+    //
+    //   pin on brake, ungated       dead at t=2.115  (pinned at the settle window, t=1.5)
+    //   pin only when |v| < 0.02    dead at t=6.085  (gate delays it; does not fix it)
+    //   --no_hull_park              clean past t=21
+    //
+    // So the gate was not the answer -- the act of pinning is. An earlier comment here
+    // claimed plane seating had made pinning safe; the middle row above is what disproves
+    // it, because that hull was both plane-seated AND stationary when it was pinned.
+    //
+    // The creep that pinning was introduced to stop is now largely harmless anyway: the
+    // arm solves every target against the LIVE arm_base_pose rather than a nominal
+    // station, and the wall slots are fixed world points, so a builder a little off its
+    // mark still lays a straight course. Along-arc creep is corrected actively by the
+    // orbit controller's station keeping (0.12 m deadband). What remains uncorrected is
+    // radial and yaw drift, and the 2.78-4.44 m reach band absorbs a good deal of it --
+    // nominal reaches are 3.09 m to the wall and 3.5 m to the heap.
+    //
+    // A braked M113 does not stay put. The reference scenario measured this directly --
+    // 0.08 m / 0.6 deg of drift at heading 0, but up to 0.9 m / 17 deg at 45/90/135 deg
+    // over 8 s, and it persists with the brakes RELEASED, so it is not a brake problem.
+    // Ours sits at heading = ray + 90 deg, i.e. one of the bad ones. Along-arc drift is
+    // corrected by the orbit controller's station keeping; RADIAL drift is not, because
+    // station_error is an orbit angle and cannot see it. That is a known, accepted
+    // residual -- rigid terrain gives a locked track nothing to key into, and the plan is
+    // to move to SCM, where a deformable surface should hold it.
+    //
+    // Full brake with zero throttle IS the park signal -- it is exactly what the orbit
+    // controller publishes when it is on station, so no extra topic is needed.
+    //
+    // The speed test is the other half. "Parked" has to mean the arm base frame is not
+    // moving, because that frame is what every solved pose is expressed in; a hull that is
+    // braked but still rolling to a stop would have the arm reaching for where the rock
+    // was a moment ago.
+    if (time >= m_command_enable_time) {
+        constexpr double park_speed_tol = 0.02;  // m/s
+        constexpr double park_spin_tol = 0.02;   // rad/s
+        const auto chassis = m_m113->GetChassisBody();
+        const bool wants_park = m_hull_park_enabled && m_driver_inputs.m_throttle <= 0.0 &&
+                                m_driver_inputs.m_braking >= 1.0;
+
+        // VIRTUAL ANCHOR. Brakes alone do not hold this vehicle: measured on full brake,
+        // zero throttle, on station, the hull still creeps at 0.22-0.27 m/s. So the arm
+        // was never offered a pick, because "parked" means "the arm base frame is steady"
+        // and it never was.
+        //
+        // SetFixed does hold it, and was tried, and tears the single-pin track apart --
+        // bisected at 3 ranks: pinned on brake dead at t=2.115, pinned only when already
+        // stopped dead at t=6.085, never pinned clean past t=21. SetFixed removes the body
+        // from the solve, so its velocity is forced to zero in one step while ~130 track
+        // shoes are still solving against the velocity it had a step ago.
+        //
+        // A spring-damper to the parked pose has no such discontinuity: it is an ordinary
+        // external load, it ramps, and the track sees a force it can react to. Stiffness
+        // is sized from what it must resist -- the downslope component of a 10483 kg hull
+        // at lunar gravity on the ~3.5 deg local tilt is about 1.0 kN, so 5e4 N/m reaches
+        // that at 2 cm of drift. Damping is near-critical for that stiffness and mass.
+        if (wants_park && !m_anchor_active) {
+            m_anchor_active = true;
+            m_anchor_pos = chassis->GetPos();
+            m_anchor_yaw = chassis->GetRot().GetCardanAnglesZYX().z();
+            if (!m_anchor_accumulator_ready) {
+                m_anchor_accumulator = chassis->AddAccumulator();
+                m_anchor_accumulator_ready = true;
+            }
+        } else if (!wants_park && m_anchor_active) {
+            m_anchor_active = false;
+            if (m_anchor_accumulator_ready)
+                chassis->EmptyAccumulator(m_anchor_accumulator);
+        }
+
+        if (m_anchor_active && m_anchor_accumulator_ready) {
+            constexpr double anchor_k = 5.0e4;        // N/m
+            constexpr double anchor_c = 4.5e4;        // N.s/m, near-critical at 10.5 t
+            constexpr double anchor_k_yaw = 2.0e5;    // N.m/rad
+            constexpr double anchor_c_yaw = 1.2e5;    // N.m.s/rad
+            // Horizontal only: the vertical direction is the suspension's job, and pulling
+            // on it would fight the track's contact with the ground.
+            const chrono::ChVector3d offset = chassis->GetPos() - m_anchor_pos;
+            const chrono::ChVector3d vel = chassis->GetPosDt();
+            const chrono::ChVector3d force(-anchor_k * offset.x() - anchor_c * vel.x(),
+                                           -anchor_k * offset.y() - anchor_c * vel.y(), 0.0);
+            const double yaw = chassis->GetRot().GetCardanAnglesZYX().z();
+            double yaw_err = yaw - m_anchor_yaw;
+            while (yaw_err > chrono::CH_PI)
+                yaw_err -= chrono::CH_2PI;
+            while (yaw_err < -chrono::CH_PI)
+                yaw_err += chrono::CH_2PI;
+            const double torque_z =
+                -anchor_k_yaw * yaw_err - anchor_c_yaw * chassis->GetAngVelParent().z();
+
+            chassis->EmptyAccumulator(m_anchor_accumulator);
+            chassis->AccumulateForce(m_anchor_accumulator, force, chassis->GetPos(), false);
+            chassis->AccumulateTorque(m_anchor_accumulator,
+                                      chrono::ChVector3d(0.0, 0.0, torque_z), false);
+        }
+
+        m_parked = wants_park && chassis->GetPosDt().Length() < park_speed_tol &&
+                   chassis->GetAngVelParent().Length() < park_spin_tol;
+    }
+
+#ifdef AMD_UW_ENABLE_ROS2
+    // AFTER the park decision, because the arm bridge will not offer or accept a pick
+    // unless the hull is pinned: a solved grab pose is expressed in the arm base frame,
+    // and that frame is moving whenever the builder is creeping to its next station.
+    //
+    // The arm is gated by the same settle window as the drive. It was previously
+    // synchronized unconditionally, so the arm began slewing its first ~4.7 rad swing at
+    // t=0 while the hull was still settling -- the one thing the window exists to prevent.
+    if (m_arm_ros_bridge) {
+        m_arm_ros_bridge->SetHullParked(m_parked);
+        m_arm_ros_bridge->Synchronize(time, /*apply_commands=*/time >= m_command_enable_time);
+    }
+#endif
+
+    // The single Update for this step. The arm bridge deliberately does not call it --
+    // two calls in one step would advance the joint slew twice.
     if (m_arm)
         m_arm->Update(time);
     // No terrain argument: a tracked vehicle interacts with rigid terrain purely
     // through contacts, and the rank's terrain is synchronized by its owner.
     m_m113->Synchronize(time, m_driver_inputs);
+}
+
+int BuilderRig::GetPlacedCount() const {
+#ifdef AMD_UW_ENABLE_ROS2
+    return m_arm_ros_bridge ? m_arm_ros_bridge->GetPlacedCount() : 0;
+#else
+    return 0;
+#endif
 }
 
 void BuilderRig::SetStationAngle(double angle_rad) {

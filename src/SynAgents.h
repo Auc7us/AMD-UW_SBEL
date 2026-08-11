@@ -66,10 +66,16 @@ class SynRockAgent : public chrono::synchrono::SynAgent {
     // `rocks` is the rig's LIVE rock vector, not a copy -- StartNextHarvestCycle
     // appends to it on every dump. Must outlive this agent; only dereferenced from
     // Update()/GatherMessages().
+    // `builder_rocks` is this rank's builder feedstock, appended after the collector's
+    // rocks in the same message. It rides this agent rather than getting one of its own
+    // because a new AddAgent call shifts every later SynChrono agent id, and those ids
+    // are hard-coded on both sides of the link (see main.cpp). May be null.
     SynRockAgent(const std::vector<std::shared_ptr<chrono::ChBodyAuxRef>>* rocks,
                  std::string chrono_data_path,
                  bool visualize_zombies,
-                 RockFieldConfig config);
+                 RockFieldConfig config,
+                 const std::vector<std::shared_ptr<chrono::ChBodyAuxRef>>* builder_rocks = nullptr,
+                 int builder_rock_capacity = 0);
 
     void InitializeZombie(chrono::ChSystem* system) override;
     void SynchronizeZombie(std::shared_ptr<chrono::synchrono::SynMessage> message) override;
@@ -80,6 +86,8 @@ class SynRockAgent : public chrono::synchrono::SynAgent {
 
   private:
     const std::vector<std::shared_ptr<chrono::ChBodyAuxRef>>* m_rocks;
+    const std::vector<std::shared_ptr<chrono::ChBodyAuxRef>>* m_builder_rocks;
+    int m_builder_rock_capacity;
     std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> m_zombie_rocks;
     std::string m_chrono_data_path;
     bool m_visualize_zombies;

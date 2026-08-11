@@ -1,5 +1,6 @@
 #include "RockField.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <random>
@@ -130,6 +131,102 @@ std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> AddRockFields(
             // max.z is therefore the rock's height above its resting contact.
             rock_top_heights->push_back(rock_visual_meshes[shape_index]->GetBoundingBox().max.z());
         }
+    }
+
+    return rocks;
+}
+
+std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> AddBuilderPileRocks(
+    chrono::ChSystem* system,
+    chrono::vehicle::ChTerrain& terrain,
+    const std::shared_ptr<chrono::ChContactMaterial>& rock_mat,
+    const std::string& chrono_data_path,
+    const std::string& amd_uw_data_path,
+    int builder_index,
+    int num_builders,
+    int slot_count,
+    double height_probe_z,
+    const RockFieldConfig& config) {
+    std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> rocks;
+    if (slot_count <= 0)
+        return rocks;
+
+    const std::array<std::string, 3> rock_visual_obj_files = {
+        chrono_data_path + "robot/curiosity/rocks/rock1.obj",
+        chrono_data_path + "robot/curiosity/rocks/rock2.obj",
+        chrono_data_path + "robot/curiosity/rocks/rock3.obj",
+    };
+    const std::array<std::string, 3> rock_collision_obj_files = {
+        amd_uw_data_path + "rocks/curiosity_hulls/rock1_hull.obj",
+        amd_uw_data_path + "rocks/curiosity_hulls/rock2_hull.obj",
+        amd_uw_data_path + "rocks/curiosity_hulls/rock3_hull.obj",
+    };
+
+    auto rock_vis_mat = CreateLunarHapkeMaterial();
+    std::array<std::shared_ptr<chrono::ChTriangleMeshConnected>, 3> visual_meshes;
+    std::array<std::shared_ptr<chrono::ChTriangleMeshConnected>, 3> collision_meshes;
+    std::array<std::shared_ptr<chrono::ChCollisionShapeConvexHull>, 3> ct_shapes;
+    std::array<std::shared_ptr<chrono::ChVisualShapeTriangleMesh>, 3> vis_shapes;
+    double rock_radius = 0.0;
+    for (size_t i = 0; i < rock_visual_obj_files.size(); i++) {
+        visual_meshes[i] = LoadRockMesh(rock_visual_obj_files[i], true, config.mesh_scale);
+        collision_meshes[i] = LoadRockMesh(rock_collision_obj_files[i], false, config.mesh_scale);
+        ct_shapes[i] = chrono_types::make_shared<chrono::ChCollisionShapeConvexHull>(
+            rock_mat, collision_meshes[i]->GetCoordsVertices());
+        vis_shapes[i] = chrono_types::make_shared<chrono::ChVisualShapeTriangleMesh>();
+        vis_shapes[i]->SetMesh(visual_meshes[i]);
+        vis_shapes[i]->SetBackfaceCull(true);
+        vis_shapes[i]->AddMaterial(rock_vis_mat);
+        for (const auto& v : visual_meshes[i]->GetCoordsVertices())
+            rock_radius = std::max(rock_radius, std::hypot(v.x(), v.y()));
+    }
+
+    // Heaped, not scattered: the rocks of one heap sit in a ring around its centre so it
+    // reads as a dumped pile. But they must not CROWD, or the gripper closing on one
+    // fouls its neighbours -- the jaws are 1x geometry on a 2x arm and open to 0.388 m
+    // separation, so each rock needs clear air on both sides. Size the ring from the gap
+    // wanted between neighbouring surfaces rather than from a fudge factor: a first cut
+    // at 1.35 * radius * n / pi left 0.30 m rocks only 0.07 m apart.
+    constexpr double heap_surface_gap = 0.30;
+    const int ring_n = std::max(2, wall_slots_per_pile);
+    const double ring_radius = (2.0 * rock_radius + heap_surface_gap) / (2.0 * std::sin(chrono::CH_PI / ring_n));
+    std::mt19937 rng(51413u + 6151u * static_cast<unsigned>(builder_index));
+    std::uniform_real_distribution<double> yaw_offset(-chrono::CH_PI, chrono::CH_PI);
+
+    for (int slot = 0; slot < slot_count; slot++) {
+        const int pile = slot / wall_slots_per_pile;
+        const int within = slot % wall_slots_per_pile;
+        const chrono::ChVector3d center = BuilderPileCenter(builder_index, num_builders, pile);
+        // Taken in ring order so consecutive slots draw from around the heap rather than
+        // hollowing out one side of it.
+        const double a = chrono::CH_2PI * within / ring_n;
+        const chrono::ChVector3d xy = center + chrono::ChVector3d(std::cos(a), std::sin(a), 0.0) * ring_radius;
+        const double terrain_z = terrain.GetHeight(chrono::ChVector3d(xy.x(), xy.y(), height_probe_z));
+        const int shape_index = (builder_index * 3 + slot) % static_cast<int>(visual_meshes.size());
+
+        double mass;
+        chrono::ChVector3d cog;
+        chrono::ChMatrix33<> inertia;
+        collision_meshes[shape_index]->ComputeMassProperties(true, mass, cog, inertia);
+        chrono::ChMatrix33<> principal_inertia_rot;
+        chrono::ChVector3d principal_inertia;
+        chrono::ChInertiaUtils::PrincipalInertia(inertia, principal_inertia, principal_inertia_rot);
+
+        auto rock_body = chrono_types::make_shared<chrono::ChBodyAuxRef>();
+        // Fixed until the gripper locks on. See the header note.
+        rock_body->SetFixed(true);
+        rock_body->SetSleepingAllowed(false);
+        rock_body->SetMass(config.density * mass);
+        rock_body->SetInertiaXX(config.density * principal_inertia);
+        rock_body->SetFrameCOMToRef(chrono::ChFrame<>(cog, principal_inertia_rot));
+        rock_body->SetFrameRefToAbs(chrono::ChFrame<>(
+            chrono::ChVector3d(xy.x(), xy.y(), terrain_z + config.surface_clearance),
+            chrono::QuatFromAngleZ(yaw_offset(rng))));
+        rock_body->AddCollisionShape(ct_shapes[shape_index]);
+        rock_body->EnableCollision(true);
+        rock_body->AddVisualShape(vis_shapes[shape_index]);
+        system->AddBody(rock_body);
+        rocks.push_back(rock_body);
     }
 
     return rocks;

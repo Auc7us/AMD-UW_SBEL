@@ -60,9 +60,19 @@ BuilderVehicleRosBridge::~BuilderVehicleRosBridge() {
 }
 
 std::optional<chrono::vehicle::DriverInputs>
-BuilderVehicleRosBridge::Synchronize() {
+BuilderVehicleRosBridge::Synchronize(double time) {
     m_executor->spin_some();
-    PublishState();
+    // Throttle. This used to publish vehicle_state AND station_angle on EVERY sim step
+    // -- 2 kHz each at the 5e-4 step -- against controllers that consume them at 10-20 Hz.
+    // At 15 builders that plus arm_state was ~90k messages/s, which saturates Fast-DDS:
+    // fragments get dropped and subscribers hit "sequence size exceeds remaining buffer"
+    // deserialising a truncated Float64MultiArray. Dropped COMMANDS are the real cost.
+    // 200 Hz of sim time is ~10 Hz of wall time here, matching the controller rate.
+    constexpr double publish_period = 1.0 / 200.0;
+    if (m_last_publish_time < 0.0 || time - m_last_publish_time >= publish_period) {
+        m_last_publish_time = time;
+        PublishState();
+    }
 
     auto command = m_pending_command;
     m_pending_command.reset();

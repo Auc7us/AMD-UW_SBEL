@@ -172,7 +172,9 @@ void RobotRig::InitializeOnTerrain(chrono::vehicle::ChTerrain& terrain,
                             m_num_robots, height_probe_z, rock_field_config, &m_rock_top_heights,
                             m_harvest_cycle);
 
-    const chrono::ChVector3d start_ground = InitialGroundPositionForRobot(m_robot_index, m_num_robots);
+    // Spawn radius, not the drop ring: the two are separate so the rig does not start
+    // parked against its own builder. See robot_spawn_radius.
+    const chrono::ChVector3d start_ground = InitialSpawnPositionForRobot(m_robot_index, m_num_robots);
     const double start_x = start_ground.x();
     const double start_y = start_ground.y();
     const double start_z = terrain.GetHeight(chrono::ChVector3d(start_x, start_y, height_probe_z)) +
@@ -432,11 +434,10 @@ void RobotRig::InitializeTrailerBed() {
     const chrono::ChVector3d offset(0.0, 0.0, 0.03);  // bed floor just above the trailer chassis
     const chrono::ChVector3d bed_pos = chassis->GetPos() + chassis->GetRot().Rotate(offset);
 
-    // Open dumping tub (floor + front +x and both +/-y walls, open rear -x), a
-    // DYNAMIC body carried by the trailer through a lateral-axis revolute motor
-    // held flat. Unlike the old fixed/teleported plate, a jointed dynamic bed has
-    // real velocity, so friction keeps placed rocks aboard while driving. Mirrors
-    // the Python TrailerDumpBed; the motor can later run a dump cycle.
+    // Open dumping tub (floor + both +/-x end walls + the -y right wall, open on the
+    // LEFT +y side), a DYNAMIC body carried by the trailer through a longitudinal-axis
+    // revolute motor held flat. Unlike the old fixed/teleported plate, a jointed dynamic
+    // bed has real velocity, so friction keeps placed rocks aboard while driving.
     // Extents come from RobotLayout so the sensor rank's visual-only copy of this bed
     // is built from the same numbers. See the trailer_bed_* constants there.
     const double ex = trailer_bed_floor_x;  // footprint: x along the trailer, y across
@@ -482,10 +483,12 @@ void RobotRig::InitializeTrailerBed() {
     m_trailer_bed->EnableCollision(true);
     GetSystem()->AddBody(m_trailer_bed);
 
-    // Hinged rear tailgate (-x): a separate dynamic body, connected to the bed
-    // with a revolute joint about the trailer lateral (Y) axis.
-    const chrono::ChVector3d tailgate_center_local(-ex / 2.0 - t / 2.0, 0.0, t / 2.0 + wall_h / 2.0);
-    const chrono::ChVector3d tailgate_hinge_local(-ex / 2.0 - t / 2.0, 0.0, t / 2.0);
+    // Hinged LEFT tailgate (+y): a separate dynamic body, connected to the bed with a
+    // revolute joint about the trailer longitudinal (X) axis. It sits on the discharge
+    // lip, outboard of the left wheel.
+    const chrono::ChVector3d tailgate_center_local(0.0, trailer_bed_discharge_y + t / 2.0,
+                                                   t / 2.0 + wall_h / 2.0);
+    const chrono::ChVector3d tailgate_hinge_local(0.0, trailer_bed_discharge_y + t / 2.0, t / 2.0);
     const chrono::ChVector3d tailgate_pos = bed_pos + chassis->GetRot().Rotate(tailgate_center_local);
 
     m_trailer_tailgate = chrono_types::make_shared<chrono::ChBody>();
@@ -494,10 +497,11 @@ void RobotRig::InitializeTrailerBed() {
     m_trailer_tailgate->SetRot(chassis->GetRot());
     const double tailgate_mass = 5.0;
     m_trailer_tailgate->SetMass(tailgate_mass);
+    // Gate box is (ex, t, wall_h) now that it runs along the trailer, not across it.
     m_trailer_tailgate->SetInertiaXX(
-        chrono::ChVector3d(tailgate_mass / 12.0 * (ey * ey + wall_h * wall_h),
-                           tailgate_mass / 12.0 * (t * t + wall_h * wall_h),
-                           tailgate_mass / 12.0 * (t * t + ey * ey)));
+        chrono::ChVector3d(tailgate_mass / 12.0 * (t * t + wall_h * wall_h),
+                           tailgate_mass / 12.0 * (ex * ex + wall_h * wall_h),
+                           tailgate_mass / 12.0 * (ex * ex + t * t)));
     {
         const auto gate = TrailerTailgateBox();
         add_box(m_trailer_tailgate, gate.size.x(), gate.size.y(), gate.size.z(), gate.center.x(), gate.center.y(),
@@ -508,10 +512,11 @@ void RobotRig::InitializeTrailerBed() {
 
     // Tailgate hinge as a rotation motor held at angle 0 -> the gate stays CLOSED
     // (a free revolute here just dangled open, since a bottom-hinged flap is
-    // unstable upright under gravity). Same pattern as the bed motor; drive this
-    // angle later to swing the gate open for a dump. Motor turns about frame Z, so
-    // rotate +90 deg about X to put Z on the trailer lateral (Y) axis.
-    const chrono::ChQuaternion<> tailgate_hinge_rot = chassis->GetRot() * chrono::QuatFromAngleX(chrono::CH_PI_2);
+    // unstable upright under gravity). Motor turns about frame Z, so rotate -90 deg
+    // about Y to put Z on the trailer's -X axis: about -X, the gate's top (+z) swings
+    // toward +y, i.e. the gate falls OUTWARD into a chute. About +X it would swing
+    // inward into the tub.
+    const chrono::ChQuaternion<> tailgate_hinge_rot = chassis->GetRot() * chrono::QuatFromAngleY(-chrono::CH_PI_2);
     const chrono::ChVector3d tailgate_hinge_pos = bed_pos + chassis->GetRot().Rotate(tailgate_hinge_local);
     m_trailer_tailgate_hinge = chrono_types::make_shared<chrono::ChLinkMotorRotationAngle>();
     m_trailer_tailgate_hinge->SetName("trailer_tailgate_hinge");
@@ -520,12 +525,23 @@ void RobotRig::InitializeTrailerBed() {
     m_trailer_tailgate_hinge->SetAngleFunction(chrono_types::make_shared<chrono::ChFunctionConst>(0.0));
     GetSystem()->AddLink(m_trailer_tailgate_hinge);
 
-    // Revolute motor about the chassis lateral (Y) axis. A rotation motor turns
-    // about its frame Z, so rotate the frame +90 deg about X to land Z on the
-    // chassis Y axis. Held at 0 => bed stays flat (rigidly carried).
-    const chrono::ChQuaternion<> frame_rot = chassis->GetRot() * chrono::QuatFromAngleX(chrono::CH_PI_2);
+    // Revolute motor about the chassis longitudinal (-X) axis, positioned ON THE
+    // DISCHARGE LIP rather than at the tub centre. Held at 0 => bed stays flat.
+    //
+    // The axis placement is the whole trick. Hinge at the tub centre and the lip sweeps
+    // inboard as d*cos(theta) -- at the 55 deg dump angle a lip at 0.8 m ends up at
+    // 0.46 m, back over the left tire (0.35..0.65). Hinging ON the lip leaves it fixed in
+    // space: the tub's right side lifts, the floor slopes left, and the load pours over a
+    // pour line that stays at y = +0.8, clear of the wheel. That is how a real side-dump
+    // body works, and it is why this is not simply the old rear-dump with a different axis.
+    //
+    // -X, not +X: about -X a positive angle lifts the -y side, tipping the floor toward
+    // the open +y lip. About +X the same angle would tip it into the closed right wall.
+    const chrono::ChQuaternion<> frame_rot = chassis->GetRot() * chrono::QuatFromAngleY(-chrono::CH_PI_2);
+    const chrono::ChVector3d bed_hinge_pos =
+        bed_pos + chassis->GetRot().Rotate(chrono::ChVector3d(0.0, trailer_bed_discharge_y, 0.0));
     m_trailer_bed_motor = chrono_types::make_shared<chrono::ChLinkMotorRotationAngle>();
-    m_trailer_bed_motor->Initialize(m_trailer_bed, chassis, chrono::ChFramed(bed_pos, frame_rot));
+    m_trailer_bed_motor->Initialize(m_trailer_bed, chassis, chrono::ChFramed(bed_hinge_pos, frame_rot));
     m_trailer_bed_motor->SetAngleFunction(chrono_types::make_shared<chrono::ChFunctionConst>(0.0));
     GetSystem()->AddLink(m_trailer_bed_motor);
 }
@@ -534,9 +550,9 @@ namespace {
 
 // Dump cycle geometry and timing.
 //
-// The bed is hinged about the trailer lateral axis and open at the rear, so a
-// positive tilt of this size drops the rear lip well below the front and the load
-// slides out. The angle MUST exceed the friction angle of the bed material, and the
+// The bed is hinged about the trailer longitudinal axis, on the open LEFT lip, so a
+// positive tilt of this size lifts the right side and the load slides out sideways
+// over that lip. The angle MUST exceed the friction angle of the bed material, and the
 // previous 40 deg did not: the bed is mu = 0.9, a rock slides only when
 // tan(theta) > mu, and arctan(0.9) = 42.0 deg. At 40 deg (tan = 0.839) the load is
 // below the threshold and is not supposed to move at all -- a dump that worked was
@@ -559,7 +575,10 @@ constexpr double dump_dwell_time = 3.0;
 // Matches the placement grid in RosArmBridge (bed floor ~1.0 x 1.2 m), with a little
 // margin so a rock resting against a wall still counts as in the bed.
 constexpr double bed_half_length = 0.7;
-constexpr double bed_half_width = 0.8;
+// The tub is offset left (see trailer_bed_center_y), so this half-width is measured
+// about that centre, not about the trailer centreline -- otherwise a rock sitting
+// against the new +0.8 m discharge lip reads as having already left the bed.
+constexpr double bed_half_width = 0.5 * trailer_bed_floor_y + 0.2;
 constexpr double bed_clear_height = 1.2;
 // Stuck detector: throttle applied but not moving. See CheckStuck.
 constexpr double stuck_speed = 0.08;          // m/s, below this counts as not moving
@@ -635,8 +654,9 @@ bool RobotRig::RockIsInBed(const std::shared_ptr<chrono::ChBodyAuxRef>& rock) co
         return false;
     const chrono::ChVector3d local =
         m_trailer_bed->GetRot().RotateBack(rock->GetPos() - m_trailer_bed->GetPos());
-    return std::abs(local.x()) < bed_half_length && std::abs(local.y()) < bed_half_width &&
-           local.z() > -0.3 && local.z() < bed_clear_height;
+    return std::abs(local.x()) < bed_half_length &&
+           std::abs(local.y() - trailer_bed_center_y) < bed_half_width && local.z() > -0.3 &&
+           local.z() < bed_clear_height;
 }
 
 void RobotRig::AdvanceDumpCycle(double time) {

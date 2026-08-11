@@ -47,4 +47,31 @@ std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> AddRockFields(
     // gets a different scatter instead of replaying the same one on a new bearing.
     int cycle = 0);
 
+// Adds one builder's FEEDSTOCK: real, pickable rocks heaped outboard of its lane, one
+// heap per run of wall slots (see BuilderPileCenter). Returned in slot order, so
+// element k is the rock intended for wall slot k.
+//
+// Every one of them is created FIXED with collision on. That is the whole point: a
+// couple of dozen extra bodies per rank would otherwise each carry six DOF, generate
+// contact pairs against the terrain and each other, and be integrated every 5e-4 s step
+// for the entire run -- to sit perfectly still. Fixed, they are static colliders that
+// cost the solver nothing, and LrvArm unfixes exactly one of them, at the moment its
+// gripper locks on, and re-fixes it once it has been laid (see BuilderArmRosBridge).
+// So at most one rock in the heap is ever a dynamic body.
+//
+// Mesh scale comes from `config` and must stay the rover's, because these rocks ride to
+// the sensor rank on the same SynRockAgent, whose zombie bodies are all built at
+// config.mesh_scale -- a different scale here would draw them the wrong size on rank 0.
+std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> AddBuilderPileRocks(
+    chrono::ChSystem* system,
+    chrono::vehicle::ChTerrain& terrain,
+    const std::shared_ptr<chrono::ChContactMaterial>& rock_mat,
+    const std::string& chrono_data_path,
+    const std::string& amd_uw_data_path,
+    int builder_index,
+    int num_builders,
+    int slot_count,
+    double height_probe_z,
+    const RockFieldConfig& config);
+
 }  // namespace amd_uw

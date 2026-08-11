@@ -33,7 +33,8 @@ class BuilderVehicleRosBridge {
     BuilderVehicleRosBridge(int builder_id, chrono::vehicle::ChTrackedVehicle& vehicle);
     ~BuilderVehicleRosBridge();
 
-    std::optional<chrono::vehicle::DriverInputs> Synchronize();
+    // `time` is SIM time, used only to throttle publishing. See publish_period.
+    std::optional<chrono::vehicle::DriverInputs> Synchronize(double time);
 
     // Set by the owning rank when its harvest cycle advances.
     void SetStationAngle(double angle_rad) { m_station_angle = angle_rad; }
@@ -50,6 +51,7 @@ class BuilderVehicleRosBridge {
     rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr m_state_pub;
     rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr m_station_pub;
     double m_station_angle = 0.0;
+    double m_last_publish_time = -1.0;
     std::optional<chrono::vehicle::DriverInputs> m_pending_command;
 };
 

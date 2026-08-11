@@ -93,9 +93,15 @@ Everything is concentric about `(0, 0)`, and each rank owns one ray out from the
 centre, evenly spaced (`2*pi*rank/N`). On that ray:
 
 ```text
-centre ---- work circle (30 m) ---- builder orbit (40 m) ---- collector (50 m) ----> rock line
+centre ---- work circle (30 m) ---- builder orbit (33 m) ---- collector (37 m) ----> rock line
               yellow ring                cyan ring                green ring
 ```
+
+The two gaps are 3 m inboard and 4 m outboard, both inside the 2.78–4.44 m band the
+2x-scaled builder arm proved in service, so one lane serves both the wall and the drop
+pile. 35/40 put both gaps at 5 m and the builder had to reposition for every pick.
+Rovers are *placed* further out still, at 42 m, so a spawning trailer does not land on
+its own builder; only the placement reads that radius.
 
 So a rank's collector starts directly outside its own builder, on the line joining
 the site centre to it, faces radially outward, and its rock line runs away from
@@ -112,7 +118,44 @@ The rock line runs 30 m to 660 m out from each collector, so its outer end leave
 the 1024 m heightmap; those last few rocks rest on the flat extension strips that
 `AddRockLineTerrainExtensions` lays along each ray, not on mapped terrain.
 
-Start the builder orbit controllers with:
+### What the builder does
+
+The builder **builds**, on its own schedule. It is not triggered by, gated on, or
+positioned by its collector's harvest cycle. One wall slot per iteration:
+
+1. The sim publishes `/builder_N/pick_target` with `ready=1` — the hull is parked and
+   pinned, slot `k` is unlaid, and its feedstock rock is still in the heap.
+2. `builder_arm_controller` solves grab and place IK in the arm base frame and sends one
+   12-element `/builder_N/arm_cmd`.
+3. `LrvArm`'s pick/place machine runs it: approach, close on contact, lock, lift, swing
+   180°, settle, release, stow.
+4. The sim re-fixes the laid rock and advances the station angle by one slot.
+5. `builder_orbit_controller` creeps the ~1 m and parks. `ready` goes high for slot `k+1`.
+
+The geometry is all derived from the slot index `k` in `src/RobotLayout.h`, so the arm,
+the drive station and the feedstock cannot disagree:
+
+| | radius | angle |
+|---|---|---|
+| wall slot `k` | 30.0 | `ray + k·pitch` |
+| station for `k` | 33.0 | `ray + k·pitch + arm_lead` |
+| feedstock heap | 36.6 | heap-centre slot angle, **no** `arm_lead` |
+
+`pitch = 0.9 m / 30 m`, so one slot is 0.9 m of course and 0.99 m of lane. `arm_lead =
+atan(2.5/33)` exists because the arm mounts 2.5 m *back* along a tangentially parked
+hull; adding it to the station puts the *arm base*, not the hull origin, radially
+opposite the slot it serves. That is why the heap must **not** also carry it — doing so
+pushed every heap to 5.62 m from the arm base, past the 5.2 m guard, and no rock was
+reachable. `main.cpp` now prints a reach audit at startup so that class of error shows
+up at t=0 rather than after the machine has driven to its first station.
+
+**Feedstock rocks are fixed except the one in the gripper.** They are created
+`SetFixed(true)` with collision on, so a couple of dozen extra bodies per rank cost the
+solver nothing; `LrvArm::TryLockRock` unfixes exactly one when the fingers make contact,
+and the arm bridge re-fixes it once laid — it is part of the wall then, and must not be
+nudged by the next stone landing beside it.
+
+Start both halves together (they are a pair; the drive half alone holds slot 0 forever):
 
 ```bash
 source /opt/ros/humble/setup.bash
@@ -121,24 +164,27 @@ source install/setup.bash
 ros2 launch amd_uw_ros2 builder_orbit_controllers.launch.py \
   builder_ids:=1,2 \
   work_circle_radius_m:=30.0 \
-  path_radius_m:=40.0 \
-  target_speed_mps:=1.0 \
-  lookahead_m:=8.0 \
+  path_radius_m:=33.0 \
   counter_clockwise:=true
 ```
 
-Each controller reads `/builder_N/vehicle_state` (`[x, y, yaw, speed]`) and
-publishes `/builder_N/vehicle_cmd` (`[steering, throttle, braking]`). A builder
-starts braked and holds until its first valid ROS command arrives.
+The orbit controller reads `/builder_N/vehicle_state` (`[x, y, yaw, speed]`) and
+publishes `/builder_N/vehicle_cmd` (`[steering, throttle, braking]`). A builder starts
+braked and holds until its first valid ROS command arrives.
 
-Its hull is **not** pinned while parked, and must not be. Pinning it is
-self-consistent only on flat ground; on this heightmap the hull is placed level
-over ground that pitches and rolls a few degrees, the suspension then has no way
-to absorb the mismatch, and the single-pin track throws shoes and goes NaN within
-about a second on every rank. That was invisible for a long time because the orbit
-controller releases the hull within ~50 ms — it only showed up on a rank whose
-controller was never started. A free hull with brakes on settles onto the real
-surface and holds to within a few cm.
+Its hull **is** pinned while parked, and released the moment it is asked to move — full
+brake with zero throttle is the park signal, which is exactly what the orbit controller
+publishes on station, so no extra topic is needed. A braked M113 does not stay put (the
+reference scenario measured up to 0.9 m / 17° of drift over 8 s at the headings ours
+uses), and station keeping closes the loop on orbit *angle* only, so radial creep is
+invisible to it.
+
+This used to be fatal and the reason must not be lost: pinning a **level** hull on this
+heightmap made it fight 0.24–0.33 m of terrain spread across its own footprint, and the
+single-pin track threw shoes and went NaN within about a second on every rank. What made
+it safe was seating the hull on a *fitted terrain plane* (`SeatBuilderOnTerrainPlane`,
+worst-case error 0.02–0.08 m) and pinning only **after** the settle window, at whatever
+pose it actually settled into, so no strain is injected.
 
 ### One system per rank
 

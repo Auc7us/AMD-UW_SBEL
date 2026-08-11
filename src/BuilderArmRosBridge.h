@@ -2,7 +2,12 @@
 
 #include <array>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <vector>
+
+#include "chrono/core/ChVector3.h"
+#include "chrono/physics/ChBodyAuxRef.h"
 
 #include "rclcpp/rclcpp.hpp"
 #include "std_msgs/msg/float64_multi_array.hpp"
@@ -11,37 +16,107 @@ namespace amd_uw {
 
 class LrvArm;
 
-// Direct ROS 2 actuator bridge for the tracked builder arm.
+// ROS 2 bridge for the tracked builder arm, and the owner of that builder's BUILD
+// CYCLE -- pick a rock out of the feedstock heap, lay it on the next slot of the work
+// circle, repeat.
 //
-// /builder_N/arm_cmd:
-//   [theta1, theta2, theta3, theta4, finger_closure_m]
+// The cycle is the builder's own. Nothing here reads the collector's harvest state, the
+// harvest cycle index, or any lane rotation; slot k's rock, the slot's world point, and
+// the orbit angle the hull must hold to serve it all come from RobotLayout's build plan,
+// indexed only by how many rocks THIS builder has already laid.
 //
-// /builder_N/arm_state:
-//   [theta1, theta2, theta3, theta4,
-//    finger1_m, finger2_m, end_effector_x, end_effector_y, end_effector_z]
+// Topics
+//   in  /builder_N/arm_cmd
+//         5  elements: [theta1..4, finger_closure_m] -- direct actuator command, kept
+//                      for the deterministic actuation test. Bypasses the build cycle.
+//         12 elements: [seq, target_index, rock_x, rock_y, grab_theta1..4,
+//                      place_theta1..4] -- a pick-and-place, same shape as the rover's.
+//   out /builder_N/arm_base_pose   [x, y, z, qw, qx, qy, qz]   IK frame origin
+//   out /builder_N/pick_target     [ready, index, x, y, z]     next rock (privileged)
+//   out /builder_N/place_target    [x, y, z]                   next wall slot
+//   out /builder_N/arm_status      [seq, state, index, success, error_code, sim_time]
+//   out /builder_N/arm_state       [theta1..4, finger1, finger2, ee_x, ee_y, ee_z]
+//
+// PRIVILEGED INFORMATION IS DELIBERATE. pick_target is read straight off the rock body
+// rather than perceived: this is a mimic of the construction task, not a perception
+// demo, and the arm has to hit a 0.2-scale rock with a gripper whose jaws open 0.388 m.
 class BuilderArmRosBridge {
   public:
-    BuilderArmRosBridge(int builder_id, LrvArm& arm);
+    // `pile_rocks[k]` is the rock intended for `wall_slots[k]`; both are indexed by wall
+    // slot and must be the same length. Rocks are FIXED at rest -- this class unfixes
+    // nothing itself, but it re-fixes each one once it has been laid, so at most the one
+    // in the gripper is ever a dynamic body.
+    BuilderArmRosBridge(int builder_id,
+                        LrvArm& arm,
+                        std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> pile_rocks,
+                        std::vector<chrono::ChVector3d> wall_slots);
     ~BuilderArmRosBridge();
 
-    void Synchronize();
+    // apply_commands=false spins the executor and publishes state but DISCARDS any
+    // command, so the arm holds its pose. Used during the builder's settle window: a
+    // 2x-scaled arm slewing a 4.7 rad swing while the hull is still finding equilibrium
+    // is exactly the load the settle window exists to avoid.
+    void Synchronize(double time, bool apply_commands = true);
+
+    // The hull is parked (pinned) and may be worked from. Set by BuilderRig each step.
+    // A pick is never offered or accepted while the builder is driving: the arm base
+    // would be moving under a solved pose, and the rock would be laid on the roll.
+    void SetHullParked(bool parked) { m_hull_parked = parked; }
+
+    // Rocks laid so far == the next wall slot == how far round the lane the hull should
+    // now be. BuilderRig turns this into the station angle it publishes.
+    int GetPlacedCount() const { return m_placed_count; }
+    bool BuildComplete() const { return m_placed_count >= static_cast<int>(m_wall_slots.size()); }
 
   private:
-    struct Command {
+    struct DirectCommand {
         std::array<double, 4> theta = {0.0, 0.0, 0.0, 0.0};
         double finger_closure = 0.0;
     };
 
+    struct PickPlaceCommand {
+        double command_seq = 0.0;
+        int target_index = -1;
+        std::array<double, 4> grab_theta = {0.0, 0.0, 0.0, 0.0};
+        std::array<double, 4> place_theta = {0.0, 0.0, 0.0, 0.0};
+    };
+
     void OnCommand(const std_msgs::msg::Float64MultiArray::SharedPtr msg);
+    void PublishStateThrottled(double time);
     void PublishState();
+    void PublishBuildTopics(double time);
+    // Slot ready to be worked, or -1. Requires a parked hull, an unlaid slot, and a rock
+    // still in the heap.
+    int ReadySlot() const;
 
     int m_builder_id;
     LrvArm& m_arm;
+    std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> m_pile_rocks;
+    std::vector<chrono::ChVector3d> m_wall_slots;
+
+    int m_placed_count = 0;
+    bool m_hull_parked = false;
+    double m_last_started_seq = -1.0;
+    double m_settled_seq = -2.0;  // command_seq whose completion was already booked
+    int m_active_slot = -1;
+    double m_last_time = 0.0;
+    bool m_reported_complete = false;
+
     rclcpp::Node::SharedPtr m_node;
     std::unique_ptr<rclcpp::executors::SingleThreadedExecutor> m_executor;
     rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr m_command_sub;
     rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr m_state_pub;
-    std::optional<Command> m_pending_command;
+    rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr m_base_pose_pub;
+    rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr m_pick_target_pub;
+    rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr m_place_target_pub;
+    rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr m_status_pub;
+
+    std::mutex m_command_mutex;
+    std::optional<DirectCommand> m_pending_direct;
+    std::optional<PickPlaceCommand> m_pending_pick_place;
+
+    double m_last_publish_time = -1.0;
+    double m_last_build_pub_time = -1.0;
 };
 
 }  // namespace amd_uw

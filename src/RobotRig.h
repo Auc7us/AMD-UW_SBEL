@@ -235,8 +235,12 @@ class RobotRig {
     // Front-axle normal load at rest (captured after settle), used as the reference
     // for the load-aware traction guard. 0 => guard runs open-loop (assumes full load).
     double m_front_static_load = 0.0;
-    chrono::vehicle::DriverInputs m_last_raw_inputs;
-    chrono::vehicle::DriverInputs m_last_guarded_inputs;
+    // Initialised for the same reason as BuilderRig::m_driver_inputs: DriverInputs has
+    // no default member initialisers. CheckStuck reads m_last_guarded_inputs.m_throttle,
+    // so leaving it indeterminate let the stuck detector act on garbage before the first
+    // controller message.
+    chrono::vehicle::DriverInputs m_last_raw_inputs{0.0, 0.0, 1.0, 0.0};
+    chrono::vehicle::DriverInputs m_last_guarded_inputs{0.0, 0.0, 1.0, 0.0};
     mutable long m_guard_steps = 0;
     mutable long m_guard_limited_steps = 0;
 };
