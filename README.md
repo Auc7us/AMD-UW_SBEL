@@ -66,26 +66,50 @@ source install/setup.bash
 
 ## Run ROS Demo
 
-Terminal 1, start the ROS controllers for robot ranks 1 and 2:
+Shown here at **5 robot ranks**. Rank 0 is the sensor/visualization rank and owns no
+robot, so `num_robot_ranks = np - 1` -- five robots means `-np 6`, and the rank ids the
+controllers address are `1..5`. Every rank parses the same command line and derives the
+layout from that one count, so the three commands below have to agree on it.
+
+Terminal 1, start the collector controllers for robot ranks 1-5:
 
 ```bash
 source /opt/ros/humble/setup.bash
 cd ~/mountdir/amd-uw/ros2_ws
 source install/setup.bash
 ros2 launch amd_uw_ros2 robot_controllers.launch.py \
-  robot_ids:=1,2 \
+  robot_ids:=1,2,3,4,5 \
   target_speed_mps:=3.0 \
   switch_radius_m:=2.0 \
   rock_side_offset_m:=2.0
 ```
 
-Terminal 2, start the C++ sim:
+Terminal 2, start the builder orbit + arm controllers for the same ranks. Each rank owns
+one collector *and* one builder, so `builder_ids` mirrors `robot_ids` -- a builder without
+its controller starts braked and holds slot 0 for the whole run:
+
+```bash
+source /opt/ros/humble/setup.bash
+cd ~/mountdir/amd-uw/ros2_ws
+source install/setup.bash
+ros2 launch amd_uw_ros2 builder_orbit_controllers.launch.py \
+  builder_ids:=1,2,3,4,5 \
+  work_circle_radius_m:=30.0 \
+  path_radius_m:=33.0 \
+  counter_clockwise:=true
+```
+
+Terminal 3, start the C++ sim:
 
 ```bash
 source /opt/ros/humble/setup.bash
 cd ~/mountdir/amd-uw
-mpirun -np 3 ./build/demo_SYN_polaris_flat --vsg 1,2
+mpirun -np 6 ./build/demo_SYN_polaris_flat --vsg 1
 ```
+
+`--vsg` takes the MPI ranks that should open a window, one window each, so
+`--vsg 1,2,3,4,5` gives five chase cameras on one machine. Pick the one rank you want to
+watch unless you actually want all of them.
 
 ### Site layout
 
@@ -152,6 +176,37 @@ up at t=0 rather than after the machine has driven to its first station. Measure
 4 ranks: seed heap 3.54–4.37 m, collector load 3.91–4.04 m, wall slot 3.09 m, all
 inside the 2.0–5.2 m envelope.
 
+#### How many rocks a rank gets
+
+**2 to 6, drawn per rank**, not a site-wide 2. `RocksPerRank(rank_index)` in
+`src/RobotLayout.h` is the single source of truth, and `--rocks_per_rank N` pins every
+rank to `N` for a reproducible test. It is a pure integer hash of the rank index rather
+than anything drawn from `<random>` or carried in `RockFieldConfig`, because three
+separate places have to arrive at the same number in *different processes*:
+
+- `RockField` spawns that many bodies on the owning rank;
+- `SynRockAgent` sizes the sensor rank's zombie pool for a rank it knows nothing about
+  except its id -- undersize it and the tail of that rank's rocks is simply invisible in
+  the global camera;
+- `HarvestDropSlot` advances the collector's lane by one load's worth of **wall slots**
+  per cycle, which is what keeps a delivered pile inside the arm's reach of the station
+  the builder is already driving to.
+
+That third one is why a bigger load is not just "more rocks". A load is tipped out in one
+place and the builder then creeps one slot per rock it lays, so with `L` rocks the far end
+of the run is `L-1` slots of lane from the pile. At `L=6` the reach audit measured 6.54 m
+against a 5.2 m envelope -- the builder would have parked at its slot and refused the pile
+beside it. So the load is now dropped at the **middle** of the run of slots it serves
+(`HarvestLoadCenterSlot`), exactly as the seed heap has always been centred on the run
+*it* serves. That halves the lever arm: 4.70 m at `L=6`, and it also tightens `L=2` from
+4.04 m to 3.94 m.
+
+Note the sector cap. `BuilderWallSlotCount` gives each builder 70% of its `2*pi/N`
+sector, which at 15 builders is **9 wall slots** -- six of them served by the seed heap.
+A 15-builder site is therefore build-limited, not feedstock-limited: each builder lays
+its nine rocks and stops while its collector keeps harvesting. Widening that means
+shrinking `wall_slot_pitch_m` or accepting neighbouring builders in each other's lane.
+
 #### Where the rock comes from
 
 There is **one** seed heap of six rocks per builder, and that is all the site places.
@@ -192,7 +247,7 @@ source /opt/ros/humble/setup.bash
 cd ~/mountdir/amd-uw/ros2_ws
 source install/setup.bash
 ros2 launch amd_uw_ros2 builder_orbit_controllers.launch.py \
-  builder_ids:=1,2 \
+  builder_ids:=1,2,3,4,5 \
   work_circle_radius_m:=30.0 \
   path_radius_m:=33.0 \
   counter_clockwise:=true
@@ -255,6 +310,75 @@ wall/sim. If it ever needs to come down, the builder only ever occupies the orbi
 so a second smaller patch plus collision families would let its shoes skip the
 big mesh.
 
+### Recording poses for offline rendering
+
+`--record_dir <path>` writes the world pose of every moving body on every physics rank,
+at `--record_rate` Hz (default 60), for re-rendering the run in Blender with better
+meshes than the sim carries.
+
+```bash
+mpirun -np 16 ./build/demo_SYN_polaris_flat --record_dir /data/run1 --record_rate 60
+python3 tools/read_trajectory.py /data/run1 --check          # validate
+python3 tools/read_trajectory.py /data/run1 --rank 1 --list  # what was recorded
+python3 tools/read_trajectory.py /data/run1 --rank 1 --npz rank1.npz
+python3 tools/read_trajectory.py /data/run1 --rank 1 --bbox 0   # rebuild a frame
+```
+
+`--bbox` is the check worth running before writing any Blender importer: it rebuilds one
+frame from the files alone -- `body_pose * shape_frame * shape_aabb` -- and prints each
+group's world extent. Getting either convention wrong does not error, it just produces a
+wrong scene, and the wrongness is visible here as a number. A correct rebuild reads:
+
+```text
+builder    size=  2.705 x   5.407 x  1.146 m     <- M113 hull is 2.686 m wide, 5.4 m long
+collector  size=  3.511 x   2.496 x  2.070 m
+rock       size= 49.723 x  18.025 x  1.863 m     <- the group, i.e. the whole rock line
+```
+
+Wheels folded into the hull (the centre-of-mass mistake) collapses the collector's
+extent; ignoring the shape frames stacks the M113's road wheels on its centreline.
+
+Per rank: `rank_N_meta.json` (run parameters), `rank_N_objects.jsonl` (one line per
+recorded body), `rank_N_frames.bin` (the poses). `static_props.jsonl` is the scenery --
+terrain, the three rings, the centre pad, the decorative laid rocks -- written once by
+rank 1, since it is identical everywhere and never moves.
+
+Rank 0 is not recorded. It holds *zombies*: copies driven by SynChrono messages at the
+heartbeat, not simulated bodies, so recording there would resample the same data a
+heartbeat late and at a coarser rate.
+
+At 4 ranks a physics rank records ~205 bodies -- rover chassis, four spindles and the
+wishbones, the trailer with its bed and tailgate, both eight-link manipulators, the
+M113's hull, sprockets, idlers, ten road wheels and 126 track shoes, and every rock,
+including the ones spawned by later harvest cycles. That is ~350 KB of sim second per
+rank at 60 Hz.
+
+Three things a consumer has to know, all of which are in the files:
+
+- **The pose is the body's REFERENCE frame**, which is what Chrono hands its own
+  renderers (`ChBody::GetVisualModelFrame` returns exactly this). Using the centre of
+  mass instead would offset every `ChBodyAuxRef` -- every rock and every arm link -- by
+  its own COM offset.
+- **A body is not one mesh at its origin.** Each manifest entry lists its visual shapes
+  *with their local frames*, so a shape's world transform is `body_pose *
+  shape_local_frame`. The M113 road wheel is two wheel halves at ±y; the trailer tub is
+  four boxes.
+- **`scale` is not the whole story for the rocks.** `LoadRockMesh` bakes the 0.2 scale
+  into the vertices and re-bases the mesh so its bottom sits at z=0, so the shape reports
+  scale `[1,1,1]` against a source OBJ that is five times too big and sitting at the
+  wrong height. Every trimesh shape therefore also carries `aabb_min`/`aabb_max`: the
+  box the geometry was actually drawn in. Fit replacement meshes to that.
+
+Two bodies have no visual shape of their own and need a mesh chosen on the Blender side:
+`collector_trailer/chassis` (draw it with `LRV_Wagon/trailer_chassis.obj`, which is what
+the sensor rank uses) and `world/front_ballast`.
+
+The object list grows during a run -- each harvest cycle spawns a fresh set of rocks --
+so `rank_N_objects.jsonl` is appended to, and flushed, at the moment a body first
+appears, with the sim time it appeared at. Frames before that carry no entry for it;
+`--npz` fills those with NaN rather than zeros, because a rock that does not exist yet
+is not a rock at the site centre.
+
 ### Cost diagnostics
 
 `--perf_log <seconds>` prints a per-rank breakdown every N sim seconds: the
@@ -274,11 +398,14 @@ Rank layout:
 
 ```text
 rank 0 = global sensor/visualization rank
-rank 1 = robot 1
-rank 2 = robot 2
+rank 1 = robot 1   (collector 1 + builder 1)
+rank 2 = robot 2   (collector 2 + builder 2)
+rank 3 = robot 3   (collector 3 + builder 3)
+rank 4 = robot 4   (collector 4 + builder 4)
+rank 5 = robot 5   (collector 5 + builder 5)
 ```
 
-Terminal 3, optional status/debug commands:
+Terminal 4, optional status/debug commands:
 
 ```bash
 source /opt/ros/humble/setup.bash

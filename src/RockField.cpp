@@ -94,11 +94,12 @@ std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> AddRockFields(
     const chrono::ChVector3d forward(std::cos(heading), std::sin(heading), 0.0);
     const chrono::ChVector3d left(-std::sin(heading), std::cos(heading), 0.0);
 
-    for (int i = 0; i < config.rocks_per_rank; i++) {
+    const int rocks_per_rank = RocksPerRank(robot_index);
+    for (int i = 0; i < rocks_per_rank; i++) {
         const double distance = config.first_distance + i * config.distance_step + distance_jitter(rng);
         const chrono::ChVector3d xy = origin + forward * distance + left * lateral_offset(rng);
         const double terrain_z = terrain.GetHeight(chrono::ChVector3d(xy.x(), xy.y(), height_probe_z));
-        const int shape_index = (robot_index * config.rocks_per_rank + i) % static_cast<int>(rock_visual_meshes.size());
+        const int shape_index = (robot_index * rocks_per_rank + i) % static_cast<int>(rock_visual_meshes.size());
 
         double mass;
         chrono::ChVector3d cog;
@@ -109,6 +110,11 @@ std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> AddRockFields(
         chrono::ChInertiaUtils::PrincipalInertia(inertia, principal_inertia, principal_inertia_rot);
 
         auto rock_body = chrono_types::make_shared<chrono::ChBodyAuxRef>();
+        // Named so the trajectory recorder can identify it from a plain system sweep --
+        // rock bodies are created here, spawned again on every harvest cycle, and never
+        // held in any list the recorder is handed.
+        rock_body->SetName("harvest_rock_r" + std::to_string(robot_index) + "_c" + std::to_string(cycle) + "_" +
+                           std::to_string(i));
         rock_body->SetFixed(false);
         rock_body->SetSleepingAllowed(true);
         rock_body->SetSleepTime(0.15f);
@@ -213,6 +219,7 @@ std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> AddBuilderPileRocks(
         chrono::ChInertiaUtils::PrincipalInertia(inertia, principal_inertia, principal_inertia_rot);
 
         auto rock_body = chrono_types::make_shared<chrono::ChBodyAuxRef>();
+        rock_body->SetName("seed_rock_b" + std::to_string(builder_index) + "_" + std::to_string(slot));
         // Fixed until the gripper locks on. See the header note.
         rock_body->SetFixed(true);
         rock_body->SetSleepingAllowed(false);

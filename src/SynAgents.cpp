@@ -159,12 +159,19 @@ void SynRockAgent::InitializeZombie(chrono::ChSystem* system) {
     // scene, since both bind their renderables at initialise time. Unused ones wait
     // below the terrain until a message places them.
     const int robot_index = m_agent_key.GetNodeID() - 1;
-    // Harvest rocks (rocks_per_rank per cycle) plus the builder's feedstock heap, which
-    // is sent on the same message and so needs zombies of its own at the end of the run.
-    const int capacity = std::max(1, m_config.rocks_per_rank) * zombie_rock_cycle_capacity +
+    // Harvest rocks (RocksPerRank(robot_index) per cycle) plus the builder's feedstock
+    // heap, which is sent on the same message and so needs zombies of its own at the end
+    // of the run.
+    //
+    // The count comes from RocksPerRank and NOT from a config this rank was handed. Rank
+    // 0 owns no rock field and gets one RockFieldConfig for the whole site, but each
+    // remote rank now spawns 2-6 rocks per cycle -- so the pool has to be sized from the
+    // SENDING rank's own number, which is exactly what that function is for.
+    const int rocks_per_rank = RocksPerRank(robot_index);
+    const int capacity = std::max(1, rocks_per_rank) * zombie_rock_cycle_capacity +
                          std::max(0, m_builder_rock_capacity);
     for (int i = 0; i < capacity; i++) {
-        const int shape_index = (robot_index * m_config.rocks_per_rank + i) % static_cast<int>(rock_vis_shapes.size());
+        const int shape_index = (robot_index * rocks_per_rank + i) % static_cast<int>(rock_vis_shapes.size());
         auto rock = chrono_types::make_shared<chrono::ChBodyAuxRef>();
         rock->SetFixed(true);
         rock->EnableCollision(false);

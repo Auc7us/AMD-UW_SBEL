@@ -101,7 +101,50 @@ inline constexpr double wall_slot_pitch_rad = wall_slot_pitch_m / work_circle_ra
 // first outbound leg, which is minutes of sim long. After that the builder eats what the
 // collector delivers, and nothing else.
 inline constexpr int builder_seed_rock_count = 6;
-inline constexpr int harvest_rocks_per_load = 2;
+
+// Rocks on one rank's rock line, and therefore in one collector load. It was a fixed 2
+// on every rank; it is now 2-6, drawn per rank, so the site is not fifteen copies of the
+// same round trip.
+//
+// This is THE source of truth for that count and every consumer has to come through it,
+// because the number is read in three places that must agree exactly or the run breaks
+// in ways that do not look like a rock count:
+//
+//   * RockField spawns this many bodies on the owning rank;
+//   * SynRockAgent sizes the sensor rank's zombie pool from it -- undersize it and the
+//     tail of a rank's rocks is simply invisible in the global camera;
+//   * HarvestDropSlot advances the collector's lane by one load's worth of WALL SLOTS
+//     per cycle, which is what keeps each delivered pile within the builder's arm reach
+//     of the station it is already driving to.
+//
+// So it is a pure function of the rank index, computed identically in every process,
+// rather than anything carried in RockFieldConfig -- rank 0 has to be able to work out
+// rank 7's count without being told.
+inline constexpr int min_rocks_per_rank = 2;
+inline constexpr int max_rocks_per_rank = 6;
+
+// >0 pins every rank to that count. Set once from --rocks_per_rank, before anything
+// reads the layout; every rank parses the same command line, so they stay in agreement.
+inline int g_rocks_per_rank_override = 0;
+inline void SetRocksPerRankOverride(int count) {
+    g_rocks_per_rank_override = count;
+}
+
+inline int RocksPerRank(int rank_index) {
+    if (g_rocks_per_rank_override > 0)
+        return g_rocks_per_rank_override;
+    // Integer hash (splitmix32 finalizer), not <random>: this has to give the same
+    // answer in every MPI process on every machine, and a std::mt19937 stream would
+    // have to be advanced in the same order everywhere to do that.
+    unsigned int x = 0x9E3779B9u * static_cast<unsigned int>((rank_index < 0 ? 0 : rank_index) + 1) + 0x20260817u;
+    x ^= x >> 16;
+    x *= 0x7FEB352Du;
+    x ^= x >> 15;
+    x *= 0x846CA68Bu;
+    x ^= x >> 16;
+    constexpr unsigned int span = max_rocks_per_rank - min_rocks_per_rank + 1;
+    return min_rocks_per_rank + static_cast<int>(x % span);
+}
 
 // Harvest cycles. Each time a collector finishes a load and dumps it, its whole lane --
 // rock line, drop point, and the rocks it will fetch next -- steps counter-clockwise
@@ -118,11 +161,33 @@ inline constexpr int harvest_rocks_per_load = 2;
 // It was a flat 30 deg, which at 0.03 rad/slot is 17 slots -- a load of two rocks every
 // 17 slots leaves a wall that is 88% gaps, and puts every pile 15 m of arc from the
 // builder that is supposed to eat it.
-inline int HarvestDropSlot(int cycle) {
-    return builder_seed_rock_count + (cycle < 0 ? 0 : cycle) * harvest_rocks_per_load;
+//
+// Both take the rank, because a load is now 2-6 rocks depending on whose it is, and the
+// step is one slot per rock DELIVERED. A rank whose collector brings six rocks walks its
+// lane six slots per cycle; one that brings two walks two. Using a single site-wide load
+// size here would put the fast ranks' piles well ahead of the wall their builder has
+// actually reached.
+inline int HarvestDropSlot(int rank_index, int cycle) {
+    return builder_seed_rock_count + (cycle < 0 ? 0 : cycle) * RocksPerRank(rank_index);
 }
-inline double HarvestLaneOffsetRad(int cycle) {
-    return HarvestDropSlot(cycle) * wall_slot_pitch_rad;
+
+// Where that load is actually PUT, as a slot number: the MIDDLE of the run of slots it
+// will be eaten over, not its first slot.
+//
+// This is the same rule BuilderPileCenter already uses for the seed heap, and for the
+// same reason -- the builder has to reach the pile from either end of the run. It only
+// became load-bearing when a load stopped being two rocks. A load is tipped out in one
+// place and the builder then creeps one slot per rock laid, so with L rocks the far end
+// of the run is (L-1) slots of lane away from the pile. Measured at L=6: the arm base
+// ended up 6.54 m from the drop point against a 5.2 m envelope, and the reach audit said
+// so at t=0 -- the builder would have parked at its slot and refused the pile beside it.
+// Centring halves that lever arm: +/-2.5 slots gives 4.70 m, inside the envelope, and it
+// also tightens the old L=2 case from 4.04 m to 3.94 m.
+inline double HarvestLoadCenterSlot(int rank_index, int cycle) {
+    return HarvestDropSlot(rank_index, cycle) + 0.5 * (RocksPerRank(rank_index) - 1);
+}
+inline double HarvestLaneOffsetRad(int rank_index, int cycle) {
+    return HarvestLoadCenterSlot(rank_index, cycle) * wall_slot_pitch_rad;
 }
 
 // Distance from the tractor's chassis origin BACK to the trailer's rear pour lip, along
@@ -264,7 +329,7 @@ inline double RankRayAngleRad(int rank_index, int num_ranks) {
 // Angle of the COLLECTOR's lane on a given harvest cycle: the base ray, advanced by the
 // wall slots the builder will have laid by the time that load lands. See HarvestDropSlot.
 inline double HarvestLaneAngleRad(int rank_index, int num_ranks, int cycle) {
-    return RankRayAngleRad(rank_index, num_ranks) + HarvestLaneOffsetRad(cycle);
+    return RankRayAngleRad(rank_index, num_ranks) + HarvestLaneOffsetRad(rank_index, cycle);
 }
 
 inline chrono::ChVector3d PointOnSiteRay(int rank_index, int num_ranks, double radius) {

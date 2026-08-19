@@ -52,6 +52,7 @@
 #include "src/RobotLayout.h"
 #include "src/RobotRig.h"
 #include "src/SynAgents.h"
+#include "src/TrajectoryRecorder.h"
 
 using namespace chrono;
 using namespace chrono::sensor;
@@ -75,11 +76,25 @@ double settle_time = 1.0;
 double motion_log_rate = 0.0;
 // Sim-time period of the rank-local performance probe (0 disables it).
 double perf_log_period = 0.0;
+// Pose-capture rate for --record_dir. 60 Hz because the output is meant to be re-rendered
+// as animation; anything below the target frame rate has to be interpolated, and rocks
+// tipping out of a bed do not interpolate well.
+double record_rate_hz = 60.0;
 
 const double terrain_resolution_scale = 4.0;
 const double terrain_pixels_x = 256.0;
 const double terrain_pixels_y = 256.0;
-const std::string terrain_heightmap_file = "terrain/terrain2.bmp";
+// Graded work pad. terrain2.bmp puts the site rings on a 5% hillside -- the builder orbit
+// swung 3.96 m with a 17% peak along-path grade, more than the single-pin tracks want to
+// climb under load. tools/make_graded_pad.py blends r<=45 m toward a level plane (keeping
+// 15% of the local relief so it still reads as ground), cosine-tapers out to 130 m, and
+// leaves everything past that bit-identical. The orbit now swings 0.57 m at ~2%.
+//
+// 16-bit PNG, not BMP: RigidTerrain spreads gray over [min,max] using the image's full
+// range and Chrono's STB wrapper always loads 16-bit, so 8 bits would quantize this
+// 50 m range into 0.196 m steps -- invisible on a hillside, but it would terrace a flat
+// pad into 20 cm stairs. Set this back to "terrain/terrain2.bmp" for the ungraded site.
+const std::string terrain_heightmap_file = "terrain/terrain2_graded.png";
 const double terrain_height_offset = 0.0;
 const double terrain_min_height = -25.0;
 const double terrain_max_height = 25.0;
@@ -148,9 +163,11 @@ ChQuaternion<> SensorLookAtRotation(const ChVector3d& camera_pos, const ChVector
     return rot.GetQuaternion();
 }
 
-double RockLineEndDistance(const RockFieldConfig& config) {
-    return config.first_distance +
-           (config.rocks_per_rank - 1) * config.distance_step;
+// How far out a rank's rock line reaches. Per rank, because the number of rocks on it
+// is per rank now -- a six-rock line runs four steps further than a two-rock one, and
+// the terrain extension strips are sized from this.
+double RockLineEndDistance(const RockFieldConfig& config, int robot_index) {
+    return config.first_distance + (RocksPerRank(robot_index) - 1) * config.distance_step;
 }
 
 double DistanceToTerrainEdge(const ChVector3d& origin,
@@ -183,6 +200,10 @@ double DistanceToTerrainEdge(const ChVector3d& origin,
 // Fitting a plane and matching pitch and roll to it cuts the worst-case seating error to
 // 0.019-0.077 m -- 6x to 20x better -- at every radius, which is the point: this is a fix
 // for the seating, not for one lucky lane radius.
+//
+// Those figures are for the ungraded map. On terrain2_graded.png the pad holds the lane to
+// 1.1 deg of tilt and 0.102 m of level-hull error, so the fit is mostly insurance now -- it
+// earns its keep again the moment the heightmap constant points back at terrain2.bmp.
 struct BuilderSeating {
     ChCoordsys<> pose;
     double level_error;  // worst seating error the old single-probe placement would give
@@ -635,8 +656,8 @@ void AddRockLineTerrainExtensions(RigidTerrain& terrain,
                                   double terrain_length,
                                   double terrain_width,
                                   const RockFieldConfig& config) {
-    const double rock_line_end_distance = RockLineEndDistance(config);
     for (int robot_index = 0; robot_index < num_robots; ++robot_index) {
+        const double rock_line_end_distance = RockLineEndDistance(config, robot_index);
         const ChVector3d origin = InitialGroundPositionForRobot(robot_index, num_robots);
         const ChVector3d forward = RockLineForwardForRobot(robot_index, num_robots);
         const double edge_distance =
@@ -810,6 +831,13 @@ void AddCommandLineOptions(ChCLI& cli) {
                           "Metres from the drop point to the first rock (default 20)", "20.0");
     cli.AddOption<double>("Diagnostics", "rock_distance_step",
                           "Metres between successive rocks on a rank's line (default 30)", "30.0");
+    cli.AddOption<int>("Diagnostics", "rocks_per_rank",
+                       "Pin every rank's rock line to this many rocks (0 = the default per-rank 2-6)", "0");
+
+    // Absolute-pose capture for offline re-rendering.
+    cli.AddOption<std::string>("Recording", "record_dir",
+                               "Write every moving body's world pose to this directory (empty = off)", "");
+    cli.AddOption<double>("Recording", "record_rate", "Pose capture rate in Hz", std::to_string(record_rate_hz));
 }
 
 }  // namespace
@@ -843,6 +871,12 @@ int main(int argc, char* argv[]) {
     const int solver_iterations = cli.GetAsType<int>("solver_iterations");
     rock_field_config.first_distance = cli.GetAsType<double>("rock_first_distance");
     rock_field_config.distance_step = cli.GetAsType<double>("rock_distance_step");
+    // Before ANY layout query: RocksPerRank feeds the harvest lane angle, the drop slot
+    // and the zombie pool size, so an override applied later would leave the geometry
+    // already computed from the un-overridden count.
+    SetRocksPerRankOverride(cli.GetAsType<int>("rocks_per_rank"));
+    const std::string record_dir = cli.GetAsType<std::string>("record_dir");
+    record_rate_hz = cli.GetAsType<double>("record_rate");
     syn_manager.SetHeartbeat(heartbeat);
 
     // Use AMD-UW data as the Chrono data root and its vehicle subfolder for vehicle JSON assets.
@@ -866,7 +900,19 @@ int main(int argc, char* argv[]) {
         SynLog() << "Site centre=(" << site_center_x << ", " << site_center_y << "); work circle="
                  << work_circle_radius << " m; builder orbit=" << builder_path_radius
                  << " m; collector ring=" << robot_start_radius << " m.\n";
-        SynLog() << "Vehicle data: " << GetVehicleDataPath() << "\n\n";
+        SynLog() << "Vehicle data: " << GetVehicleDataPath() << "\n";
+        // Printed once, from the one function every rank derives it from, because a
+        // per-rank rock count is the sort of thing that is only ever wrong by disagreeing
+        // between two processes -- and this is where that disagreement would be visible.
+        std::ostringstream counts;
+        int total_rocks = 0;
+        for (int i = 0; i < std::max(0, num_ranks - 1); ++i) {
+            const int n = RocksPerRank(i);
+            total_rocks += n;
+            counts << (i ? ", " : "") << "r" << (i + 1) << "=" << n;
+        }
+        SynLog() << "Rocks per rank per harvest cycle (" << min_rocks_per_rank << "-" << max_rocks_per_rank
+                 << "): " << counts.str() << " -- " << total_rocks << " per cycle across the site.\n\n";
     }
 
     const double terrain_length = terrain_pixels_x * terrain_resolution_scale;
@@ -934,6 +980,22 @@ int main(int argc, char* argv[]) {
                                  rock_field_config);
     auto rock_mat = MakeContactMaterial(contact_method, 0.9f, 0.0f);
     VsgAppWrapper app;
+
+    // Pose capture, on the physics ranks only. Rank 0 holds zombies -- copies driven by
+    // messages at the SynChrono heartbeat, not simulated bodies -- so recording there
+    // would resample the same data at a coarser rate and with a rank of latency.
+    //
+    // Constructed HERE, and told to exclude what already exists, because everything
+    // built up to this line is scenery that never moves: the terrain patches, the three
+    // orbit rings, the centre pad, the decorative laid rocks. They get described once
+    // and are then out of the per-frame sweep. Everything created after this line --
+    // rover, trailer, arms, rocks, builder, track shoes -- is recorded.
+    std::unique_ptr<TrajectoryRecorder> recorder;
+    if (owns_robot && !record_dir.empty()) {
+        recorder = std::make_unique<TrajectoryRecorder>(record_dir, rank, record_rate_hz, step_size,
+                                                        /*write_static=*/rank == 1);
+        recorder->ExcludeExisting(system);
+    }
 
     if (owns_robot) {
         robot->InitializeOnTerrain(terrain, rock_mat, chrono_data_path, amd_uw_data_path, height_probe_z,
@@ -1020,8 +1082,8 @@ int main(int argc, char* argv[]) {
         }
         SynLog() << "Rank " << rank << " build plan: " << wall_slot_count << " wall slots at "
                  << wall_slot_pitch_m << " m pitch, " << builder_pile_rocks.size()
-                 << " seed rocks in 1 heap, then " << harvest_rocks_per_load
-                 << " per collector load every " << harvest_rocks_per_load << " slots; "
+                 << " seed rocks in 1 heap, then " << RocksPerRank(builder_index)
+                 << " per collector load every " << RocksPerRank(builder_index) << " slots; "
                  << wall_slot_count * wall_slot_pitch_rad * builder_path_radius << " m of lane to walk.\n";
 
         // Reach audit, at t=0, against the NOMINAL arm base for each slot. Every target in
@@ -1060,14 +1122,15 @@ int main(int argc, char* argv[]) {
                 }
             }
             // Each load lands at HarvestDropSlot(c) and is eaten over the next
-            // harvest_rocks_per_load slots, so check both ends of that run.
-            for (int cycle = 0; HarvestDropSlot(cycle) < wall_slot_count; ++cycle) {
+            // RocksPerRank slots, so check both ends of that run.
+            const int rocks_per_load = RocksPerRank(builder_index);
+            for (int cycle = 0; HarvestDropSlot(builder_index, cycle) < wall_slot_count; ++cycle) {
                 // HarvestDropPoint, not InitialGroundPositionForRobot: the audit has to
                 // measure where the ROCKS land, and the latter is where the tractor parks
                 // -- 2.4 m of arc further on, so the rig's pour lip lands here.
                 const ChVector3d drop = HarvestDropPoint(builder_index, num_robot_ranks, cycle);
-                for (int k = 0; k < harvest_rocks_per_load; ++k) {
-                    const double d = (drop - arm_base_at_slot(HarvestDropSlot(cycle) + k)).Length();
+                for (int k = 0; k < rocks_per_load; ++k) {
+                    const double d = (drop - arm_base_at_slot(HarvestDropSlot(builder_index, cycle) + k)).Length();
                     drop_min = std::min(drop_min, d);
                     drop_max = std::max(drop_max, d);
                 }
@@ -1236,6 +1299,42 @@ int main(int argc, char* argv[]) {
               << (system->GetBodies().size() - bodies_before_zombies) << " zombie bodies = "
               << system->GetBodies().size() << " total\n";
 
+    // Name the machines for the recording. Everything else it finds -- the rocks, and
+    // anything a Chrono model adds that these getters do not reach -- falls back to its
+    // own Chrono name, which is why the rock bodies are named where they are created.
+    if (recorder) {
+        recorder->AddMeta("robot_index", std::to_string(robot->GetRobotIndex()));
+        recorder->AddMeta("num_robot_ranks", std::to_string(num_robot_ranks));
+        recorder->AddMeta("rocks_per_rank", std::to_string(RocksPerRank(robot->GetRobotIndex())));
+        recorder->AddMeta("seed_rocks", std::to_string(builder_pile_rocks.size()));
+        recorder->AddMeta("wall_slots", std::to_string(BuilderWallSlotCount(num_robot_ranks)));
+        recorder->AddMeta("step_size", std::to_string(step_size));
+        // The rock meshes are scaled and re-based at load, so the OBJ named in the
+        // manifest is NOT what was drawn. Each shape carries its drawn bounding box;
+        // this is the factor that produced it.
+        recorder->AddMeta("rock_mesh_scale", std::to_string(rock_field_config.mesh_scale));
+        recorder->AddMeta("gravity_z", std::to_string(-lunar_gravity));
+        recorder->AddMeta("site", "{\"center\":[0,0],\"work_circle\":" + std::to_string(work_circle_radius) +
+                                      ",\"builder_orbit\":" + std::to_string(builder_path_radius) +
+                                      ",\"collector_ring\":" + std::to_string(robot_start_radius) + "}");
+        recorder->AddMeta("terrain", "{\"heightmap\":\"" + terrain_heightmap_file + "\",\"length\":" +
+                                         std::to_string(terrain_length) + ",\"width\":" +
+                                         std::to_string(terrain_width) + ",\"min_height\":" +
+                                         std::to_string(terrain_min_height) + ",\"max_height\":" +
+                                         std::to_string(terrain_max_height) + "}");
+
+        recorder->LabelVehicle(robot->GetVehicle(), "collector");
+        recorder->LabelTrailer(robot->GetTrailer().get(), "collector_trailer");
+        recorder->Label(robot->GetTrailerBed(), "collector_trailer", "dump_bed");
+        recorder->Label(robot->GetTrailerTailgate(), "collector_trailer", "tailgate");
+        recorder->LabelArm(robot->GetArm(), "collector_arm");
+        if (builder) {
+            recorder->LabelTrackedVehicle(builder->GetVehicle(), "builder");
+            recorder->LabelArm(builder->GetArm(), "builder_arm");
+        }
+        recorder->Start(system);
+    }
+
     std::shared_ptr<ChSensorManager> sensor_manager;
     if (is_sensor_rank && !no_sensor) {
         sensor_manager = chrono_types::make_shared<ChSensorManager>(system);
@@ -1315,6 +1414,11 @@ int main(int argc, char* argv[]) {
         const double time = system->GetChTime();
         if (time >= end_time)
             break;
+
+        // Before anything in this iteration touches the state: the pose written under
+        // stamp t is the state AT t, not the state after the step that starts at t.
+        if (recorder)
+            recorder->CaptureIfDue(system, time);
 
         if (owns_robot && step_number % render_steps == 0) {
             ScopedTimer timer(perf_accum.render);

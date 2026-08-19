@@ -37,7 +37,8 @@ add_executable(demo_SYN_polaris_flat
     src/MaterialUtils.cpp
     src/RobotRig.cpp
     src/RockField.cpp
-    src/SynAgents.cpp)
+    src/SynAgents.cpp
+    src/TrajectoryRecorder.cpp)
 
 if(AMD_UW_ENABLE_ROS2)
     find_package(ament_cmake QUIET)
