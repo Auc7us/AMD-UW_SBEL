@@ -39,6 +39,19 @@ cmake -S . -B build -G Ninja -DAMD_UW_ENABLE_ROS2=ON   # configure once (or afte
 ninja -C build                                          # build the whole project
 ```
 
+On a **ROCm host** (HPC Fund) add `-DAMD_UW_ENABLE_CUDA=OFF`. Chrono::Sensor's OptiX ray
+tracer is CUDA-only, so the default link line pulls in `/usr/local/cuda/...` — which does
+not exist there at all, and the link fails on `libcudart_static.a` before anything else
+is even attempted. With the switch off the demo links against a CUDA-free
+`libChrono_sensor`; rank 0's camera then has no ray tracer behind it, so run with
+`--no_sensor`:
+
+```bash
+cmake -S . -B build -G Ninja -DAMD_UW_ENABLE_ROS2=ON -DAMD_UW_ENABLE_CUDA=OFF \
+      -DCHRONO_ROOT=$HOME/mountdir/chrono -DCHRONO_PACKAGE_DIR=$HOME/mountdir/packages
+ninja -C build
+```
+
 After editing sources, just rebuild (no reconfigure needed):
 
 ```bash
@@ -138,9 +151,11 @@ All of this lives in `src/RobotLayout.h` as one source of truth. Note this also
 scales past two ranks: the previous layout hard-coded two headings (330 deg and
 60 deg) and silently gave every rank after the second the same heading as rank 2.
 
-The rock line runs 30 m to 660 m out from each collector, so its outer end leaves
-the 1024 m heightmap; those last few rocks rest on the flat extension strips that
-`AddRockLineTerrainExtensions` lays along each ray, not on mapped terrain.
+The rock line runs 30 m to 660 m out from each collector, so its outer end can leave
+the 1024 m heightmap. Nothing needs stitching there: SCM's patch extends to infinity in
+the x-y plane, and outside the initialized area a node simply takes the height of the
+nearest initialized one, so a rock past the edge rests on flat ground at the right
+elevation. (The rigid build used to lay explicit extension strips for this.)
 
 ### What the builder does
 
@@ -303,20 +318,79 @@ Two ordering rules follow, and breaking either is silent:
   without it the tracks sink through the ground and the gripper passes through
   rocks.
 
-Watch the terrain cost when changing the field map. The rover's mission needs the
-full 1024 m `terrain2.bmp`, which is a ~130k-triangle collision mesh, and the
-M113's ~130 track shoes query it every step; that narrowphase is ~7.6 of the ~17.9
-wall/sim. If it ever needs to come down, the builder only ever occupies the orbit,
-so a second smaller patch plus collision families would let its shoes skip the
-big mesh.
+### Terrain: deformable SCM
+
+The ground is `SCMTerrain` — Bekker-Wong deformable soil — over the same 1024 x 1024 m
+`terrain2_graded.png` heightmap the rigid build used, at **0.10 m** grid spacing. Soil
+parameters and the resolution are the `terrain_scm_*` / `scm_*` constants at the top of
+`main.cpp`.
+
+Read the cost before changing the resolution:
+
+| | at 0.10 m |
+|---|---|
+| grid nodes | 10241 x 10241 = **104.9 M** |
+| undeformed heights (dense `ChMatrixDynamic<double>`) | **839 MB per rank** |
+| visualization mesh (verts + normals + UV + colour + 209.7 M faces) | **~13.5 GB per rank** |
+
+Both scale as 1/delta^2, so 0.05 m is 4x each figure. The height matrix is allocated
+whether or not a node is ever touched.
+
+The visualization mesh is therefore built **only on ranks that actually render** —
+a rank with its own `--vsg` window, or rank 0 when its camera is enabled. A headless rank
+pays the 839 MB and nothing more. Physics is unaffected either way: SCM works from the
+height matrix and the active domains, not from the mesh.
+
+**Active domains are not optional.** SCM only casts rays from grid nodes inside some
+active domain, so a body outside every domain gets no soil reaction at all and sinks
+straight through the terrain. Four places register them, and all four are needed:
+
+- `RobotRig::InitializeOnTerrain` — the collector's and trailer's wheel spindles, and the
+  cycle-0 rocks. Before `Settle()`, or the settle steps run against the whole grid.
+- `RobotRig::StartNextHarvestCycle` — each later cycle's rocks as they spawn.
+- `main.cpp`, after the builder is built — **one** domain on the M113 hull rather than ~130
+  on the shoes (a domain only selects which nodes cast rays; the rays hit whatever shape is
+  above them, so one box over the footprint covers every shoe in it), plus one per seed rock.
+- `main.cpp`, on ranks that own no robot — a degenerate 1 cm domain on a marker body. Rank 0
+  steps the system too, and `SCMLoader::SetupInitial()` only installs Chrono's default
+  whole-system domain when a visualization mesh was requested, so a headless rank 0 would
+  otherwise index an empty domain list behind a release-disabled assert.
+
+For reference, the rigid terrain this replaced was a ~130k-triangle collision mesh that the
+M113's ~130 track shoes queried every step: ~7.6 of the ~17.9 wall/sim. SCM moves that cost
+from Bullet's narrowphase to ray casting over the active domains, so it scales with how much
+machine is on the ground, not with how big the map is.
 
 ### Recording poses for offline rendering
 
-`--record_dir <path>` writes the world pose of every moving body on every physics rank,
-at `--record_rate` Hz (default 60), for re-rendering the run in Blender with better
-meshes than the sim carries.
+**Recording is on by default.** Every run writes the world pose of every moving body on
+every physics rank, at `--record_rate` Hz (default 60), for re-rendering in Blender with
+better meshes than the sim carries. A run nobody can re-render afterwards is a run that
+has to be repeated, and at this terrain size a repeat is expensive.
+
+Runs are named by timestamp under `--record_root` (default `recordings/`, relative to the
+working directory, gitignored):
+
+```text
+recordings/run_20260821_181530/
+```
+
+Rank 0 stamps that name once and broadcasts it over MPI. Every rank deriving it from its
+own clock would scatter one run across as many directories as there are ranks the moment
+the second ticked over during startup — and startup here is seconds of heightmap
+resampling, so it would tick.
+
+| flag | effect |
+|---|---|
+| *(nothing)* | record to `recordings/run_<timestamp>` at 60 Hz |
+| `--record_root /data` | record to `/data/run_<timestamp>` |
+| `--record_dir /data/run1` | record to exactly that directory |
+| `--no_record` | do not record |
+
+The absolute path in use is printed by rank 0 at startup.
 
 ```bash
+mpirun -np 16 ./build/demo_SYN_construction                  # -> recordings/run_<timestamp>
 mpirun -np 16 ./build/demo_SYN_construction --record_dir /data/run1 --record_rate 60
 python3 tools/read_trajectory.py /data/run1 --check          # validate
 python3 tools/read_trajectory.py /data/run1 --rank 1 --list  # what was recorded
@@ -618,7 +692,7 @@ Arm status error codes:
 1. [x] Add ROS controller integration.
 2. [x] Stop at rock.
 3. [x] Integrate with Harry.
-4. [ ] [WIP] Move to SCM terrain. 
+4. [x] Move to SCM terrain — 1024 x 1024 m at 0.10 m grid spacing.
 5. [x] ~~Explore a PyChrono wrapper for SynChrono~~. Scrapped.
 6. [ ] Scale to many vehicles and rocks.
 

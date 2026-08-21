@@ -5,6 +5,9 @@ install/
 log/
 build_importer/
 
+# Default parent for timestamp-named pose recordings (--record_root).
+recordings/
+
 # Reference-only checkout of the lunar-manip Python scenarios, and its own git
 # repo. It is here to read and compare against, never to load from: this project
 # resolves every runtime asset under data/, and nothing in src/, main.cpp,

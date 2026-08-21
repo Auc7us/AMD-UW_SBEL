@@ -762,6 +762,17 @@ void RobotRig::StartNextHarvestCycle(double time) {
     for (size_t i = first_new; i < m_rocks.size(); ++i)
         GetSystem()->GetCollisionSystem()->BindItem(m_rocks[i]);
 
+    // On deformable terrain the new rocks also need their own SCM active domains. Being
+    // bound into the collision system only makes them visible to ray casts that are
+    // actually fired, and SCM fires rays only from nodes inside some active domain -- so
+    // without this a later cycle's rocks spawn on the surface and sink straight through it.
+    // The cycle-0 rocks get theirs in InitializeOnTerrain; these are the ones that follow.
+    if (auto* scm = dynamic_cast<chrono::vehicle::SCMTerrain*>(m_terrain)) {
+        const chrono::ChVector3d rock_domain(1.0, 1.0, 1.0);
+        for (size_t i = first_new; i < m_rocks.size(); ++i)
+            scm->AddActiveDomain(m_rocks[i], chrono::ChVector3d(0.0, 0.0, 0.3), rock_domain);
+    }
+
     // DO NOT bind these into the VSG scene from here -- it segfaults. VSG needs new
     // geometry compiled and merged between frames (the LoadOperation/Merge pattern in
     // ChVisualSystemVSG.cpp); BindBody does neither, so it is only safe before

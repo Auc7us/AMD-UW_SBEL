@@ -28,6 +28,12 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 option(AMD_UW_ENABLE_ROS2 "Enable ROS2 command/state bridge" ON)
+# Chrono::Sensor's OptiX ray tracer is CUDA-only, so on an NVIDIA host the demo links the
+# CUDA runtime and the driver stubs alongside libChrono_sensor. Turn this OFF to build
+# against a Chrono::Sensor that was compiled without CUDA -- which is the only thing that
+# links on a ROCm host, where /usr/local/cuda does not exist at all. Rank 0's camera is a
+# runtime concern (--no_sensor); this switch is purely about what gets linked.
+option(AMD_UW_ENABLE_CUDA "Link the CUDA runtime and driver stubs used by a CUDA/OptiX Chrono::Sensor" ON)
 option(AMD_UW_USE_SOLIDWORKS_IMPORTER "Build the LRV arm from the Chrono SolidWorks Python importer" OFF)
 
 add_executable(demo_SYN_construction
@@ -97,6 +103,15 @@ target_include_directories(demo_SYN_construction
         "${CHRONO_ROOT}/src/chrono_thirdparty/flatbuffers/include"
         "${OPTIX_INCLUDE_DIR}")
 
+# libgomp for whichever GCC actually compiles this, not a pinned version directory: the
+# container ships 11 and 13, and Chrono itself is built with 13.
+execute_process(COMMAND ${CMAKE_CXX_COMPILER} -print-file-name=libgomp.so
+                OUTPUT_VARIABLE AMD_UW_LIBGOMP OUTPUT_STRIP_TRAILING_WHITESPACE)
+if(NOT EXISTS "${AMD_UW_LIBGOMP}")
+    set(AMD_UW_LIBGOMP gomp)
+endif()
+message(STATUS "libgomp: ${AMD_UW_LIBGOMP}")
+
 target_include_directories(demo_SYN_construction
     SYSTEM PRIVATE
         /usr/include/eigen3
@@ -153,18 +168,18 @@ target_link_libraries(demo_SYN_construction
         "${CHRONO_BUILD_DIR}/lib/libChrono_vehicle_irrlicht.so"
         "${CHRONO_BUILD_DIR}/lib/libChrono_vehicle.so"
         "${CHRONO_BUILD_DIR}/lib/libChrono_fsisph.so"
-        /usr/local/cuda/lib64/libcudart_static.a
+        "$<$<BOOL:${AMD_UW_ENABLE_CUDA}>:/usr/local/cuda/lib64/libcudart_static.a>"
         dl
         /usr/lib/x86_64-linux-gnu/librt.a
-        /usr/local/cuda/targets/x86_64-linux/lib/stubs/libnvrtc.so
-        /usr/local/cuda/targets/x86_64-linux/lib/stubs/libcuda.so
-        /usr/local/cuda/targets/x86_64-linux/lib/stubs/libcublas.so
-        /usr/local/cuda/targets/x86_64-linux/lib/stubs/libcusparse.so
+        "$<$<BOOL:${AMD_UW_ENABLE_CUDA}>:/usr/local/cuda/targets/x86_64-linux/lib/stubs/libnvrtc.so>"
+        "$<$<BOOL:${AMD_UW_ENABLE_CUDA}>:/usr/local/cuda/targets/x86_64-linux/lib/stubs/libcuda.so>"
+        "$<$<BOOL:${AMD_UW_ENABLE_CUDA}>:/usr/local/cuda/targets/x86_64-linux/lib/stubs/libcublas.so>"
+        "$<$<BOOL:${AMD_UW_ENABLE_CUDA}>:/usr/local/cuda/targets/x86_64-linux/lib/stubs/libcusparse.so>"
         "${CHRONO_BUILD_DIR}/lib/libChrono_fsi.so"
         "${CHRONO_BUILD_DIR}/lib/libChrono_vsg.so"
         "${CHRONO_BUILD_DIR}/lib/libChrono_irrlicht.so"
         "${CHRONO_BUILD_DIR}/lib/libChrono_core.so"
-        /usr/lib/gcc/x86_64-linux-gnu/11/libgomp.so
+        "${AMD_UW_LIBGOMP}"
         /usr/lib/x86_64-linux-gnu/libpthread.a
         pthread
         "${CHRONO_BUILD_DIR}/lib/libyaml-cpp.so.0.8.0"
