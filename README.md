@@ -338,79 +338,40 @@ rock       size= 49.723 x  18.025 x  1.863 m     <- the group, i.e. the whole ro
 Wheels folded into the hull (the centre-of-mass mistake) collapses the collector's
 extent; ignoring the shape frames stacks the M113's road wheels on its centreline.
 
-#### Previewing a recording without Blender
+#### Replaying a recording in 3D, without Blender
 
-`tools/preview_run.py` turns a recording into ONE self-contained HTML page: a plan view
-of the whole site with every body drawn as its own bounding box, a scrubbable timeline,
-an elevation panel, and a nearest-rock-to-builder trace. Standard library only -- there
-is no matplotlib in the container and no display either, so a page you open in a browser
-beats a plotting window.
+`tools/replay_run.py` is a previz playblast: it opens the recording in a real 3D window
+using the run's OWN meshes, played back on the wall clock, orbitable and scrubbable. The
+scene builds itself -- the object manifest names every mesh file and its local frame, so
+there is nothing to import and no scene to maintain.
 
 ```bash
-python3 tools/preview_run.py ~/mountdir/recordings/run16          # -> run16/preview.html
-python3 tools/preview_run.py <dir> -o /tmp/run.html --fps 3       # 3 frames per sim second
-python3 tools/preview_run.py <dir> --rank 1,2,3 --to 200          # one sector, first 200 s
-python3 tools/preview_run.py <dir> --all-parts                    # keep track shoes too
+python3 tools/replay_run.py ~/mountdir/recordings/run16              # real time
+python3 tools/replay_run.py <dir> --speed 8                          # 8x
+python3 tools/replay_run.py <dir> --rank 1,2 --from 90 --to 140      # one sector, one cycle
+python3 tools/replay_run.py <dir> --boxes                            # bounding boxes, faster
+python3 tools/replay_run.py <dir> --movie clip.mp4 --fps 20          # off-screen to mp4
+python3 tools/replay_run.py <dir> --shot look.png --at 300           # one frame
 ```
 
-Boxes rather than meshes, on purpose: the manifest already carries each visual shape's
-bounds, so a box needs no mesh files present and no import step, and it catches the
-failures worth catching -- a machine off its own sector ray, a rock sunk into the terrain
-or floating over it, a load dropped outside the arm's envelope, an arm folded through its
-own hull. Use `blender_import.py` when it has to look good; use this when you want to know
-whether it is right.
+Keys: `space` play/pause, arrows step a frame, `[` `]` speed, `t` top, `i` iso, `f` follow
+the next machine, `c` free camera, `r` restart, `q` quit.
 
-Frames are NOT fixed size -- a rank's body count grows as rocks are created -- so the
-file is indexed by walking frame headers and seeking past payloads, and only the frames
-actually kept are read in full. That is what makes the 8.3 GB, 15-rank, 24-minute run16
-preview in about 4 seconds. Ranks are aligned by simulation TIME rather than frame
-number, so a rank that starts a step late does not show its machines a frame out of step
-with everyone else's.
+Needs `pyvista` (`pip install pyvista imageio imageio-ffmpeg`), and a display for the
+interactive window -- `--movie` and `--shot` render off-screen and need neither.
 
-Defaults drop the parts that are numerically dominant and structurally uninteresting from
-above -- track shoes, road wheels, suspension arms, spindles. 63 shoes per builder is
-most of the recording and none of it says whether the site is working.
+Meshes are loaded once per file and shared, so fifteen ranks of builders cost one hull
+mesh rather than fifteen, and each body is drawn in the colour its own shapes carry, so
+the playblast looks like the run instead of like a debug view. Bodies stay hidden until
+their first recorded pose, because rocks are created during the run and would otherwise
+sit at the origin until they exist. The terrain is rebuilt from the heightmap named in the
+recording's own metadata and cropped to the site: the patch is 1024 m across against a
+37 m site, and keeping all of it both costs frame rate and wrecks every camera fit, since
+those are computed over the scene bounds and the machines end up specks.
 
-Per rank: `rank_N_meta.json` (run parameters), `rank_N_objects.jsonl` (one line per
-recorded body), `rank_N_frames.bin` (the poses). `static_props.jsonl` is the scenery --
-terrain, the three rings, the centre pad, the decorative laid rocks -- written once by
-rank 1, since it is identical everywhere and never moves.
-
-Rank 0 is not recorded. It holds *zombies*: copies driven by SynChrono messages at the
-heartbeat, not simulated bodies, so recording there would resample the same data a
-heartbeat late and at a coarser rate.
-
-At 4 ranks a physics rank records ~205 bodies -- rover chassis, four spindles and the
-wishbones, the trailer with its bed and tailgate, both eight-link manipulators, the
-M113's hull, sprockets, idlers, ten road wheels and 126 track shoes, and every rock,
-including the ones spawned by later harvest cycles. That is ~350 KB of sim second per
-rank at 60 Hz.
-
-Three things a consumer has to know, all of which are in the files:
-
-- **The pose is the body's REFERENCE frame**, which is what Chrono hands its own
-  renderers (`ChBody::GetVisualModelFrame` returns exactly this). Using the centre of
-  mass instead would offset every `ChBodyAuxRef` -- every rock and every arm link -- by
-  its own COM offset.
-- **A body is not one mesh at its origin.** Each manifest entry lists its visual shapes
-  *with their local frames*, so a shape's world transform is `body_pose *
-  shape_local_frame`. The M113 road wheel is two wheel halves at ±y; the trailer tub is
-  four boxes.
-- **`scale` is not the whole story for the rocks.** `LoadRockMesh` bakes the 0.2 scale
-  into the vertices and re-bases the mesh so its bottom sits at z=0, so the shape reports
-  scale `[1,1,1]` against a source OBJ that is five times too big and sitting at the
-  wrong height. Every trimesh shape therefore also carries `aabb_min`/`aabb_max`: the
-  box the geometry was actually drawn in. Fit replacement meshes to that.
-
-Two bodies have no visual shape of their own and need a mesh chosen on the Blender side:
-`collector_trailer/chassis` (draw it with `LRV_Wagon/trailer_chassis.obj`, which is what
-the sensor rank uses) and `world/front_ballast`.
-
-The object list grows during a run -- each harvest cycle spawns a fresh set of rocks --
-so `rank_N_objects.jsonl` is appended to, and flushed, at the moment a body first
-appears, with the sim time it appeared at. Frames before that carry no entry for it;
-`--npz` fills those with NaN rather than zeros, because a rock that does not exist yet
-is not a rock at the site centre.
+Defaults drop track shoes, road wheels, suspension arms and spindles -- 1905 of the 3472
+bodies in a 15-rank run, none of which say whether the site is working. `--all-parts`
+keeps them and will cost you the frame rate.
 
 ### Cost diagnostics
 
