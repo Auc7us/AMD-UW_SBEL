@@ -352,6 +352,7 @@ python3 tools/replay_run.py <dir> --rank 1,2 --from 90 --to 140      # one secto
 python3 tools/replay_run.py <dir> --boxes                            # bounding boxes, faster
 python3 tools/replay_run.py <dir> --movie clip.mp4 --fps 20          # off-screen to mp4
 python3 tools/replay_run.py <dir> --shot look.png --at 300           # one frame
+python3 tools/replay_run.py <dir> --focus "builder/Chassis" --all-parts   # close on one machine
 ```
 
 Keys: `space` play/pause, arrows step a frame, `[` `]` speed, `t` top, `i` iso, `f` follow
@@ -360,14 +361,37 @@ the next machine, `c` free camera, `r` restart, `q` quit.
 Needs `pyvista` (`pip install pyvista imageio imageio-ffmpeg`), and a display for the
 interactive window -- `--movie` and `--shot` render off-screen and need neither.
 
+It is 1:1 with what the sim drew, and that takes more than loading the OBJ files. Every
+mesh is fitted to the bounding box the recorder captured, because -- as TrajectoryRecorder
+says in as many words -- `scale` alone is a lie for anything transformed in memory after
+loading. Two cases here, both badly wrong without the fit: every rock reports scale
+[1,1,1] and is drawn at 0.2, since LoadRockMesh bakes the scale into the vertices and
+re-bases the mesh on the ground plane, so the source OBJ renders FIVE TIMES too large; and
+the builder hull is drawn deliberately squashed in z by 0.110 (`Builder_Chassis_Squashed_Z`
+in BuilderRig.cpp, so the roof does not bury the arm), so the source OBJ renders as a
+full-height M113. The fit is per axis, which reproduces a one-axis squash exactly where a
+uniform scale cannot. Primitives come from the dimensions the recorder wrote -- box `size`,
+cylinder `radius`/`height` -- not from a bounding box; run16 carries 92 cylinders.
+
+Scenery comes from `static_props.jsonl` rather than being synthesised. The three rings are
+not circles: each is 180 short boxes laid ON the terrain by height probe, following its
+height, and the pad and decorative wall rocks are recorded the same way -- a flat circle at
+a guessed height is wrong by metres on a hillside. The terrain is rebuilt from the heightmap
+named in the recording's own metadata and fitted to the patch bounds, which is what makes
+it exact: run16's patch spans z=-13.82..12.65 while its metadata declares [-25, 25], because
+Chrono maps grey over the image's own range and not the declared one. Vertex pitch works out
+at length/(nv_x-1) = 4.0157 m, matching Chrono's mesh exactly. Checked against the recorded
+scenery: ring markers land within a median 0.08 m of the rebuilt surface and the placed
+rocks within 0.00 m, the residual being grid pitch on a slope, and builder hulls float
+0.36-0.77 m above it, which is the track and road wheels they are actually standing on.
+
 Meshes are loaded once per file and shared, so fifteen ranks of builders cost one hull
-mesh rather than fifteen, and each body is drawn in the colour its own shapes carry, so
-the playblast looks like the run instead of like a debug view. Bodies stay hidden until
-their first recorded pose, because rocks are created during the run and would otherwise
-sit at the origin until they exist. The terrain is rebuilt from the heightmap named in the
-recording's own metadata and cropped to the site: the patch is 1024 m across against a
-37 m site, and keeping all of it both costs frame rate and wrecks every camera fit, since
-those are computed over the scene bounds and the machines end up specks.
+mesh rather than fifteen, and each body is drawn in the colour its own shapes carry, so the
+playblast looks like the run instead of like a debug view. Bodies stay hidden until their
+first recorded pose, because rocks are created during the run and would otherwise sit at
+the origin until they exist. The terrain is cropped to the site: the patch is 1024 m across
+against a 37 m site, and keeping all of it both costs frame rate and wrecks every camera
+fit, since those are computed over the scene bounds and the machines end up specks.
 
 Defaults drop track shoes, road wheels, suspension arms and spindles -- 1905 of the 3472
 bodies in a 15-rank run, none of which say whether the site is working. `--all-parts`

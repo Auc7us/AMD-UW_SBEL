@@ -135,21 +135,83 @@ class MeshCache:
         return sum(1 for v in self._cache.values() if v is not None)
 
 
+def fit_to_aabb(mesh, amin, amax):
+    """Map a mesh's own bounds onto the bounds Chrono actually DREW, per axis.
+
+    This is the difference between a plausible-looking scene and a correct one, and the
+    recorder says so in as many words: "scale" alone is a lie for anything whose mesh was
+    transformed in memory after loading. Two cases in this project, both wrong by a lot
+    without this:
+
+      * every rock reports scale [1,1,1] and is drawn at 0.2, because LoadRockMesh bakes
+        the scale into the vertices and re-bases the mesh so its bottom sits at z=0 --
+        so the source OBJ renders FIVE TIMES too large;
+      * the builder hull is drawn squashed (shape_name Builder_Chassis_Squashed_Z), a
+        factor of 0.110 in z, so the source OBJ renders as a full-height M113.
+
+    Per axis rather than uniform: that reproduces a deliberate one-axis squash exactly,
+    which a uniform fit cannot. The cost is that a mesh which was ROTATED before its
+    bounds were taken (the rocks) gets a little internal distortion while still filling
+    precisely the right box -- invisible on a lumpy rock, and the box is what the physics
+    saw.
+    """
+    lo, hi = mesh.bounds[0::2], mesh.bounds[1::2]
+    scale = [1.0, 1.0, 1.0]
+    offset = [0.0, 0.0, 0.0]
+    for i in range(3):
+        raw = hi[i] - lo[i]
+        want = amax[i] - amin[i]
+        if raw > 1e-9 and want > 1e-9:
+            scale[i] = want / raw
+        # Align by the box, not by the origin: the rocks were re-based on load, so their
+        # source origin is nowhere near the origin Chrono drew them about.
+        offset[i] = amin[i] - lo[i] * scale[i]
+    m = np.diag([scale[0], scale[1], scale[2], 1.0])
+    m[:3, 3] = offset
+    return mesh.transform(m, inplace=False)
+
+
 def shape_geometry(shape, cache, boxes_only):
-    """PolyData for one visual shape, already placed in its body's frame."""
+    """PolyData for one visual shape, already placed in its body's frame.
+
+    Primitives are built from the dimensions the recorder wrote -- box "size", cylinder
+    "radius"/"height" -- not from a bounding box. run16 carries 92 cylinders and they were
+    every one of them drawn as a 20 cm cube before this.
+    """
     import pyvista as pv
 
-    amin = shape.get("aabb_min") or [-0.1] * 3
-    amax = shape.get("aabb_max") or [0.1] * 3
+    kind = shape.get("type")
+    amin = shape.get("aabb_min")
+    amax = shape.get("aabb_max")
     mesh = None
-    if not boxes_only and shape.get("type") == "trimesh":
+
+    if kind == "trimesh" and not boxes_only:
         mesh = cache.get(shape.get("file", ""), shape.get("scale", [1, 1, 1]))
+        if mesh is not None:
+            mesh = mesh.copy(deep=False)
+            if amin and amax:
+                mesh = fit_to_aabb(mesh, amin, amax)
+
     if mesh is None:
-        # Primitive stand-in from the shape's own bounds. Also the --boxes path, and the
-        # only thing available for cylinders and boxes, which carry no mesh file.
-        mesh = pv.Box(bounds=(amin[0], amax[0], amin[1], amax[1], amin[2], amax[2]))
-    else:
-        mesh = mesh.copy(deep=False)
+        if kind == "box" and shape.get("size"):
+            sx, sy, sz = (max(1e-4, float(v)) for v in shape["size"])
+            mesh = pv.Box(bounds=(-sx / 2, sx / 2, -sy / 2, sy / 2, -sz / 2, sz / 2))
+        elif kind == "sphere" and shape.get("radius"):
+            mesh = pv.Sphere(radius=float(shape["radius"]), theta_resolution=16,
+                             phi_resolution=16)
+        elif kind in ("cylinder", "capsule") and shape.get("radius"):
+            # Chrono's cylinder and capsule are both centred on the body origin with their
+            # axis along local z, which is also pyvista's default direction argument.
+            r = float(shape["radius"])
+            h = max(1e-4, float(shape.get("height", 2.0 * r)))
+            if kind == "cylinder":
+                mesh = pv.Cylinder(radius=r, height=h, direction=(0, 0, 1), resolution=20)
+            else:
+                mesh = pv.Capsule(radius=r, cylinder_length=h, direction=(0, 0, 1))
+        elif amin and amax:
+            mesh = pv.Box(bounds=(amin[0], amax[0], amin[1], amax[1], amin[2], amax[2]))
+        else:
+            mesh = pv.Box(bounds=(-0.1, 0.1, -0.1, 0.1, -0.1, 0.1))
 
     rot = quat_matrix(shape.get("rot", [1, 0, 0, 0]))
     pos = np.array(shape.get("pos", [0, 0, 0]), dtype=float)
@@ -161,61 +223,67 @@ def shape_geometry(shape, cache, boxes_only):
     return mesh
 
 
-def terrain_mesh(meta, decimate, keep_radius):
-    """Structured grid from the run's own heightmap, so height errors are visible.
+def terrain_mesh(meta, prop, decimate, keep_radius):
+    """The terrain, rebuilt from the run's own heightmap and fitted to the patch Chrono drew.
 
-    Chrono maps grey linearly onto [min_height, max_height] across a length x width patch
-    centred on the origin. STB always loads 16-bit, so the normalisation is by the image's
-    own dtype maximum rather than by 255 -- getting that wrong scales the whole landscape
-    by 257 and everything appears to float.
+    RigidTerrain builds its patch mesh in memory, so the manifest names no file for it --
+    but it does record the patch's bounds, and those are ground truth. Fitting to them
+    beats reconstructing the grey mapping: run16's patch spans z=-13.82..12.65 while its
+    metadata declares a [-25, 25] height range, because the mapping runs over the image's
+    OWN grey range, not the declared one. Guess that wrong and the whole landscape is
+    scaled and everything on it appears to float or sink.
     """
     import pyvista as pv
 
     terr = (meta or {}).get("terrain") or {}
     name = terr.get("heightmap")
     if not name:
-        return None
+        return None, None
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    path = None
-    for candidate in (name, os.path.join(here, "data", name)):
-        if os.path.exists(candidate):
-            path = candidate
-            break
+    path = next((c for c in (name, os.path.join(here, "data", name)) if os.path.exists(c)), None)
     if path is None:
         print(f"  ! heightmap {name} not found, terrain skipped", file=sys.stderr)
-        return None
+        return None, None
 
     img = pv.read(path)
     arr = img.active_scalars
     if arr is None:
-        return None
+        return None, None
     arr = np.asarray(arr)
     if arr.ndim > 1:  # RGB bitmap: channels are equal for greyscale, any one will do
         arr = arr[:, 0]
     nx, ny = img.dimensions[0], img.dimensions[1]
-    grid = arr.reshape((ny, nx)).astype(np.float64)
-    peak = 65535.0 if grid.max() > 255.0 else 255.0
-    lo = float(terr.get("min_height", 0.0))
-    hi = float(terr.get("max_height", 1.0))
-    z = lo + (hi - lo) * (grid / peak)
+    grey = arr.reshape((ny, nx)).astype(np.float64)
+
+    shape = (prop or {}).get("shapes", [{}])[0]
+    amin, amax = shape.get("aabb_min"), shape.get("aabb_max")
+    if amin and amax:
+        x0, x1, y0, y1 = amin[0], amax[0], amin[1], amax[1]
+        span = grey.max() - grey.min()
+        z = (amin[2] + (amax[2] - amin[2]) * (grey - grey.min()) / span if span > 0
+             else np.full_like(grey, amin[2]))
+    else:
+        length = float(terr.get("length", nx))
+        width = float(terr.get("width", ny))
+        x0, x1, y0, y1 = -length / 2, length / 2, -width / 2, width / 2
+        lo, hi = float(terr.get("min_height", 0.0)), float(terr.get("max_height", 1.0))
+        z = lo + (hi - lo) * (grey / (65535.0 if grey.max() > 255.0 else 255.0))
 
     step = max(1, int(decimate))
     z = z[::step, ::step]
-    length = float(terr.get("length", nx))
-    width = float(terr.get("width", ny))
     rows, cols = z.shape
-    x = np.linspace(-length / 2.0, length / 2.0, cols)
-    y = np.linspace(-width / 2.0, width / 2.0, rows)
-    # Cropped to the site. The full patch is 1024 m across against a 37 m site, so keeping
-    # it all costs frame rate for scenery nobody is looking at AND wrecks the framing:
-    # every camera fit is computed over the scene bounds, so the machines end up specks.
+    x = np.linspace(x0, x1, cols)
+    y = np.linspace(y0, y1, rows)
+    # Cropped to the site. The patch is 1024 m across against a 37 m site, so keeping all
+    # of it costs frame rate for scenery nobody looks at AND wrecks the framing: camera
+    # fits are computed over the scene bounds, and uncropped the machines end up specks.
     if keep_radius > 0:
-        cx = np.abs(x) <= keep_radius
-        cy = np.abs(y) <= keep_radius
+        cx, cy = np.abs(x) <= keep_radius, np.abs(y) <= keep_radius
         if cx.any() and cy.any():
             x, y, z = x[cx], y[cy], z[np.ix_(cy, cx)]
     xx, yy = np.meshgrid(x, y)
-    return pv.StructuredGrid(xx, yy, z)
+    colour = shape.get("color")
+    return pv.StructuredGrid(xx, yy, z), (tuple(colour) if colour else "#8a8578")
 
 
 def load(directory, ranks, t_from, t_to, fps, keep_all, max_frames):
@@ -273,45 +341,72 @@ def load(directory, ranks, t_from, t_to, fps, keep_all, max_frames):
     return meta0, bodies, poses, targets, rate
 
 
-def build_scene(pl, bodies, cache, boxes_only, meta, terrain_decimate, show_rings,
-                terrain_radius):
-    """One actor per body, index-aligned with `bodies`."""
+def static_props(directory):
+    """Scenery from static_props.jsonl: the patch, the three rings, the pad, the wall rocks."""
+    path = os.path.join(directory, "static_props.jsonl")
+    out = []
+    if not os.path.exists(path):
+        return out
+    import json
+
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                out.append(json.loads(line))
+    return out
+
+
+def build_scene(pl, bodies, cache, boxes_only, meta, terrain_decimate, scenery,
+                terrain_radius, directory):
+    """One actor per body, index-aligned with `bodies`, plus the static scenery."""
     import pyvista as pv
 
-    actors = []
-    for obj in bodies:
-        shapes = obj.get("shapes", [])
-        pieces = [shape_geometry(s, cache, boxes_only) for s in shapes]
+    def merged(obj):
+        pieces = [shape_geometry(s, cache, boxes_only) for s in obj.get("shapes", [])]
         pieces = [p for p in pieces if p is not None and p.n_points]
         if not pieces:
             lo, hi = body_bounds(obj)
             pieces = [pv.Box(bounds=(lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]))]
-        mesh = pieces[0] if len(pieces) == 1 else pieces[0].merge(pieces[1:])
+        return pieces[0] if len(pieces) == 1 else pieces[0].merge(pieces[1:])
+
+    actors = []
+    for obj in bodies:
         # The manifest carries each shape's colour, so the playblast looks like the run
         # rather than like a debug view. Group colour only when a body has none.
-        colour = next((tuple(s["color"]) for s in shapes if s.get("color")), None)
-        actor = pl.add_mesh(mesh, color=colour or group_color(obj), smooth_shading=True,
+        colour = next((tuple(s["color"]) for s in obj.get("shapes", []) if s.get("color")), None)
+        actor = pl.add_mesh(merged(obj), color=colour or group_color(obj), smooth_shading=True,
                             specular=0.25, name=f"b{len(actors)}")
         actor.SetVisibility(False)  # until a pose is applied; rocks appear mid-run
         actors.append(actor)
 
-    if terrain_decimate:
-        terr = terrain_mesh(meta, terrain_decimate, terrain_radius)
-        if terr is not None:
-            pl.add_mesh(terr, color="#8a8578", smooth_shading=True, specular=0.05,
-                        name="terrain")
+    if not scenery:
+        return actors
 
-    if show_rings:
-        site = (meta or {}).get("site") or {}
-        ring_z = float(site.get("ring_z", 3.2))
-        for key, colour in (("work_circle", "#eab308"), ("builder_orbit", "#22d3ee"),
-                            ("collector_ring", "#22c55e")):
-            r = site.get(key)
-            if not r:
+    # The rings are not circles: each is 180 little boxes laid ON the terrain, following
+    # its height, and the pad and the decorative wall rocks are recorded the same way.
+    # Drawing them from the record is the only way they land where the run had them --
+    # a synthetic flat circle at a guessed height is wrong by metres on a hillside.
+    props = static_props(directory)
+    for prop in props:
+        shapes = prop.get("shapes", [])
+        is_patch = len(shapes) == 1 and shapes[0].get("type") == "trimesh" and not shapes[0].get("file")
+        if is_patch:
+            if not terrain_decimate:
                 continue
-            ring = pv.Circle(radius=float(r), resolution=180).extract_all_edges()
-            pl.add_mesh(ring.translate((0, 0, ring_z), inplace=False), color=colour,
-                        line_width=2, name=f"ring_{key}")
+            terr, colour = terrain_mesh(meta, prop, terrain_decimate, terrain_radius)
+            if terr is not None:
+                pl.add_mesh(terr, color=colour, smooth_shading=True, specular=0.05,
+                            name="terrain")
+            continue
+        colour = next((tuple(s["color"]) for s in shapes if s.get("color")), "#94a3b8")
+        mesh = merged(prop)
+        m = np.eye(4)
+        m[:3, :3] = quat_matrix(prop.get("first_rot", [1, 0, 0, 0]))
+        m[:3, 3] = prop.get("first_pos", [0, 0, 0])
+        if not np.allclose(m, np.eye(4)):
+            mesh = mesh.transform(m, inplace=False)
+        pl.add_mesh(mesh, color=colour, smooth_shading=True, name=f"prop_{prop['part']}")
     return actors
 
 
@@ -347,13 +442,17 @@ def main():
     ap.add_argument("--no-terrain", action="store_true")
     ap.add_argument("--terrain-decimate", type=int, default=4,
                     help="heightmap subsampling, higher is coarser (default 4)")
-    ap.add_argument("--no-rings", action="store_true")
+    ap.add_argument("--no-scenery", action="store_true",
+                    help="skip the terrain, rings, pad and decorative wall rocks")
     ap.add_argument("--terrain-margin", type=float, default=25.0,
                     help="metres of terrain kept outside the collector ring (default 25)")
     ap.add_argument("--movie", help="render off-screen to this .mp4 and exit")
     ap.add_argument("--shot", help="write a single PNG and exit")
     ap.add_argument("--at", type=float, help="sim time for --shot (default: midpoint)")
     ap.add_argument("--window", default="1600x1000")
+    ap.add_argument("--focus", help="frame the first body whose group/part contains this")
+    ap.add_argument("--focus-dist", type=float, default=12.0,
+                    help="camera distance for --focus, metres (default 12)")
     args = ap.parse_args()
 
     import pyvista as pv
@@ -380,8 +479,9 @@ def main():
     site_r = float(((meta or {}).get("site") or {}).get("collector_ring", 37.0))
     actors = build_scene(pl, bodies, cache, args.boxes, meta,
                          0 if args.no_terrain else args.terrain_decimate,
-                         not args.no_rings,
-                         site_r + max(0.0, args.terrain_margin))
+                         not args.no_scenery,
+                         site_r + max(0.0, args.terrain_margin),
+                         args.directory)
     if cache.misses:
         print(f"  ! {len(cache.misses)} mesh file(s) missing, drawn as boxes", file=sys.stderr)
     print(f"meshes      {cache.loaded()} distinct loaded")
@@ -402,7 +502,17 @@ def main():
 
     set_cam(iso)
 
-    state = {"slot": 0, "playing": not off, "speed": args.speed, "follow": -1}
+    focus = -1
+    if args.focus:
+        want = args.focus.lower()
+        focus = next((i for i, b in enumerate(bodies)
+                      if want in f"{b['group']}/{b['part']}".lower()), -1)
+        if focus < 0:
+            print(f"  ! no body matching {args.focus!r}, keeping the site view", file=sys.stderr)
+        else:
+            print(f"focus       {bodies[focus]['group']}/{bodies[focus]['part']}")
+
+    state = {"slot": 0, "playing": not off, "speed": args.speed, "follow": focus}
     hud_actor = pl.add_text("", position="upper_left", font_size=10, color="#e2e8f0",
                             name="hud")
 
@@ -419,7 +529,8 @@ def main():
         if state["follow"] >= 0:
             p = poses[state["slot"], state["follow"]]
             if np.isfinite(p[0]):
-                set_cam([(float(p[0]) - 12, float(p[1]) - 12, float(p[2]) + 8),
+                d = max(1.0, args.focus_dist)
+                set_cam([(float(p[0]) - d * 0.8, float(p[1]) - d * 0.8, float(p[2]) + d * 0.55),
                          (float(p[0]), float(p[1]), float(p[2])), (0, 0, 1)])
         hud()
 
