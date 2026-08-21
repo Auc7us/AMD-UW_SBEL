@@ -104,7 +104,7 @@ Terminal 3, start the C++ sim:
 ```bash
 source /opt/ros/humble/setup.bash
 cd ~/mountdir/amd-uw
-mpirun -np 6 ./build/demo_SYN_polaris_flat --vsg 1
+mpirun -np 6 ./build/demo_SYN_construction --vsg 1
 ```
 
 `--vsg` takes the MPI ranks that should open a window, one window each, so
@@ -317,7 +317,7 @@ at `--record_rate` Hz (default 60), for re-rendering the run in Blender with bet
 meshes than the sim carries.
 
 ```bash
-mpirun -np 16 ./build/demo_SYN_polaris_flat --record_dir /data/run1 --record_rate 60
+mpirun -np 16 ./build/demo_SYN_construction --record_dir /data/run1 --record_rate 60
 python3 tools/read_trajectory.py /data/run1 --check          # validate
 python3 tools/read_trajectory.py /data/run1 --rank 1 --list  # what was recorded
 python3 tools/read_trajectory.py /data/run1 --rank 1 --npz rank1.npz
@@ -337,6 +337,39 @@ rock       size= 49.723 x  18.025 x  1.863 m     <- the group, i.e. the whole ro
 
 Wheels folded into the hull (the centre-of-mass mistake) collapses the collector's
 extent; ignoring the shape frames stacks the M113's road wheels on its centreline.
+
+#### Previewing a recording without Blender
+
+`tools/preview_run.py` turns a recording into ONE self-contained HTML page: a plan view
+of the whole site with every body drawn as its own bounding box, a scrubbable timeline,
+an elevation panel, and a nearest-rock-to-builder trace. Standard library only -- there
+is no matplotlib in the container and no display either, so a page you open in a browser
+beats a plotting window.
+
+```bash
+python3 tools/preview_run.py ~/mountdir/recordings/run16          # -> run16/preview.html
+python3 tools/preview_run.py <dir> -o /tmp/run.html --fps 3       # 3 frames per sim second
+python3 tools/preview_run.py <dir> --rank 1,2,3 --to 200          # one sector, first 200 s
+python3 tools/preview_run.py <dir> --all-parts                    # keep track shoes too
+```
+
+Boxes rather than meshes, on purpose: the manifest already carries each visual shape's
+bounds, so a box needs no mesh files present and no import step, and it catches the
+failures worth catching -- a machine off its own sector ray, a rock sunk into the terrain
+or floating over it, a load dropped outside the arm's envelope, an arm folded through its
+own hull. Use `blender_import.py` when it has to look good; use this when you want to know
+whether it is right.
+
+Frames are NOT fixed size -- a rank's body count grows as rocks are created -- so the
+file is indexed by walking frame headers and seeking past payloads, and only the frames
+actually kept are read in full. That is what makes the 8.3 GB, 15-rank, 24-minute run16
+preview in about 4 seconds. Ranks are aligned by simulation TIME rather than frame
+number, so a rank that starts a step late does not show its machines a frame out of step
+with everyone else's.
+
+Defaults drop the parts that are numerically dominant and structurally uninteresting from
+above -- track shoes, road wheels, suspension arms, spindles. 63 shoes per builder is
+most of the recording and none of it says whether the site is working.
 
 Per rank: `rank_N_meta.json` (run parameters), `rank_N_objects.jsonl` (one line per
 recorded body), `rank_N_frames.bin` (the poses). `static_props.jsonl` is the scenery --
@@ -389,7 +422,7 @@ loop section, Chrono's per-step timers, and the builder's drive command / speed 
 orbit radius / track-shoe spread.
 
 ```bash
-mpirun -np 3 ./build/demo_SYN_polaris_flat --no_sensor -e 10 --perf_log 0.5
+mpirun -np 3 ./build/demo_SYN_construction --no_sensor -e 10 --perf_log 0.5
 ```
 
 `--builder_no_arm` drops the manipulator, to separate arm cost from vehicle cost.

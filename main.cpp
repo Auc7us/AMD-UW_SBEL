@@ -1,4 +1,7 @@
-// Minimal MPI SynChrono demo for the AMD-UW Polaris JSON vehicle.
+// MPI SynChrono lunar construction demo: one rank per site sector, each running a
+// Polaris-based collector that harvests rocks and a tracked builder that lays them
+// into a wall. Deliberately named for the task and not for the vehicle or the
+// terrain model, both of which have changed under it more than once.
 // Rank 0 is the global sensor/visualization rank. Robot physics starts on rank 1.
 
 #include <mpi.h>
@@ -1373,7 +1376,7 @@ int main(int argc, char* argv[]) {
     if (owns_robot && cli.HasValueInVector<int>("vsg", rank)) {
         SetChronoDataPath(amd_uw_data_path);
         auto vsg_app = chrono_types::make_shared<ChWheeledVehicleVisualSystemVSG>();
-        vsg_app->SetWindowTitle("AMD-UW SynChrono Polaris Apollo Terrain Demo");
+        vsg_app->SetWindowTitle("AMD-UW SynChrono Lunar Construction Demo");
         vsg_app->SetWindowSize(1280, 800);
         vsg_app->SetWindowPosition(100, 100);
         vsg_app->SetChaseCamera(track_point, 8.0, 0.75);

@@ -30,7 +30,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 option(AMD_UW_ENABLE_ROS2 "Enable ROS2 command/state bridge" ON)
 option(AMD_UW_USE_SOLIDWORKS_IMPORTER "Build the LRV arm from the Chrono SolidWorks Python importer" OFF)
 
-add_executable(demo_SYN_polaris_flat
+add_executable(demo_SYN_construction
     main.cpp
     src/BuilderRig.cpp
     src/LrvArm.cpp
@@ -49,17 +49,17 @@ if(AMD_UW_ENABLE_ROS2)
         message(FATAL_ERROR "AMD_UW_ENABLE_ROS2=ON requires ROS2 rclcpp and std_msgs. Source ROS2 or configure with -DAMD_UW_ENABLE_ROS2=OFF.")
     endif()
 
-    target_sources(demo_SYN_polaris_flat PRIVATE
+    target_sources(demo_SYN_construction PRIVATE
         src/BuilderArmRosBridge.cpp
         src/BuilderVehicleRosBridge.cpp
         src/RosArmBridge.cpp
         src/RosTrailerBridge.cpp
         src/RosControllerDriver.cpp)
-    target_compile_definitions(demo_SYN_polaris_flat PRIVATE AMD_UW_ENABLE_ROS2)
+    target_compile_definitions(demo_SYN_construction PRIVATE AMD_UW_ENABLE_ROS2)
     message(STATUS "ROS2 bridge enabled")
 endif()
 
-target_compile_definitions(demo_SYN_polaris_flat
+target_compile_definitions(demo_SYN_construction
     PRIVATE
         CHRONO_USE_CUDA
         CH_API_COMPILE_SENSOR
@@ -77,7 +77,7 @@ target_compile_definitions(demo_SYN_polaris_flat
         "UW_AMD_VEHICLE_DATA_DIR=\"${UW_AMD_VEHICLE_DATA_DIR}\"")
 
 if(AMD_UW_USE_SOLIDWORKS_IMPORTER)
-    target_compile_definitions(demo_SYN_polaris_flat
+    target_compile_definitions(demo_SYN_construction
         PRIVATE
             AMD_UW_USE_SOLIDWORKS_IMPORTER
             # So the embedded interpreter can `import pychrono` without the caller
@@ -86,7 +86,7 @@ if(AMD_UW_USE_SOLIDWORKS_IMPORTER)
     message(STATUS "LRV arm SolidWorks importer enabled")
 endif()
 
-target_include_directories(demo_SYN_polaris_flat
+target_include_directories(demo_SYN_construction
     PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/src"
         "${CHRONO_ROOT}/src"
@@ -97,7 +97,7 @@ target_include_directories(demo_SYN_polaris_flat
         "${CHRONO_ROOT}/src/chrono_thirdparty/flatbuffers/include"
         "${OPTIX_INCLUDE_DIR}")
 
-target_include_directories(demo_SYN_polaris_flat
+target_include_directories(demo_SYN_construction
     SYSTEM PRIVATE
         /usr/include/eigen3
         /usr/local/cuda/include
@@ -107,7 +107,7 @@ target_include_directories(demo_SYN_polaris_flat
         /usr/lib/x86_64-linux-gnu/openmpi/include
         /usr/lib/x86_64-linux-gnu/openmpi/include/openmpi)
 
-target_compile_options(demo_SYN_polaris_flat
+target_compile_options(demo_SYN_construction
     PRIVATE
         -march=native
         -Wint-in-bool-context
@@ -120,13 +120,13 @@ target_compile_options(demo_SYN_polaris_flat
         -Wno-stringop-overflow
         -fopenmp)
 
-target_link_options(demo_SYN_polaris_flat
+target_link_options(demo_SYN_construction
     PRIVATE
         "-Wl,--disable-new-dtags"
         "-Wl,-rpath,${CHRONO_BUILD_DIR}/lib:${CHRONO_PACKAGE_DIR}/vsg/lib:/usr/lib/x86_64-linux-gnu/openmpi/lib::::"
         "-Wl,-rpath-link,${CHRONO_PACKAGE_DIR}/vsg/lib")
 
-target_link_libraries(demo_SYN_polaris_flat
+target_link_libraries(demo_SYN_construction
         # SolidWorks importer only: libChrono_parsers.so statically embeds and
         # globally re-exports its own tinyxml2. FastDDS (the ROS2 rmw) links the
         # system libtinyxml2.so.9 and parses XML profiles at DDS-participant/node
@@ -177,13 +177,13 @@ target_link_libraries(demo_SYN_polaris_flat
         /usr/lib/x86_64-linux-gnu/openmpi/lib/libmpi.so)
 
 if(AMD_UW_USE_SOLIDWORKS_IMPORTER)
-    target_link_libraries(demo_SYN_polaris_flat "${CHRONO_BUILD_DIR}/lib/libChrono_parsers.so")
+    target_link_libraries(demo_SYN_construction "${CHRONO_BUILD_DIR}/lib/libChrono_parsers.so")
 endif()
 
 if(AMD_UW_ENABLE_ROS2)
     if(ament_cmake_FOUND)
-        ament_target_dependencies(demo_SYN_polaris_flat rclcpp std_msgs)
+        ament_target_dependencies(demo_SYN_construction rclcpp std_msgs)
     else()
-        target_link_libraries(demo_SYN_polaris_flat rclcpp::rclcpp ${std_msgs_TARGETS})
+        target_link_libraries(demo_SYN_construction rclcpp::rclcpp ${std_msgs_TARGETS})
     endif()
 endif()
