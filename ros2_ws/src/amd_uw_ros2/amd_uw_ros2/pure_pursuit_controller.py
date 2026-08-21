@@ -1,4 +1,5 @@
 import math
+import time
 from dataclasses import dataclass
 from typing import List, Optional, Set, Tuple
 
@@ -136,20 +137,106 @@ class PurePursuitController(Node):
         # arrives radially -- nose-in at the circumference, with the trailer pointing out
         # into open field and the load tipping wherever the rover happened to stop.
         #
-        # Instead it is given two waypoints. The first is on the collector circle,
-        # approach_arc_m of arc CLOCKWISE of the drop point (clockwise = behind it, since
-        # the lane walks counter-clockwise). The second is the drop point itself, reached
-        # by following the circle. By the time the rover has run that arc its heading is
-        # tangential, so the rear-discharging trailer pours a line of rock along the
-        # circumference rather than a heap across it.
+        # Instead it runs in on an arc that lies OUTSIDE the collector circle and touches
+        # it only at the drop point, arriving clockwise while the builder walks
+        # counter-clockwise. See approach_arc_radius_m below for the construction and for
+        # why the previous ring-following version drove into builders.
         #
-        # approach_arc_m has to be long enough for the heading to settle -- the rover
-        # turns at ~5 m radius -- and short enough that it is not a detour. Reaching the
-        # entry waypoint is not required to be precise: approach_capture_m accepts it
-        # generously, and everything after that is circle-following.
-        self.declare_parameter("approach_arc_m", 12.0)
+        # Reaching the entry waypoint is not required to be precise: approach_capture_m
+        # accepts it generously, and everything after that is arc-following.
         self.declare_parameter("approach_capture_m", 5.0)
         self.declare_parameter("approach_lookahead_m", 6.0)
+        # Radius of the run-in arc, and the whole reason this file was rewritten.
+        #
+        # The old run-in put its entry waypoint ON the collector circle, arc_m CLOCKWISE
+        # of the drop point, and then followed the circle in. Clockwise is where the
+        # BUILDER is -- it walks counter-clockwise towards the drop point -- so the last
+        # 12 m of every return leg was driven along the builder's own lane with 4 m of
+        # radius between them (37 vs 33, hull half-width 1.343). Collectors hit builders.
+        #
+        # Instead the run-in is an arc that lies OUTSIDE the collector circle and touches
+        # it only at the drop point. Put its centre on the drop point's own ray at radius
+        # (ring + rho): then the closest that circle ever comes to the site centre is
+        # exactly `ring`, at the drop point, and every other point on it is further out.
+        # So the rover can never be swept inboard onto the builder, and its heading at the
+        # touch point is tangential to the ring by construction.
+        #
+        # rho is the only knob. It must exceed the rover's ~5 m turn radius with margin,
+        # because this curve is driven under load on lunar traction; 12 m is 2.4x that,
+        # and at home_approach_speed_mps=1.0 a quarter arc is ~19 s of sim. Larger is
+        # smoother and slower; below ~8 m the curve starts fighting the trailer.
+        self.declare_parameter("approach_arc_radius_m", 12.0)
+        # How far back along the arc the rover aims before it has captured the arc. A
+        # quarter turn puts the entry point well outside the ring (at rho=12, ring=37 that
+        # is r=50.4) and on the COUNTER-CLOCKWISE side of the drop point -- the side the
+        # builder is never on.
+        self.declare_parameter("approach_entry_sweep_rad", math.pi / 2.0)
+        # Radial tolerance for deciding the rover is on the arc.
+        self.declare_parameter("approach_arc_capture_m", 4.0)
+        # Builder feedback. The drop point is placed this many wall slots AHEAD of the
+        # slot the builder is currently consuming, so the load lands where it will next
+        # need rocks rather than where the harvest cycle counter happened to point.
+        #
+        # 1 slot, not more, and the arm is why: arm base sits at r=33.09, the pile at
+        # r=37, and one slot is 0.03 rad, so the base-to-pile distance runs 3.91 m at 0
+        # slots, 4.04 at 1, 4.43 at 2, and 5.01 at 3 -- against feedstock_reach_max=5.0 in
+        # BuilderArmRosBridge. Three slots ahead is already refused. Reach, not collision,
+        # is what bounds this now that the run-in no longer crosses the builder's lane.
+        self.declare_parameter("drop_slots_ahead", 1.0)
+        # Must match wall_slot_pitch_rad in src/RobotLayout.h (0.9 m of course at r=30).
+        self.declare_parameter("slot_pitch_rad", 0.03)
+        # Which builder feeds this collector. Each rank owns one of each, so 0 means "the
+        # one with my own id" -- resolved after robot_id is read, below.
+        self.declare_parameter("builder_id", 0)
+        # Drop back to the sim's own drop point if the builder has said nothing for this
+        # long (wall seconds). Losing the topic must not strand a loaded rover.
+        self.declare_parameter("builder_status_timeout_s", 5.0)
+        # WHICH POINT ON THE RIG has to be in the drop band. The load leaves from the bed,
+        # not from the tractor, so accepting arrival at the tractor's own reference parks
+        # the trailer short of the drop point -- and on a clockwise run-in "short" is the
+        # counter-clockwise side, i.e. AWAY from the builder, so the rocks tumble away from
+        # the machine that has to pick them up. The sim publishes the trailer's rear axle
+        # on /robot_N/trailer_state; this offset is only the fallback for when it has not
+        # arrived yet, measured back along the tractor heading.
+        self.declare_parameter("drop_reference_offset_m", 3.5)
+        self.declare_parameter("trailer_state_timeout_s", 5.0)
+        # ACCEPT ON REACH, not on radial/arc proxies.
+        #
+        # The builder only cares about one number: how far the pile ends up from its arm
+        # base. BuilderArmRosBridge refuses anything outside [2.0, 5.0] m of it. Radial and
+        # arc error do not cost the same against that budget -- a metre of outward radial
+        # error is a metre of reach, a metre of arc is about 0.4 m -- so no single radial
+        # tolerance is both safe and permissive. Measured: parking on the old tractor-based
+        # test put the axle 1.9 m radially and 2.5 m of arc off the drop point, i.e. ~5.8 m
+        # from the arm base, and all four builders sat starved with "none within 2.0-5.0 m".
+        #
+        # So the drop is accepted when the trailer axle is inside a MARGIN window on the
+        # real distance to /builder_N/arm_base_pose. The window is inset from the hard
+        # limits because the load still has to leave a 55 deg bed and roll to rest before
+        # it freezes (dumped_rock_settle_* in RobotRig.cpp): the pile lands near the axle,
+        # not exactly on it.
+        # WHICH point on the rig is judged. "gate" is the rear gate edge centre -- the lip
+        # the load pours over, and the point the bed is hinged on so it stays fixed in
+        # space while the tub rises. "axle" is the rear axle, roughly a metre forward of
+        # it, which drops the load about a metre short: some rocks land inside the
+        # builder's pickup radius and some outside. "offset" forces the heading-projected
+        # fallback. Judging at the gate is what makes the rig carry on those last few
+        # metres before it tips.
+        self.declare_parameter("drop_reference_point", "gate")
+        # REPORTING ONLY, both of these and the reach window below. How tangential the
+        # trailer was and how far the pile ended up from the arm base are worth knowing --
+        # they are the numbers that say whether the run-in geometry is right -- but neither
+        # may gate the drop: see drive_home for the orbit that gating caused. Measured from
+        # the trailer's own axis (gate -> axle), not the tractor's. 0 omits the angle.
+        self.declare_parameter("drop_heading_tolerance_deg", 20.0)
+        self.declare_parameter("drop_reach_min_m", 2.6)
+        self.declare_parameter("drop_reach_max_m", 4.5)
+        # Radial nudge on the drop point, inboard negative. The ring radius comes from the
+        # sim, and nominal reach at 37 m is 3.94 m against a 5.0 m ceiling -- only ~1 m of
+        # headroom for outward error, against ~1.9 m of floor before the 2.0 m minimum. Set
+        # this to about -1.0 to buy back a metre of the tighter side if acceptance tuning is
+        # not enough on its own.
+        self.declare_parameter("drop_radius_offset_m", 0.0)
         self.declare_parameter("home_approach_speed_mps", 1.0)
         # Matches pickup_slowdown_offset_m, and for the same reason: on this soil the
         # rover sheds speed slowly, so a short taper means arriving hot and braking
@@ -182,6 +269,24 @@ class PurePursuitController(Node):
         self.declare_parameter("post_done_straighten_time_s", 0.75)
 
         self.robot_id = int(self.get_parameter("robot_id").value)
+        builder_id = int(self.get_parameter("builder_id").value)
+        self.builder_id = builder_id if builder_id > 0 else self.robot_id
+        self.builder_status_topic = f"/builder_{self.builder_id}/arm_status"
+        # Latest [slot, usable_rocks, slot_angle_rad] from the builder, and the wall clock
+        # it arrived on. None until the first message: until then the drop point is the
+        # sim's own, which is the pre-existing behaviour.
+        self.builder_slot: Optional[int] = None
+        self.builder_rocks_left: Optional[int] = None
+        self.builder_slot_angle: Optional[float] = None
+        self.builder_status_stamp: Optional[float] = None
+        self._logged_builder_drop = False
+        self.trailer_state_topic = f"/robot_{self.robot_id}/trailer_state"
+        self.trailer_axle: Optional[Tuple[float, float]] = None
+        self.trailer_axle_stamp: Optional[float] = None
+        self.trailer_gate: Optional[Tuple[float, float]] = None
+        self.builder_base_topic = f"/builder_{self.builder_id}/arm_base_pose"
+        self.builder_arm_base: Optional[Tuple[float, float]] = None
+        self.builder_arm_base_stamp: Optional[float] = None
         self.ego_state_topic = f"/robot_{self.robot_id}/egoState"
         self.target_pos_topic = f"/robot_{self.robot_id}/targetPos"
         self.target_done_topic = f"/robot_{self.robot_id}/target_done"
@@ -237,6 +342,15 @@ class PurePursuitController(Node):
         self.at_home_pub = self.create_publisher(Bool, self.at_home_topic, 10)
         self.create_subscription(Float64MultiArray, self.home_pos_topic, self.on_home_pos, 10)
         self.create_subscription(Bool, self.mission_done_topic, self.on_mission_done, 10)
+        self.create_subscription(
+            Float64MultiArray, self.builder_status_topic, self.on_builder_status, 10
+        )
+        self.create_subscription(
+            Float64MultiArray, self.trailer_state_topic, self.on_trailer_state, 10
+        )
+        self.create_subscription(
+            Float64MultiArray, self.builder_base_topic, self.on_builder_arm_base, 10
+        )
 
         rate_hz = max(1e-6, float(self.get_parameter("control_rate_hz").value))
         self.dt = 1.0 / rate_hz
@@ -378,6 +492,146 @@ class PurePursuitController(Node):
             "mission_done=true; every target is collected or skipped, returning to spawn."
         )
 
+    def on_builder_status(self, msg: Float64MultiArray) -> None:
+        """Track where the builder is consuming and how much it has left.
+
+        Indices 6-8 are appended fields (see BuilderArmRosBridge.h); a shorter message is
+        an older sim, and is ignored rather than misread.
+        """
+        if len(msg.data) < 9:
+            return
+        self.builder_slot = int(msg.data[6])
+        self.builder_rocks_left = int(msg.data[7])
+        self.builder_slot_angle = float(msg.data[8])
+        self.builder_status_stamp = time.monotonic()
+
+    def on_trailer_state(self, msg: Float64MultiArray) -> None:
+        """Track the trailer's rear axle -- the point the load actually leaves from.
+
+        Indices 3-5 are [valid, x, y], appended (see RosTrailerBridge.h). The valid flag
+        exists so (0, 0) is never mistaken for the site origin.
+        """
+        if len(msg.data) < 6 or msg.data[3] < 0.5:
+            return
+        self.trailer_axle = (float(msg.data[4]), float(msg.data[5]))
+        self.trailer_axle_stamp = time.monotonic()
+        # Indices 6-8 are [valid, x, y] for the rear gate edge centre, appended after the
+        # axle. Absent on an older sim, in which case the axle is still used.
+        if len(msg.data) >= 9 and msg.data[6] >= 0.5:
+            self.trailer_gate = (float(msg.data[7]), float(msg.data[8]))
+
+    def on_builder_arm_base(self, msg: Float64MultiArray) -> None:
+        """Track the builder's IK frame origin -- the point its reach test measures from."""
+        if len(msg.data) < 2:
+            return
+        self.builder_arm_base = (float(msg.data[0]), float(msg.data[1]))
+        self.builder_arm_base_stamp = time.monotonic()
+
+    def reach_to_builder(self) -> Optional[float]:
+        """Distance from the trailer axle to the builder's arm base, or None.
+
+        This is the quantity BuilderArmRosBridge tests against [2.0, 5.0] m before it will
+        offer a rock to the arm, so it is the only honest measure of whether a drop here
+        can be picked up.
+        """
+        timeout = abs(float(self.get_parameter("builder_status_timeout_s").value))
+        if self.builder_arm_base is None or self.builder_arm_base_stamp is None:
+            return None
+        if timeout > 0.0 and (time.monotonic() - self.builder_arm_base_stamp) > timeout:
+            return None
+        ref_x, ref_y = self.drop_reference()
+        return math.hypot(ref_x - self.builder_arm_base[0], ref_y - self.builder_arm_base[1])
+
+    def trailer_points(self) -> Optional[Tuple[Tuple[float, float], Tuple[float, float]]]:
+        """(axle, gate) if both are fresh, else None. Their difference is the trailer axis."""
+        timeout = abs(float(self.get_parameter("trailer_state_timeout_s").value))
+        if self.trailer_axle is None or self.trailer_gate is None or self.trailer_axle_stamp is None:
+            return None
+        if timeout > 0.0 and (time.monotonic() - self.trailer_axle_stamp) > timeout:
+            return None
+        return (self.trailer_axle, self.trailer_gate)
+
+    def trailer_heading(self) -> Optional[float]:
+        """Heading of the trailer itself, from the gate forward to the axle.
+
+        The tractor's yaw is not a substitute: the rig is articulated, and through the
+        run-in curve the trailer lags the tractor by a few degrees -- which is precisely
+        the error that turns a line of rock along the ring into a heap across it.
+        """
+        pts = self.trailer_points()
+        if pts is None:
+            return None
+        (ax, ay), (gx, gy) = pts
+        dx, dy = ax - gx, ay - gy
+        if math.hypot(dx, dy) < 1e-6:
+            return None
+        return math.atan2(dy, dx)
+
+    def drop_reference(self) -> Tuple[float, float]:
+        """The point on the rig that has to be inside the drop band.
+
+        Preference order, and why: the REAR GATE EDGE CENTRE, because that is the lip the
+        load pours over and the point the bed is hinged on so it stays fixed while the tub
+        rises; then the rear axle, about a metre forward of it; then the tractor pose
+        pushed back along its own heading, which is only right on a straight run and wrong
+        by the articulation angle on a curve.
+        """
+        want = str(self.get_parameter("drop_reference_point").value).strip().lower()
+        timeout = abs(float(self.get_parameter("trailer_state_timeout_s").value))
+        fresh = self.trailer_axle_stamp is not None and (
+            timeout <= 0.0 or (time.monotonic() - self.trailer_axle_stamp) <= timeout
+        )
+        if fresh and want != "offset":
+            if want == "gate" and self.trailer_gate is not None:
+                return self.trailer_gate
+            if self.trailer_axle is not None:
+                return self.trailer_axle
+        offset = max(0.0, float(self.get_parameter("drop_reference_offset_m").value))
+        return (
+            self.state.x - offset * math.cos(self.state.yaw),
+            self.state.y - offset * math.sin(self.state.yaw),
+        )
+
+    def drop_point(self) -> Optional[Tuple[float, float]]:
+        """Where to put the load: the builder's next slot, at the sim's ring radius.
+
+        The sim publishes a drop point on /robot_N/homePos derived from the harvest cycle
+        counter, which says nothing about how far the builder actually got. This keeps that
+        point's RADIUS -- the ring geometry and the arm's reach envelope were sized
+        together, so the radius is not ours to move -- and overrides only its ANGLE, to
+        drop_slots_ahead slots past the slot the builder is working now.
+
+        Falls back to the sim's point when the builder has not reported, or has gone quiet,
+        so a lost topic degrades to the old behaviour instead of stranding a loaded rover.
+        """
+        if self.home is None:
+            return None
+        if self.builder_slot_angle is None or self.builder_status_stamp is None:
+            return self.home
+        timeout = abs(float(self.get_parameter("builder_status_timeout_s").value))
+        if timeout > 0.0 and (time.monotonic() - self.builder_status_stamp) > timeout:
+            return self.home
+
+        cx = float(self.get_parameter("site_center_x").value)
+        cy = float(self.get_parameter("site_center_y").value)
+        radius = math.hypot(self.home[0] - cx, self.home[1] - cy)
+        if radius < 1e-6:
+            return self.home
+        pitch = float(self.get_parameter("slot_pitch_rad").value)
+        ahead = float(self.get_parameter("drop_slots_ahead").value)
+        angle = self.builder_slot_angle + ahead * pitch
+        # Inboard nudge trades outward-error headroom for inward: see drop_radius_offset_m.
+        radius = max(1.0, radius + float(self.get_parameter("drop_radius_offset_m").value))
+        target = (cx + radius * math.cos(angle), cy + radius * math.sin(angle))
+        if not self._logged_builder_drop:
+            self._logged_builder_drop = True
+            self.get_logger().info(
+                f"drop point follows builder {self.builder_id}: slot {self.builder_slot}, "
+                f"{self.builder_rocks_left} rock(s) unlaid, dropping {ahead:.0f} slot(s) "
+                f"ahead at ({target[0]:.2f}, {target[1]:.2f})."
+            )
+        return target
+
     def drop_band_errors(self) -> Optional[Tuple[float, float, float, float]]:
         """(radial_err, arc_err, band_half_width, arc_tolerance) for the drop band.
 
@@ -385,7 +639,8 @@ class PurePursuitController(Node):
         the rover there yet) and distance_to_drop_band (how much further), so the
         arrival test and the speed taper can never disagree about where the band is.
         """
-        if self.home is None or self.state is None:
+        drop = self.drop_point()
+        if drop is None or self.state is None:
             return None
         cx = float(self.get_parameter("site_center_x").value)
         cy = float(self.get_parameter("site_center_y").value)
@@ -394,77 +649,126 @@ class PurePursuitController(Node):
         if band <= 0.0 or arc_tol <= 0.0:
             return None
 
-        home_radius = math.hypot(self.home[0] - cx, self.home[1] - cy)
+        home_radius = math.hypot(drop[0] - cx, drop[1] - cy)
         if home_radius < 1e-6:
             return None
-        here_radius = math.hypot(self.state.x - cx, self.state.y - cy)
+        # The REAR AXLE against the band, not the tractor: see drop_reference().
+        ref_x, ref_y = self.drop_reference()
+        here_radius = math.hypot(ref_x - cx, ref_y - cy)
         radial_err = abs(here_radius - home_radius)
 
-        home_angle = math.atan2(self.home[1] - cy, self.home[0] - cx)
-        here_angle = math.atan2(self.state.y - cy, self.state.x - cx)
+        home_angle = math.atan2(drop[1] - cy, drop[0] - cx)
+        here_angle = math.atan2(ref_y - cy, ref_x - cx)
         arc_err = abs(wrap_to_pi(here_angle - home_angle)) * home_radius
         return (radial_err, arc_err, band, arc_tol)
 
     def home_approach_target(self) -> Tuple[float, float]:
-        """Where to steer on the return leg, so the rover arrives ALONG the circle.
+        """Where to steer on the return leg, so the rover arrives ALONG the ring.
+
+        The run-in is a circle of radius rho whose centre sits on the drop point's own ray
+        at radius (ring + rho). That circle touches the collector ring at exactly one
+        point -- the drop point -- and lies strictly outside it everywhere else, because
+        its closest approach to the site centre is (ring + rho) - rho = ring. Two things
+        follow for free:
+
+          * the rover is never carried inboard of the ring, so it cannot be swept into the
+            builder orbiting 4 m inside it;
+          * the arc is tangent to the ring at the drop point, so the heading there is
+            tangential and the rear-discharging trailer pours along the circumference.
+
+        Travel is CLOCKWISE about the site, which is counter-clockwise about the arc's own
+        centre. That is the direction that matters: the builder walks counter-clockwise
+        TOWARDS the drop point, so it is always on the clockwise side, and a clockwise
+        arrival descends from the other side entirely. It also points the trailer
+        counter-clockwise, laying the load ahead of the builder rather than behind it.
 
         Two stages, latched by _approach_committed so the switch cannot chatter:
 
-          not committed -- steer at the entry waypoint, approach_arc_m of arc clockwise
-                           of the drop point on the collector circle. Commit once within
-                           approach_capture_m of it, or once the rover is already on the
-                           circle somewhere in the arc between it and the drop point.
-          committed     -- steer at a point ON the circle, approach_lookahead_m of arc
-                           ahead of the rover's own bearing, never past the drop point.
-                           That is pure pursuit with the path as the target instead of
-                           the goal, which is what makes the final heading tangential
-                           rather than radial.
+          not committed -- steer at an entry point entry_sweep radians back along the arc.
+                           Commit once within approach_capture_m of it, or once the rover
+                           is already on the arc.
+          committed     -- steer at a point ON the arc, approach_lookahead_m of arc ahead
+                           of the rover's own position around it, never past the drop
+                           point. Unlike the old ring-following version the target keeps
+                           sliding all the way in, so the final metres are still
+                           path-following rather than a straight run at a fixed point.
 
-        Falls back to the drop point itself if the geometry cannot be evaluated -- which
-        is the old behaviour, so a missing parameter degrades rather than strands.
+        Falls back to the drop point itself if the geometry cannot be evaluated, so a
+        missing parameter degrades rather than strands.
         """
-        if self.home is None or self.state is None:
-            return self.home if self.home is not None else (self.state.x, self.state.y)
+        drop = self.drop_point()
+        if drop is None or self.state is None:
+            if drop is not None:
+                return drop
+            return (self.state.x, self.state.y) if self.state is not None else (0.0, 0.0)
 
         cx = float(self.get_parameter("site_center_x").value)
         cy = float(self.get_parameter("site_center_y").value)
-        radius = math.hypot(self.home[0] - cx, self.home[1] - cy)
-        arc = abs(float(self.get_parameter("approach_arc_m").value))
-        if radius < 1e-6 or arc <= 0.0:
-            return self.home
+        ring = math.hypot(drop[0] - cx, drop[1] - cy)
+        rho = abs(float(self.get_parameter("approach_arc_radius_m").value))
+        if ring < 1e-6 or rho < 1e-6:
+            return drop
 
-        def on_circle(angle: float) -> Tuple[float, float]:
-            return (cx + radius * math.cos(angle), cy + radius * math.sin(angle))
+        drop_angle = math.atan2(drop[1] - cy, drop[0] - cx)
+        # Arc centre: outward along the drop point's ray, one rho past the ring.
+        ax = cx + (ring + rho) * math.cos(drop_angle)
+        ay = cy + (ring + rho) * math.sin(drop_angle)
 
-        home_angle = math.atan2(self.home[1] - cy, self.home[0] - cx)
-        here_angle = math.atan2(self.state.y - cy, self.state.x - cx)
-        here_radius = math.hypot(self.state.x - cx, self.state.y - cy)
-        # Signed arc from here to the drop point, positive counter-clockwise -- the
-        # direction the lane walks, and so the direction the run-in travels.
-        arc_to_home = wrap_to_pi(home_angle - here_angle) * radius
+        def on_arc(phi: float) -> Tuple[float, float]:
+            return (ax + rho * math.cos(phi), ay + rho * math.sin(phi))
+
+        # Angles measured about the ARC centre. The drop point lies on the far side of the
+        # arc from the site centre, i.e. at drop_angle + pi as seen from the arc centre.
+        phi_drop = wrap_to_pi(drop_angle + math.pi)
+        phi_here = math.atan2(self.state.y - ay, self.state.x - ax)
+        # Travel about the arc centre is counter-clockwise (= clockwise about the site), so
+        # remaining sweep is measured in the positive direction and is always in [0, 2pi).
+        sweep_to_drop = (phi_drop - phi_here) % (2.0 * math.pi)
+        arc_radius_err = abs(math.hypot(self.state.x - ax, self.state.y - ay) - rho)
 
         if not self._approach_committed:
-            entry = on_circle(home_angle - arc / radius)
+            entry_sweep = abs(float(self.get_parameter("approach_entry_sweep_rad").value))
+            entry = on_arc(phi_drop - entry_sweep)
             capture = abs(float(self.get_parameter("approach_capture_m").value))
-            band = abs(float(self.get_parameter("drop_band_half_width_m").value))
+            arc_capture = abs(float(self.get_parameter("approach_arc_capture_m").value))
             near_entry = math.hypot(entry[0] - self.state.x, entry[1] - self.state.y) <= capture
-            # Already on the circle, in the run-in arc: nothing is gained by driving back
-            # to a waypoint the rover has effectively reached.
-            in_run_in = 0.0 <= arc_to_home <= arc and abs(here_radius - radius) <= 2.0 * band
-            if near_entry or in_run_in:
+            # Already on the arc, somewhere in the run-in sweep: driving back to a waypoint
+            # the rover has effectively reached would only cost it the heading it has.
+            on_run_in = arc_radius_err <= arc_capture and sweep_to_drop <= entry_sweep
+            if near_entry or on_run_in:
                 self._approach_committed = True
                 self.get_logger().info(
-                    f"On the collector circle {arc_to_home:.1f} m of arc short of the drop "
-                    f"point; running in tangentially."
+                    f"Captured the run-in arc (rho={rho:.1f} m) {sweep_to_drop * rho:.1f} m "
+                    f"of arc short of the drop point; coming in tangentially, clockwise."
                 )
             else:
                 return entry
 
+        # Signed remaining sweep: positive while short of the drop point, negative once
+        # the TRACTOR is past it. The modulo form above cannot express "past" -- it turns a
+        # small overshoot into nearly 2*pi -- and both cases below need to tell the
+        # difference.
+        signed_sweep = wrap_to_pi(phi_drop - phi_here)
+
+        # How far the reference that actually has to arrive trails the tractor. Arrival is
+        # judged at the trailer's rear axle (see drop_reference), so the tractor has to
+        # carry on roughly a trailer-length PAST the drop point before the load is over it.
+        # Aiming at the drop point through that stretch would ask the rover to turn back on
+        # itself; the target is allowed to run on around the arc by exactly that much
+        # instead, so the last few metres stay path-following and the heading stays
+        # tangential while the bed tips.
+        ref_x, ref_y = self.drop_reference()
+        trail = math.hypot(ref_x - self.state.x, ref_y - self.state.y)
+
+        # Genuinely past it, by more than the trailing distance: the run-in is over and
+        # there is nothing left to follow. Steer at the drop point and let the stop line in
+        # in_drop_band accept the arrival.
+        if signed_sweep < -(trail / rho) - 1e-9:
+            return drop
+
         lookahead = abs(float(self.get_parameter("approach_lookahead_m").value))
-        # Never aim past the drop point: the run-in ends there, and a lookahead that
-        # overshoots it would carry the rover on round the circle past its own pile.
-        step = max(0.0, min(lookahead, arc_to_home))
-        return on_circle(here_angle + step / radius)
+        step = max(0.0, min(lookahead / rho, signed_sweep + trail / rho))
+        return on_arc(phi_here + step)
 
     def distance_to_drop_band(self) -> float:
         """Metres still to travel before the drop band is entered; 0 once inside.
@@ -488,9 +792,10 @@ class PurePursuitController(Node):
         errors = self.drop_band_errors()
         if errors is None:
             # Fall back to the straight-line distance rather than claiming arrival.
-            if self.home is None or self.state is None:
+            drop = self.drop_point()
+            if drop is None or self.state is None:
                 return 0.0
-            return math.hypot(self.home[0] - self.state.x, self.home[1] - self.state.y)
+            return math.hypot(drop[0] - self.state.x, drop[1] - self.state.y)
         radial_err, arc_err, band, arc_tol = errors
         return math.hypot(max(0.0, radial_err - band), max(0.0, arc_err - arc_tol))
 
@@ -523,21 +828,30 @@ class PurePursuitController(Node):
         # proximity test alone lets a rover that is carrying a little too much speed sail
         # through the tolerance in a single control period and then spend the rest of the
         # cycle turning back for a point behind it.
-        if self._approach_committed and self.home is not None and self.state is not None:
+        drop = self.drop_point()
+        if self._approach_committed and drop is not None and self.state is not None:
             cx = float(self.get_parameter("site_center_x").value)
             cy = float(self.get_parameter("site_center_y").value)
-            radius = math.hypot(self.home[0] - cx, self.home[1] - cy)
+            radius = math.hypot(drop[0] - cx, drop[1] - cy)
             if radius > 1e-6:
-                home_angle = math.atan2(self.home[1] - cy, self.home[0] - cx)
-                here_angle = math.atan2(self.state.y - cy, self.state.x - cx)
-                arc_to_home = wrap_to_pi(home_angle - here_angle) * radius
+                home_angle = math.atan2(drop[1] - cy, drop[0] - cx)
+                ref_x, ref_y = self.drop_reference()
+                here_angle = math.atan2(ref_y - cy, ref_x - cx)
+                # SIGN: the run-in now arrives CLOCKWISE, so the rover's site angle
+                # DECREASES towards the drop point and it approaches from the
+                # counter-clockwise side. Short of the drop point here_angle > home_angle,
+                # so this is negative; it turns positive on crossing. The old
+                # counter-clockwise run-in had exactly the opposite sign, and reusing that
+                # test here would report arrival the instant the rover committed, tens of
+                # metres out.
+                passed_by = wrap_to_pi(home_angle - here_angle) * radius
                 # Radial slack is looser here than the band, because having crossed the
                 # line the rover is where it was going to be and stopping it is better
                 # than sending it round again.
-                if arc_to_home <= 0.0 and radial_err <= 2.0 * band:
+                if passed_by >= 0.0 and radial_err <= 2.0 * band:
                     return (
                         True,
-                        f"passed the drop point by {-arc_to_home:.2f} m of arc, "
+                        f"passed the drop point by {passed_by:.2f} m of arc, "
                         f"radial {radial_err:.2f}/{band:.2f} m",
                     )
         return (False, f"radial {radial_err:.2f}/{band:.2f} m, arc {arc_err:.2f}/{arc_tol:.2f} m")
@@ -553,11 +867,58 @@ class PurePursuitController(Node):
             self.publish_command(self.command)
             return
 
-        distance = math.hypot(self.home[0] - self.state.x, self.home[1] - self.state.y)
+        drop = self.drop_point() or self.home
+        # The TRAILER AXLE against the drop point, not the tractor. This line used to
+        # measure self.state, and because acceptance is the loosest of the three tests
+        # below, that shortcut fired the moment the tractor reached the drop point --
+        # bypassing the axle-based band entirely and leaving the load ~3 m short, out of
+        # the builder's reach. That was the whole failure in the previous run.
+        ref_x, ref_y = self.drop_reference()
+        distance = math.hypot(drop[0] - ref_x, drop[1] - ref_y)
         tolerance = max(0.1, float(self.get_parameter("home_tolerance_m").value))
         in_band, band_why = self.in_drop_band()
 
-        if self.parked_at_home or distance <= tolerance or in_band:
+        # Acceptance is GEOMETRIC ONLY. Reach and heading are measured and reported, but
+        # they must never withhold acceptance. Holding for them was a livelock generator:
+        # a rover that is refused at the drop point falls through to the driving branch
+        # below, where home_approach_target has nothing left to follow and returns the
+        # drop point itself -- a point that is beside the rover and inside its turning
+        # radius, and that keeps sliding counter-clockwise as the builder advances a slot.
+        # Pure pursuit cannot converge on such a point; it orbits it. With a ~7 m turning
+        # radius about a point on the 37 m ring, that orbit cuts clean through the 33 m
+        # builder orbit and the 30 m work circle -- the rover drives a lap around the very
+        # builder it is delivering to. That is the failure in_drop_band's own docstring
+        # warns about, and it is worse than a drop that is a metre off.
+        #
+        # Drop LATER, do not drop CONDITIONALLY: the way to put the load in reach is
+        # drop_reference_point = "gate", which judges arrival at the lip the load pours
+        # over instead of at the tractor, so the rig carries on those last few metres
+        # before it tips. Geometry decides when; the numbers below only say how it went.
+        reach = self.reach_to_builder()
+        reach_why = "reach unknown"
+        accept = self.parked_at_home or distance <= tolerance or in_band
+        if accept and reach is not None:
+            lo = abs(float(self.get_parameter("drop_reach_min_m").value))
+            hi = abs(float(self.get_parameter("drop_reach_max_m").value))
+            reach_why = f"reach {reach:.2f} m in [{lo:.2f}, {hi:.2f}]"
+            tol_deg = abs(float(self.get_parameter("drop_heading_tolerance_deg").value))
+            trailer_yaw = self.trailer_heading()
+            if tol_deg > 0.0 and trailer_yaw is not None:
+                cx_site = float(self.get_parameter("site_center_x").value)
+                cy_site = float(self.get_parameter("site_center_y").value)
+                drop_bearing = math.atan2(drop[1] - cy_site, drop[0] - cx_site)
+                # Tangent for a clockwise arrival: (sin, -cos) of the drop bearing.
+                tangent_cw = math.atan2(-math.cos(drop_bearing), math.sin(drop_bearing))
+                err_deg = abs(math.degrees(wrap_to_pi(trailer_yaw - tangent_cw)))
+                reach_why += f", heading {err_deg:.1f} deg off tangent"
+            if not (lo <= reach <= hi):
+                self.get_logger().warn(
+                    f"Dropping at {reach_why} from builder {self.builder_id}'s arm base; "
+                    f"outside the window, so some rocks may land out of its pickup radius.",
+                    once=True,
+                )
+
+        if accept:
             # Speed at the instant the band accepted, i.e. the speed the full-brake
             # stop below has to absorb. This is the number that decides whether the
             # load stays in the bed, so it gets measured rather than assumed: it was
@@ -571,8 +932,8 @@ class PurePursuitController(Node):
             if not self.parked_at_home and self.is_fully_stopped():
                 self.parked_at_home = True
                 self.get_logger().info(
-                    f"Parked at drop point ({distance:.2f} m from home, {band_why}, "
-                    f"entered band at {self._drop_entry_speed:.3f} m/s); "
+                    f"Parked at drop point (axle {distance:.2f} m from it, {band_why}, "
+                    f"{reach_why}, entered band at {self._drop_entry_speed:.3f} m/s); "
                     f"publishing {self.at_home_topic}=true."
                 )
             # Keep asserting arrival: the dump sequencer may start after we do.
@@ -596,8 +957,10 @@ class PurePursuitController(Node):
         # traction guard only has mu*g ~ 1.3 m/s^2 to give: at 0.6 steering that caps the
         # corner at ~2.9 m/s, above which the guard cuts throttle and adds brake, and the
         # rover oscillates instead of turning. So the turn runs at its own fixed speed.
-        # Not self.home: the return leg follows a two-waypoint path onto the collector
-        # circle so the rover arrives running ALONG it. See home_approach_target.
+        # Not the drop point itself: the return leg follows an arc that stays outside the
+        # collector circle and touches it only where the load is dropped, so the rover
+        # arrives running ALONG the ring and never crosses the builder's orbit. See
+        # home_approach_target.
         steering = self.compute_steering(self.home_approach_target())
         if self._hard_turning:
             target_speed = min(target_speed, float(self.get_parameter("reverse_turn_speed_mps").value))

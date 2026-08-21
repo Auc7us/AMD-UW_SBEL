@@ -40,7 +40,10 @@ def launch_setup(context, *args, **kwargs):
     home_slowdown_distance_m = ParameterValue(
         LaunchConfiguration("home_slowdown_distance_m"), value_type=float
     )
-    approach_arc_m = ParameterValue(LaunchConfiguration("approach_arc_m"), value_type=float)
+    approach_arc_radius_m = ParameterValue(
+        LaunchConfiguration("approach_arc_radius_m"), value_type=float
+    )
+    drop_slots_ahead = ParameterValue(LaunchConfiguration("drop_slots_ahead"), value_type=float)
     rear_reference_offset_m = ParameterValue(LaunchConfiguration("rear_reference_offset_m"), value_type=float)
     pickup_request_rate_hz = ParameterValue(LaunchConfiguration("pickup_request_rate_hz"), value_type=float)
     skip_failed_targets = ParameterValue(LaunchConfiguration("skip_failed_targets"), value_type=bool)
@@ -70,7 +73,8 @@ def launch_setup(context, *args, **kwargs):
                         "drop_band_half_width_m": drop_band_half_width_m,
                         "drop_arc_tolerance_m": drop_arc_tolerance_m,
                         "home_slowdown_distance_m": home_slowdown_distance_m,
-                        "approach_arc_m": approach_arc_m,
+                        "approach_arc_radius_m": approach_arc_radius_m,
+                        "drop_slots_ahead": drop_slots_ahead,
                     }
                 ],
             )
@@ -145,13 +149,25 @@ def generate_launch_description():
                 ),
             ),
             DeclareLaunchArgument(
-                "approach_arc_m",
+                "approach_arc_radius_m",
                 default_value="12.0",
                 description=(
-                    "Arc of collector circle the rover follows into its drop point, so "
-                    "it arrives running ALONG the circumference instead of nose-in at "
-                    "it. The rear-discharging trailer then pours a line of rock along "
-                    "the circle rather than a heap across it."
+                    "Radius of the run-in arc. Its centre sits one radius outboard of the "
+                    "drop point, so the arc touches the collector circle ONLY at the drop "
+                    "point and lies outside it everywhere else -- the rover arrives "
+                    "tangentially without ever being carried inboard onto the builder "
+                    "orbiting 4 m inside the ring. Must clear the rover's ~5 m turn "
+                    "radius with margin; 12 m is 2.4x it."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "drop_slots_ahead",
+                default_value="1.0",
+                description=(
+                    "Wall slots past the one the builder is consuming to place the load, "
+                    "read live off /builder_N/arm_status. Bounded by ARM REACH, not by "
+                    "clearance: arm base to pile is 3.91 m at 0 slots, 4.04 at 1, 4.43 at "
+                    "2 and 5.01 at 3, against feedstock_reach_max=5.0, so 3 is refused."
                 ),
             ),
             DeclareLaunchArgument(

@@ -37,7 +37,12 @@ class LrvArm;
 //   out /builder_N/arm_base_pose   [x, y, z, qw, qx, qy, qz]   IK frame origin
 //   out /builder_N/pick_target     [ready, index, x, y, z]     next rock (privileged)
 //   out /builder_N/place_target    [x, y, z]                   next wall slot
-//   out /builder_N/arm_status      [seq, state, index, success, error_code, sim_time]
+//   out /builder_N/arm_status      [seq, state, index, success, error_code, sim_time,
+//                                  slot, usable_rocks, slot_angle_rad]
+//                                 The last three are appended for the collector's
+//                                 return leg: the slot being consumed, how many
+//                                 unlaid rocks this builder still owns, and the
+//                                 angle of that slot about the site centre.
 //   out /builder_N/arm_state       [theta1..4, finger1, finger2, ee_x, ee_y, ee_z]
 //
 // PRIVILEGED INFORMATION IS DELIBERATE. pick_target is read straight off the rock body

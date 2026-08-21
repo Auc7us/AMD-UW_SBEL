@@ -79,7 +79,7 @@ cd ~/mountdir/amd-uw/ros2_ws
 source install/setup.bash
 ros2 launch amd_uw_ros2 robot_controllers.launch.py \
   robot_ids:=1,2,3,4,5 \
-  target_speed_mps:=3.0 \
+  target_speed_mps:=5.0 \
   switch_radius_m:=2.0 \
   rock_side_offset_m:=2.0
 ```
@@ -449,27 +449,52 @@ state is `0` idle, `1` opening gate, `2` tilting, `3` dwell, `4` levelling,
 `5` closing gate, `6` done. `/robot_N/homePos` is published by the C++ drive
 bridge so the drop point is not recomputed in Python.
 
-**The last leg is tangential.** The rock line runs radially *outward* from the drop
-point, so a rover left to itself comes home radially — nose-in at the circumference,
-trailer pointing out into open field, load tipped wherever it happened to stop. Instead
-it is given two waypoints: one on the collector circle `approach_arc_m` (12 m) of arc
-*clockwise* of the drop point, then the drop point itself, reached by following the
-circle. By the time it has run that arc its heading is tangential, so the rear-
-discharging trailer pours a line of rock *along* the circumference — which is the shape
-the builder eats from, working one slot at a time along the same circle.
+**The last leg is tangential, and it stays outside the ring.** The rock line runs
+radially *outward* from the drop point, so a rover left to itself comes home radially —
+nose-in at the circumference, trailer pointing out into open field, load tipped wherever
+it happened to stop.
 
-The run-in comes down the circle *over the builder's own seed heap*, which sits at 36.6 m
-on slot 2.5 — 0.4 m off the 37 m path. That is intended, not overlooked: the builder eats
-the six seed rocks in the first ~60 s of sim and its collector does not get home until
-~250 s, so the ground is clear long before anything drives over it. It is the same
-property the whole layout is built on — the builder clears each pile off the collector
-circle before the collector comes back to that stretch of it.
+The first fix for that followed the collector circle itself: an entry waypoint on the
+circle 12 m of arc *clockwise* of the drop point, then the drop point, reached by
+following the circle round. It arrived tangentially and it also drove into builders.
+Clockwise is where the builder *is* — it walks counter-clockwise towards the drop point —
+so the last 12 m of every return leg ran down the builder's own lane with 4 m of radius
+between them (37 against 33, hull half-width 1.343 m), and `drop_band_half_width_m` of
+2 m let an arrival at r=35 count, 0.66 m off the tracks.
+
+The run-in is now an **arc that lies outside the collector circle and touches it only at
+the drop point**. Put its centre on the drop point's ray at radius `ring + rho`, with
+radius `rho` (`approach_arc_radius_m`, 12 m): the closest that circle comes to the site
+centre is `(ring + rho) - rho = ring`, at the drop point, and every other point on it is
+further out. Three properties fall out of that one construction:
+
+- the rover can never be carried inboard of the ring, so the builder's orbit is
+  unreachable from the return leg — measured minimum path-to-hull-centre is 4.14 m,
+  against a 1.343 m hull half-width;
+- the arc is tangent to the ring at the drop point, so the heading there is tangential and
+  the rear-discharging trailer pours *along* the circumference;
+- travel is **clockwise** about the site, so the rover descends from the counter-clockwise
+  side — the side the builder is never on — and its trailer points the way the builder
+  walks, laying the load ahead of the machine rather than behind it.
+
+`rho` is the only knob and must clear the rover's ~5 m turn radius with margin; 12 m is
+2.4x it, and the entry point sits at r=50.4 m, well clear of everything.
+
+**The drop point follows the builder, not the cycle counter.** `/builder_N/arm_status`
+carries three appended fields — the slot being consumed, how many unlaid rocks the builder
+still owns, and that slot's angle about the site centre — and the collector places its load
+`drop_slots_ahead` (1) slots past it, keeping the radius the sim chose. Reach is what bounds
+that number: arm base to pile is 3.91 m at 0 slots, 4.04 at 1, 4.43 at 2 and 5.01 at 3,
+against `feedstock_reach_max` = 5.0 m, so three slots ahead is refused outright. If the
+builder goes quiet the drop point falls back to the sim's own, so a lost topic degrades
+instead of stranding a loaded rover.
 
 That also let `drop_arc_tolerance_m` come down from 8 m to 3 m. The 8 m existed because
 a rover driving straight at the drop point cannot converge on it — pure pursuit orbits a
 target inside its own turning radius — so arrival had to be accepted from a long way
-out. With the run-in, 8 m of slack would be actively harmful: the rover would enter the
-band at the entry waypoint and park 8 m short of the pile it is meant to be building.
+out. With the run-in, that much slack would be actively harmful: the outboard arc puts the
+rover on the ring only at the drop point, so wide arc slack buys nothing on the way in and
+simply parks it short of the pile it is meant to be building.
 Arrival is also accepted on a **stop line** — committed to the run-in and past the drop
 point in arc — because "have I passed it" cannot be missed by a rover carrying a little
 too much speed, whereas "am I near it" can be sailed through in one control period.

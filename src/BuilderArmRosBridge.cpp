@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <limits>
 #include <string>
 #include <utility>
@@ -164,8 +165,23 @@ void BuilderArmRosBridge::UpdateFeedstock(double time) {
         for (auto& rock : m_delivered_source()) {
             if (!rock)
                 continue;
-            if (std::find(m_feedstock.begin(), m_feedstock.end(), rock) == m_feedstock.end())
+            if (std::find(m_feedstock.begin(), m_feedstock.end(), rock) == m_feedstock.end()) {
                 m_feedstock.push_back(rock);
+                // A delivered rock is frozen where it stopped rolling (RobotRig::
+                // GetDeliveredRocks), so this distance is final: it is the verdict on the
+                // collector's drop, one line per rock, whether or not the builder is
+                // starving at the time. Reported here because nothing else in the loop
+                // can: the pick log only ever names rocks that WERE in reach, so a drop
+                // that lands short is silent apart from a wall that stops growing.
+                const double d = (rock->GetPos() - m_arm.GetIkFramePos()).Length();
+                RCLCPP_INFO(m_node->get_logger(),
+                            "t=%.2f delivered rock [%s] came to rest %.2f m from the arm base "
+                            "-- %s the %.1f-%.1f m envelope.",
+                            time, rock->GetName().c_str(), d,
+                            (d >= feedstock_reach_min && d <= feedstock_reach_max) ? "INSIDE"
+                                                                                  : "OUTSIDE",
+                            feedstock_reach_min, feedstock_reach_max);
+            }
         }
     }
 
@@ -318,8 +334,17 @@ void BuilderArmRosBridge::Synchronize(double time, bool apply_commands) {
             // the ratio moves with rank count, so wall stamps cannot be compared between
             // builders or between runs. Every timing question about this cycle is asked
             // of this number.
-            RCLCPP_INFO(m_node->get_logger(), "t=%.2f laid rock %d of %zu; station advances to slot %d.",
-                        time, m_placed_count, m_wall_slots.size(), m_placed_count);
+            // The rock's NAME, not just the count. Rock bodies are named at construction
+            // (seed_rock_b* for the starting heap, harvest_rock_r*_c* for anything a
+            // collector delivered), and the count alone cannot answer the only question
+            // that matters about the loop: was this stone delivered, or was it one the
+            // builder started with? A stranded seed rock also makes "rock 7 or later"
+            // useless as a proxy, because the builder lays whatever it can reach next --
+            // a delivery can arrive as rock 6.
+            RCLCPP_INFO(m_node->get_logger(),
+                        "t=%.2f laid rock %d of %zu [%s]; station advances to slot %d.",
+                        time, m_placed_count, m_wall_slots.size(),
+                        rock ? rock->GetName().c_str() : "unnamed", m_placed_count);
         } else {
             // A slot that could not be served must not stall the whole course. The rock
             // stays consumed -- retrying the one the arm just failed on is how a builder
@@ -445,15 +470,25 @@ void BuilderArmRosBridge::PublishBuildTopics(double time) {
         if (time - m_last_starved_report >= starved_report_period) {
             m_last_starved_report = time;
             size_t spare = 0;
+            // How far off the nearest one is, not just that there is no rock in reach:
+            // "none within 2.0-5.0 m" cannot tell a pile dropped a metre short from a
+            // stranded seed rock 8 m away, and those need opposite fixes.
+            double nearest = std::numeric_limits<double>::max();
+            const auto arm_base = m_arm.GetIkFramePos();
             for (const auto& rock : m_feedstock) {
-                if (rock && !m_consumed.count(rock.get()))
+                if (rock && !m_consumed.count(rock.get())) {
                     ++spare;
+                    nearest = std::min(nearest, (rock->GetPos() - arm_base).Length());
+                }
             }
+            char nearest_txt[64] = "n/a";
+            if (spare > 0)
+                std::snprintf(nearest_txt, sizeof(nearest_txt), "%.2f m", nearest);
             RCLCPP_INFO(m_node->get_logger(),
-                        "waiting at slot %d for %.0f s: %zu rock(s) known, none within %.1f-%.1f m of the "
-                        "arm base.",
-                        m_placed_count, time - m_starved_since, spare, feedstock_reach_min,
-                        feedstock_reach_max);
+                        "waiting at slot %d for %.0f s: %zu rock(s) known, nearest %s, none within "
+                        "%.1f-%.1f m of the arm base.",
+                        m_placed_count, time - m_starved_since, spare, nearest_txt,
+                        feedstock_reach_min, feedstock_reach_max);
         }
     } else {
         m_starved_since = -1.0;
@@ -468,6 +503,30 @@ void BuilderArmRosBridge::PublishBuildTopics(double time) {
     }
     m_place_target_pub->publish(place);
 
+    // Rocks this builder still owns and has not laid. NOT filtered by reach: the whole
+    // point of sending it is to tell the collector when a fresh load is needed, and the
+    // in-reach count is zero exactly when the builder is starving -- which is too late to
+    // start driving. m_feedstock only grows, so this is (pool - consumed).
+    int usable_rocks = 0;
+    for (const auto& rock : m_feedstock) {
+        if (rock && !m_consumed.count(rock.get()))
+            ++usable_rocks;
+    }
+
+    // Angle of the wall slot being worked, about the site centre. Sent as an angle rather
+    // than left for the collector to rebuild from ray + slot * pitch + arm_lead: the lead
+    // exists precisely because the hull and the slot are NOT at the same angle, so a
+    // consumer reconstructing it has three chances to get the convention wrong. Clamped
+    // at the end of the course so a finished builder reports its last slot instead of
+    // running off the vector.
+    double slot_angle = 0.0;
+    if (!m_wall_slots.empty()) {
+        const size_t slot_index =
+            std::min(static_cast<size_t>(std::max(0, m_placed_count)), m_wall_slots.size() - 1);
+        const auto& slot = m_wall_slots[slot_index];
+        slot_angle = std::atan2(slot.y() - site_center_y, slot.x() - site_center_x);
+    }
+
     const auto status = m_arm.GetStatus();
     std_msgs::msg::Float64MultiArray status_msg;
     status_msg.data = {
@@ -480,6 +539,12 @@ void BuilderArmRosBridge::PublishBuildTopics(double time) {
         // a supervising controller's deadline can sensibly use -- wall time is ~20x
         // faster here and the ratio moves with rank count and machine.
         m_last_time,
+        // APPENDED, so anything reading indices 0-5 is unaffected. These three are for
+        // the collector's return leg: where this builder is consuming, how much it has
+        // left, and therefore where the next load has to land.
+        static_cast<double>(m_placed_count),
+        static_cast<double>(usable_rocks),
+        slot_angle,
     };
     m_status_pub->publish(status_msg);
 }
