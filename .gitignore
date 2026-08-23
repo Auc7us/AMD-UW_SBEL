@@ -18,3 +18,5 @@ ros2_ws/src/lunar-manip/
 
 # Controller / demo stdout captured next to a run. Regenerated every run.
 *.log
+batch/*.out
+batch/gate2_*.log
