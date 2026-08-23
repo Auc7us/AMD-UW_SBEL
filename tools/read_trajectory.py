@@ -113,6 +113,63 @@ class Recording:
                 yield time, poses
 
 
+def index_frames(path):
+    """[(offset, time)] for every frame, plus the declared rate.
+
+    Built by walking frame headers and seeking past payloads. Frames are NOT fixed size --
+    a rank's body count grows during a run as rocks are created -- so the Nth frame cannot
+    be computed from a stride, only found. Walking headers reads 16 bytes per frame instead
+    of the ~6.5 kB payload, so indexing an 8 GB recording touches well under 1% of it and
+    the payloads of the frames actually wanted are the only ones ever read in full.
+
+    A truncated tail (Ctrl-C leaves a partial frame) ends the index rather than raising.
+    """
+    out = []
+    size = os.path.getsize(path)
+    rate = 0.0
+    with open(path, "rb") as f:
+        head = f.read(HEADER.size)
+        if len(head) < HEADER.size:
+            return [], 0.0
+        magic, _version, _rank, rate, _step = HEADER.unpack(head)
+        if magic != FILE_MAGIC:
+            raise ValueError(f"{path}: bad magic {magic!r}")
+        offset = HEADER.size
+        while offset + FRAME_HEADER.size <= size:
+            f.seek(offset)
+            fh = f.read(FRAME_HEADER.size)
+            if len(fh) < FRAME_HEADER.size:
+                break
+            fmagic, time, count = FRAME_HEADER.unpack(fh)
+            if fmagic != FRAME_MAGIC:
+                raise ValueError(f"{path}: lost frame sync at offset {offset}")
+            payload = RECORD.size * count
+            if offset + FRAME_HEADER.size + payload > size:
+                break  # truncated final frame
+            out.append((offset, time))
+            offset += FRAME_HEADER.size + payload
+    return out, rate
+
+
+def read_frame(f, offset):
+    """(time, {index: (px,py,pz,qw,qx,qy,qz)}) for the frame at `offset`, or None."""
+    f.seek(offset)
+    fh = f.read(FRAME_HEADER.size)
+    if len(fh) < FRAME_HEADER.size:
+        return None
+    fmagic, time, count = FRAME_HEADER.unpack(fh)
+    if fmagic != FRAME_MAGIC:
+        return None
+    buf = f.read(RECORD.size * count)
+    if len(buf) < RECORD.size * count:
+        return None
+    poses = {}
+    for i in range(count):
+        idx, px, py, pz, qw, qx, qy, qz = RECORD.unpack_from(buf, i * RECORD.size)
+        poses[idx] = (px, py, pz, qw, qx, qy, qz)
+    return time, poses
+
+
 def discover_ranks(directory):
     ranks = []
     for path in glob.glob(os.path.join(directory, "rank_*_frames.bin")):

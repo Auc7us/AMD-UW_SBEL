@@ -412,79 +412,145 @@ rock       size= 49.723 x  18.025 x  1.863 m     <- the group, i.e. the whole ro
 Wheels folded into the hull (the centre-of-mass mistake) collapses the collector's
 extent; ignoring the shape frames stacks the M113's road wheels on its centreline.
 
-#### Previewing a recording without Blender
+#### Replaying a recording in 3D, without Blender
 
-`tools/preview_run.py` turns a recording into ONE self-contained HTML page: a plan view
-of the whole site with every body drawn as its own bounding box, a scrubbable timeline,
-an elevation panel, and a nearest-rock-to-builder trace. Standard library only -- there
-is no matplotlib in the container and no display either, so a page you open in a browser
-beats a plotting window.
+`tools/replay_run.py` is a previz playblast: it opens the recording in a real 3D window
+using the run's OWN meshes, played back on the wall clock, orbitable and scrubbable. The
+scene builds itself -- the object manifest names every mesh file and its local frame, so
+there is nothing to import and no scene to maintain.
 
 ```bash
-python3 tools/preview_run.py ~/mountdir/recordings/run16          # -> run16/preview.html
-python3 tools/preview_run.py <dir> -o /tmp/run.html --fps 3       # 3 frames per sim second
-python3 tools/preview_run.py <dir> --rank 1,2,3 --to 200          # one sector, first 200 s
-python3 tools/preview_run.py <dir> --all-parts                    # keep track shoes too
+python3 tools/replay_run.py ~/mountdir/recordings/run16              # real time
+python3 tools/replay_run.py <dir> --speed 8                          # 8x
+python3 tools/replay_run.py <dir> --rank 1,2 --from 90 --to 140      # one sector, one cycle
+python3 tools/replay_run.py <dir> --no-running-gear                  # drop tracks, faster
+python3 tools/replay_run.py <dir> --boxes                            # bounding boxes, faster
+python3 tools/replay_run.py <dir> --movie clip.mp4                   # off-screen to mp4
+python3 tools/replay_run.py <dir> --shot look.png --at 300           # one frame
+python3 tools/replay_run.py <dir> --focus "builder/Chassis" --focus-dist 7   # close on one machine
 ```
 
-Boxes rather than meshes, on purpose: the manifest already carries each visual shape's
-bounds, so a box needs no mesh files present and no import step, and it catches the
-failures worth catching -- a machine off its own sector ray, a rock sunk into the terrain
-or floating over it, a load dropped outside the arm's envelope, an arm folded through its
-own hull. Use `blender_import.py` when it has to look good; use this when you want to know
-whether it is right.
+Keys: `space` play/pause, arrows step a frame, `[` `]` speed, `t` top, `i` iso, `f` follow
+the next machine, `c` free camera, `r` restart, `q` quit.
 
-Frames are NOT fixed size -- a rank's body count grows as rocks are created -- so the
-file is indexed by walking frame headers and seeking past payloads, and only the frames
-actually kept are read in full. That is what makes the 8.3 GB, 15-rank, 24-minute run16
-preview in about 4 seconds. Ranks are aligned by simulation TIME rather than frame
-number, so a rank that starts a step late does not show its machines a frame out of step
-with everyone else's.
+Playback is 1:1 with the recording by default -- `--fps` defaults to the rate in the file,
+so every recorded frame is played and nothing is resampled. A 60 Hz recording is therefore
+real time at 60 fps, and `--movie` writes it at exactly that: 1800 recorded frames come out
+as a 30.0 s, 60.00 fps video. `--fps` and `--speed` override it, and if `--max-frames`
+would truncate a long run the tool says so rather than silently decimating.
 
-Defaults drop the parts that are numerically dominant and structurally uninteresting from
-above -- track shoes, road wheels, suspension arms, spindles. 63 shoes per builder is
-most of the recording and none of it says whether the site is working.
+Needs `pyvista` (`pip install pyvista imageio imageio-ffmpeg`), and a display for the
+interactive window -- `--movie` and `--shot` render off-screen and need neither.
 
-Per rank: `rank_N_meta.json` (run parameters), `rank_N_objects.jsonl` (one line per
-recorded body), `rank_N_frames.bin` (the poses). `static_props.jsonl` is the scenery --
-terrain, the three rings, the centre pad, the decorative laid rocks -- written once by
-rank 1, since it is identical everywhere and never moves.
+Lighting is one white sun plus a dim white fill, deliberately not VTK's `enable_lightkit()`,
+whose key light is warm by default (warmth 0.6 against 0.5 neutral) and tints neutral grey
+regolith olive -- the Moon came out looking like desert. The sun sits at mid elevation
+rather than the sim's near-overhead angle because relief is what this view exists to show,
+and an overhead sun flattens ruts, rock shadows and hull edges alike.
 
-Rank 0 is not recorded. It holds *zombies*: copies driven by SynChrono messages at the
-heartbeat, not simulated bodies, so recording there would resample the same data a
-heartbeat late and at a coarser rate.
+Recordings carry ABSOLUTE mesh paths from the machine that produced them, so a run copied
+off the cluster names `/work1/...` and resolves to nothing locally. Those are re-rooted
+automatically: every path has a `data/` segment and what follows it is stable across
+checkouts, so the local `data/` and the sibling Chrono checkout are tried in turn.
+`--mesh-root DIR` adds more. The line it prints says how many were re-rooted, and anything
+still missing is drawn as a box rather than skipped.
 
-At 4 ranks a physics rank records ~205 bodies -- rover chassis, four spindles and the
-wishbones, the trailer with its bed and tailgate, both eight-link manipulators, the
-M113's hull, sprockets, idlers, ten road wheels and 126 track shoes, and every rock,
-including the ones spawned by later harvest cycles. That is ~350 KB of sim second per
-rank at 60 Hz.
+An SCM run records no terrain patch -- the deformable terrain is not a static visual when
+`ExcludeExisting()` runs -- so the surface is rebuilt from the heightmap named in the
+metadata instead.
 
-Three things a consumer has to know, all of which are in the files:
+Deformation is read from `rank_<r>_scm.bin` when the recording carries it, and the ruts are
+drawn. Those files are a near-passthrough of `SCMTerrain::GetModifiedNodes()`:
 
-- **The pose is the body's REFERENCE frame**, which is what Chrono hands its own
-  renderers (`ChBody::GetVisualModelFrame` returns exactly this). Using the centre of
-  mass instead would offset every `ChBodyAuxRef` -- every rock and every arm link -- by
-  its own COM offset.
-- **A body is not one mesh at its origin.** Each manifest entry lists its visual shapes
-  *with their local frames*, so a shape's world transform is `body_pose *
-  shape_local_frame`. The M113 road wheel is two wheel halves at ±y; the trailer tub is
-  four boxes.
-- **`scale` is not the whole story for the rocks.** `LoadRockMesh` bakes the 0.2 scale
-  into the vertices and re-bases the mesh so its bottom sits at z=0, so the shape reports
-  scale `[1,1,1]` against a source OBJ that is five times too big and sitting at the
-  wrong height. Every trimesh shape therefore also carries `aabb_min`/`aabb_max`: the
-  box the geometry was actually drawn in. Fit replacement meshes to that.
+```text
+header  8s "AMDUWSCM", u32 version, u32 rank, f64 rate_hz, f64 delta,
+        f64 plane[7] (pos xyz + quat wxyz), i32 nx, i32 ny
+frame   u32 0x4D435353, f64 time, u32 count, count * (i32 i, i32 j, f32 z)
+```
 
-Two bodies have no visual shape of their own and need a mesh chosen on the Blender side:
-`collector_trailer/chassis` (draw it with `LRV_Wagon/trailer_chassis.obj`, which is what
-the sensor rank uses) and `world/front_ballast`.
+Node `(i,j)` sits at `(i*delta, j*delta)` in the patch plane frame, heights are absolute,
+and each frame carries only the nodes modified since the last -- so a consumer accumulates,
+and a dropped sample leaves the ground slightly stale rather than permanently wrong.
 
-The object list grows during a run -- each harvest cycle spawns a fresh set of rocks --
-so `rank_N_objects.jsonl` is appended to, and flushed, at the moment a body first
-appears, with the sim time it appeared at. Frames before that carry no entry for it;
-`--npz` fills those with NaN rather than zeros, because a rock that does not exist yet
-is not a rock at the site centre.
+The ruts get their own fine grid per rank rather than going onto the terrain: SCM nodes are
+0.1 m apart and the heightmap is 4.0157 m per vertex, so ruts are forty times finer than
+the ground mesh and cannot be shown on it. Each patch spans only the bounding box its rank
+actually touched -- tens of thousands of points, against the ~100 million a 0.1 m grid over
+the full patch would need.
+
+The terrain cells beneath each patch are CUT OUT. Biasing one of two coincident surfaces --
+polygon offset, a millimetre lift -- only settles the depth-buffer tie, and leaves two lots
+of geometry and shading in the same place, which at site distances reads as a rectangular
+slab hovering over the ground. Removing the covered cells leaves one surface.
+
+The patch then has to fill the hole EXACTLY, and the two grids make that awkward: terrain
+pitch is 4.0157 m (`length/(nv_x-1)`, not a round number) and SCM nodes are 0.1 m apart, so
+they are incommensurate and a patch whose edges are node multiples misses the cell boundary
+by up to half a node. That leaves a gap showing background down one side of the hole and an
+overlap that z-fights down another -- a rectangular outline around the whole driven area.
+So the patch carries the cell boundary itself as its outer ring: first and last spacing is
+whatever is left over, the interior sits exactly on nodes. The seam is then exact to zero,
+because along a shared edge the patch's bilinear base collapses to the same linear
+interpolation the coarse quad's edge uses.
+
+Colour is sinkage against the undisturbed surface, with the zero end pinned to the
+terrain's own colour so undriven ground is invisible and the eye finds the tracks;
+`--scm-depth` sets what counts as fully dark. Cumulative keyframes are handled implicitly:
+heights are absolute, so re-applying a full dump is idempotent. Scrubbing backwards rewinds
+to pristine and replays, so a scrubbed frame matches the same frame reached by playing
+forward. `--no-scm` draws the terrain undeformed.
+
+It is 1:1 with what the sim drew, and that takes more than loading the OBJ files. Every
+mesh is fitted to the bounding box the recorder captured, because -- as TrajectoryRecorder
+says in as many words -- `scale` alone is a lie for anything transformed in memory after
+loading. Two cases here, both badly wrong without the fit: every rock reports scale
+[1,1,1] and is drawn at 0.2, since LoadRockMesh bakes the scale into the vertices and
+re-bases the mesh on the ground plane, so the source OBJ renders FIVE TIMES too large; and
+the builder hull is drawn deliberately squashed in z by 0.110 (`Builder_Chassis_Squashed_Z`
+in BuilderRig.cpp, so the roof does not bury the arm), so the source OBJ renders as a
+full-height M113. The fit is per axis, which reproduces a one-axis squash exactly where a
+uniform scale cannot. Primitives come from the dimensions the recorder wrote -- box `size`,
+cylinder `radius`/`height` -- not from a bounding box; run16 carries 92 cylinders.
+
+Scenery comes from `static_props.jsonl` rather than being synthesised. The three rings are
+not circles: each is 180 short boxes laid ON the terrain by height probe, following its
+height, and the pad and decorative wall rocks are recorded the same way -- a flat circle at
+a guessed height is wrong by metres on a hillside. The terrain is rebuilt from the heightmap
+named in the recording's own metadata and fitted to the patch bounds, which is what makes
+it exact: run16's patch spans z=-13.82..12.65 while its metadata declares [-25, 25], because
+Chrono maps grey over the image's own range and not the declared one. Vertex pitch works out
+at length/(nv_x-1) = 4.0157 m, matching Chrono's mesh exactly. Checked against the recorded
+scenery: ring markers land within a median 0.08 m of the rebuilt surface and the placed
+rocks within 0.00 m, the residual being grid pitch on a slope, and builder hulls float
+0.36-0.77 m above it, which is the track and road wheels they are actually standing on.
+
+Meshes are loaded once per file and shared, so fifteen ranks of builders cost one hull
+mesh rather than fifteen, and each body is drawn in the colour its own shapes carry, so the
+playblast looks like the run instead of like a debug view. Bodies stay hidden until their
+first recorded pose, because rocks are created during the run and would otherwise sit at
+the origin until they exist.
+
+The whole 1024 m patch is drawn at full resolution by default, because the site is not the
+whole run: the collectors drive out past 200 m on the harvest lanes, and a terrain cropped
+to the rings leaves them flying over nothing. It costs nothing to keep -- the heightmap is
+256x256, so the patch is 65k points -- and decimating it flattens exactly the relief the
+site cares about. `--terrain-margin <m>` crops to the rings if you want it, and
+`--terrain-decimate` coarsens it.
+
+Track shoes and their lugs, road wheels, sprockets, idlers and suspension are drawn by
+default: the tracks are most of what a tracked machine looks like, and without them a
+builder is a coloured plate sliding over the ground. That is 1905 of the 3336 bodies in a
+15-rank run, and `--no-running-gear` takes them back out when frame rate matters more than
+looks.
+
+Two things had to be fixed to make that affordable, and both are worth knowing if this
+gets extended. Never pass `name=` to `add_mesh` in a loop: pyvista then calls
+`remove_actor(name)` first, which scans the whole actor collection by name, so building
+3336 bodies was O(n^2) -- 11.2 million VTK collection lookups and three minutes of scene
+build. And placed geometry is cached by shape signature, not just by mesh file: 1905 track
+shoes are the same mesh fitted to the same box at the same local frame, differing only in
+body pose, and body pose lives on the actor. Together those took a full-site frame from
+3 min 15 s to 31 s.
 
 ### Cost diagnostics
 
