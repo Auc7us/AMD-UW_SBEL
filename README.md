@@ -389,9 +389,14 @@ Meshes are loaded once per file and shared, so fifteen ranks of builders cost on
 mesh rather than fifteen, and each body is drawn in the colour its own shapes carry, so the
 playblast looks like the run instead of like a debug view. Bodies stay hidden until their
 first recorded pose, because rocks are created during the run and would otherwise sit at
-the origin until they exist. The terrain is cropped to the site: the patch is 1024 m across
-against a 37 m site, and keeping all of it both costs frame rate and wrecks every camera
-fit, since those are computed over the scene bounds and the machines end up specks.
+the origin until they exist.
+
+The whole 1024 m patch is drawn at full resolution by default, because the site is not the
+whole run: the collectors drive out past 200 m on the harvest lanes, and a terrain cropped
+to the rings leaves them flying over nothing. It costs nothing to keep -- the heightmap is
+256x256, so the patch is 65k points -- and decimating it flattens exactly the relief the
+site cares about. `--terrain-margin <m>` crops to the rings if you want it, and
+`--terrain-decimate` coarsens it.
 
 Defaults drop track shoes, road wheels, suspension arms and spindles -- 1905 of the 3472
 bodies in a 15-rank run, none of which say whether the site is working. `--all-parts`

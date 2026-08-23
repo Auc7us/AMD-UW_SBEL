@@ -274,9 +274,12 @@ def terrain_mesh(meta, prop, decimate, keep_radius):
     rows, cols = z.shape
     x = np.linspace(x0, x1, cols)
     y = np.linspace(y0, y1, rows)
-    # Cropped to the site. The patch is 1024 m across against a 37 m site, so keeping all
-    # of it costs frame rate for scenery nobody looks at AND wrecks the framing: camera
-    # fits are computed over the scene bounds, and uncropped the machines end up specks.
+    # Optional crop, off by default. The full patch is 1024 m across against a 37 m site,
+    # but the collectors drive out to 200 m on the harvest lanes -- crop to the site and
+    # they leave the ground and appear to fly. It costs nothing to keep: the heightmap is
+    # 256x256, so the whole patch is 65k points. (Cropping was originally here to stop the
+    # patch bounds dragging the camera out; the explicit camera positions in main() do
+    # that job, so it is no longer the default.)
     if keep_radius > 0:
         cx, cy = np.abs(x) <= keep_radius, np.abs(y) <= keep_radius
         if cx.any() and cy.any():
@@ -440,12 +443,15 @@ def main():
     ap.add_argument("--all-parts", action="store_true", help="include track shoes and wheels")
     ap.add_argument("--boxes", action="store_true", help="bounding boxes instead of meshes")
     ap.add_argument("--no-terrain", action="store_true")
-    ap.add_argument("--terrain-decimate", type=int, default=4,
-                    help="heightmap subsampling, higher is coarser (default 4)")
+    ap.add_argument("--terrain-decimate", type=int, default=1,
+                    help="heightmap subsampling, higher is coarser (default 1, full "
+                         "resolution: the map is only 256x256, so decimating flattens "
+                         "exactly the relief the site cares about)")
     ap.add_argument("--no-scenery", action="store_true",
                     help="skip the terrain, rings, pad and decorative wall rocks")
-    ap.add_argument("--terrain-margin", type=float, default=25.0,
-                    help="metres of terrain kept outside the collector ring (default 25)")
+    ap.add_argument("--terrain-margin", type=float, default=0.0,
+                    help="crop the terrain to this many metres outside the collector ring; "
+                         "0 (default) keeps the whole patch, which is what the run had")
     ap.add_argument("--movie", help="render off-screen to this .mp4 and exit")
     ap.add_argument("--shot", help="write a single PNG and exit")
     ap.add_argument("--at", type=float, help="sim time for --shot (default: midpoint)")
@@ -480,7 +486,7 @@ def main():
     actors = build_scene(pl, bodies, cache, args.boxes, meta,
                          0 if args.no_terrain else args.terrain_decimate,
                          not args.no_scenery,
-                         site_r + max(0.0, args.terrain_margin),
+                         (site_r + args.terrain_margin) if args.terrain_margin > 0 else 0.0,
                          args.directory)
     if cache.misses:
         print(f"  ! {len(cache.misses)} mesh file(s) missing, drawn as boxes", file=sys.stderr)
