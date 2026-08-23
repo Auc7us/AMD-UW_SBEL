@@ -428,16 +428,44 @@ python3 tools/replay_run.py <dir> --boxes                            # bounding 
 python3 tools/replay_run.py <dir> --movie clip.mp4                   # off-screen to mp4
 python3 tools/replay_run.py <dir> --shot look.png --at 300           # one frame
 python3 tools/replay_run.py <dir> --focus "builder/Chassis" --focus-dist 7   # close on one machine
+python3 tools/replay_run.py <dir> --max-frames 9000                  # hold every frame of a long run
 ```
 
-Keys: `space` play/pause, arrows step a frame, `[` `]` speed, `t` top, `i` iso, `f` follow
-the next machine, `c` free camera, `r` restart, `q` quit.
+Keys: `space` play/pause, `<-` `->` step a frame, `[` `]` speed, `t` top, `c` free camera,
+`f` follow the next machine, `r` restart, `q` quit.
+
+The camera flies on `ijkl`, laid out the way `wasd` is: `i`/`k` forward and back, `j`/`l`
+strafe, `u`/`o` up and down, and pyvista's own `up`/`down` zoom. Movement is in the GROUND
+PLANE rather than along the view vector -- the site is looked at from 21 degrees above, so
+flying along the view drives into the dirt after a few presses, and gliding over the
+terrain with height on its own keys is what gets you across a 200 m work area. Each press
+covers a fixed fraction of the distance to whatever the camera is pointed at, so it feels
+the same framing the whole site or one machine, and holding a key auto-repeats. Any of them
+drops `f` follow, since a followed camera is re-aimed every frame.
+
+The arrows are the timeline and nothing else, and stepping pauses playback -- stepping into
+a running clock only fights it. `i` used to frame the iso view, which is what `c` already
+does, so the letter went to the camera.
 
 Playback is 1:1 with the recording by default -- `--fps` defaults to the rate in the file,
 so every recorded frame is played and nothing is resampled. A 60 Hz recording is therefore
 real time at 60 fps, and `--movie` writes it at exactly that: 1800 recorded frames come out
-as a 30.0 s, 60.00 fps video. `--fps` and `--speed` override it, and if `--max-frames`
-would truncate a long run the tool says so rather than silently decimating.
+as a 30.0 s, 60.00 fps video.
+
+`--max-frames` (default 3000) is a cap on how many frames are HELD IN MEMORY, not a frame
+rate: every body's pose for every frame is resident, about 22 kB per frame for a 15-rank
+run. A recording longer than the cap is resampled onto that many frames and plays coarser
+than it was recorded -- 139 s at 60 Hz is 8346 frames, so the default plays 21.6 of every
+60. The tool prints the flag value that would play every frame; `--from`/`--to` is the
+other way out, and costs nothing in fidelity.
+
+Speed runs off the WALL CLOCK: each tick advances by however much sim time has actually
+elapsed, so `[` and `]` take effect immediately and a scene too heavy to keep up drops
+frames rather than sliding into slow motion. That matters here -- pushing 816 bodies'
+poses is ~88 ms a frame against ~12 ms to render them, so a four-rank run with running
+gear has a ~10 fps ceiling and 1x playback is dropping five frames in six. It is honest
+about it: the clock in the HUD tracks real time either way. `--no-running-gear` (120
+bodies) clears 70 fps.
 
 Needs `pyvista` (`pip install pyvista imageio imageio-ffmpeg`), and a display for the
 interactive window -- `--movie` and `--shot` render off-screen and need neither.
@@ -473,10 +501,24 @@ and each frame carries only the nodes modified since the last -- so a consumer a
 and a dropped sample leaves the ground slightly stale rather than permanently wrong.
 
 The ruts get their own fine grid per rank rather than going onto the terrain: SCM nodes are
-0.1 m apart and the heightmap is 4.0157 m per vertex, so ruts are forty times finer than
-the ground mesh and cannot be shown on it. Each patch spans only the bounding box its rank
-actually touched -- tens of thousands of points, against the ~100 million a 0.1 m grid over
-the full patch would need.
+`delta` apart -- 0.02 m in current runs -- against 4.0157 m per heightmap vertex, so ruts
+are two hundred times finer than the ground mesh and cannot be shown on it. Each patch
+spans only the bounding box its own rank touched, against the 2.6 billion nodes a 0.02 m
+grid over the full 1024 m patch would need.
+
+That box is still enormous. A collector working a 60 x 34 m sector sweeps 3415 x 1809 =
+6.2 M nodes, under 9% of which are ever deformed, so the patches are DECIMATED rather than
+drawn node for node: `--rut-nodes` (default 2 000 000) is shared out between the ranks and
+each patch takes the coarsest stride that fits, which is 0.08 m for a four-rank run. The
+line the tool prints names the resulting grid and its spacing. Deformation snaps to the
+nearest kept node with the deepest value winning, so a rut keeps the depth it was recorded
+with and loses only width resolution; raise `--rut-nodes` for finer ruts at the cost of
+memory and frame rate.
+
+Decimating rather than skipping is the point. There used to be a hard node cap, and over it
+the patch was dropped -- but the terrain underneath had already been cut away, so the ruts
+came out as slabs of background colour with no relief in them. The cut now follows the
+patches that actually got built.
 
 The terrain cells beneath each patch are CUT OUT. Biasing one of two coincident surfaces --
 polygon offset, a millimetre lift -- only settles the depth-buffer tie, and leaves two lots
@@ -484,9 +526,9 @@ of geometry and shading in the same place, which at site distances reads as a re
 slab hovering over the ground. Removing the covered cells leaves one surface.
 
 The patch then has to fill the hole EXACTLY, and the two grids make that awkward: terrain
-pitch is 4.0157 m (`length/(nv_x-1)`, not a round number) and SCM nodes are 0.1 m apart, so
-they are incommensurate and a patch whose edges are node multiples misses the cell boundary
-by up to half a node. That leaves a gap showing background down one side of the hole and an
+pitch is 4.0157 m (`length/(nv_x-1)`, not a round number) and SCM nodes are 0.02 m apart,
+so they are incommensurate and a patch whose edges are node multiples misses the cell
+boundary by up to half a node. That leaves a gap showing background down one side of the hole and an
 overlap that z-fights down another -- a rectangular outline around the whole driven area.
 So the patch carries the cell boundary itself as its outer ring: first and last spacing is
 whatever is left over, the interior sits exactly on nodes. The seam is then exact to zero,

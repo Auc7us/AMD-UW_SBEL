@@ -13,8 +13,10 @@ its local frame, so the scene builds itself from the run.
     replay_run.py <dir> --movie run16.mp4     off-screen render to mp4
     replay_run.py <dir> --shot look.png --at 120
 
-Keys: space play/pause, left/right step a frame, [ ] speed, t top view, i iso view,
-      f follow the next machine, c free camera, r restart, q quit.
+Keys: space play/pause, left/right step a frame, [ ] speed.
+      ijkl flies the camera the way wasd does -- i/k forward and back over the ground,
+      j/l strafe, u/o up and down, up/down zoom.
+      t top view, c free camera, f follow the next machine, r restart, q quit.
 
 Meshes are loaded once per file and shared between the bodies that use them, so 15 ranks
 of builders cost one hull mesh, not fifteen. Track shoes, lugs, road wheels and suspension
@@ -29,6 +31,7 @@ import os
 import re
 import struct
 import sys
+import time
 
 import numpy as np
 
@@ -459,8 +462,15 @@ def load(directory, ranks, t_from, t_to, fps, keep_all, max_frames):
     want = int((t1 - t0) * max(0.1, fps)) + 1
     n = max(2, min(max_frames, want))
     if want > n:
-        print(f"  ! {want} frames wanted at {fps:g}/sim-s but --max-frames is {max_frames}; "
-              f"playing {n}, i.e. {n / max(1e-9, t1 - t0):.2f}/sim-s", file=sys.stderr)
+        # --max-frames caps how many frames are HELD IN MEMORY, it is not a frame rate:
+        # every body's pose for every frame is resident, so a 15-rank run costs about
+        # 22 kB per frame. Over the cap the timeline is resampled, which is why the rate
+        # printed next is not the rate the run was recorded at.
+        print(f"  ! {want} frames at {fps:g}/sim-s over {t1 - t0:.1f} s of run, but "
+              f"--max-frames is {max_frames} (a cap on frames held in memory, not a frame "
+              f"rate); resampled to {n}, i.e. {n / max(1e-9, t1 - t0):.2f}/sim-s. Pass "
+              f"--max-frames {want} for every recorded frame, or narrow it with --from/--to.",
+              file=sys.stderr)
     targets = np.linspace(t0, t1, n)
 
     poses = np.full((n, len(bodies), 7), np.nan, dtype=np.float32)
@@ -613,86 +623,102 @@ def blank_terrain_cells(grid, boxes):
     return int(mask.sum())
 
 
-def build_rut_patches(pl, sources, boxes, sample_base, ground, clim, max_nodes=4_000_000):
-    """One fine grid per rank covering the nodes that rank ever deformed.
+def build_rut_patches(pl, sources, boxes, sample_base, ground, clim, budget=2_000_000):
+    """One decimated fine grid per rank, covering the nodes that rank ever deformed.
 
-    Separate from the terrain on purpose. The heightmap is 4.0157 m per vertex and SCM
-    nodes are 0.1 m apart, so ruts are forty times finer than the ground mesh and cannot
-    be shown on it. Each patch spans only the bounding box its rank actually touched --
-    tens of thousands of points, not the 100 million a 0.1 m grid over the whole patch
-    would need.
+    Separate from the terrain on purpose. The heightmap carries one vertex per 4.0157 m and
+    SCM nodes are `delta` apart -- 0.02 m in these runs, two hundred times finer -- so ruts
+    cannot be drawn on the ground mesh at all. Each patch spans only the bounding box its
+    own rank touched.
 
-    Drawn with polygon-offset resolution so it never z-fights the terrain underneath: the
-    two surfaces agree exactly wherever nothing has driven, which is most of the patch.
+    That box is still enormous at 0.02 m. A collector working a 60 x 34 m sector sweeps
+    3415 x 1809 = 6.2 M nodes, of which under 9% are ever deformed, so drawing every node
+    is not affordable -- and refusing to draw is worse than it sounds, because the terrain
+    underneath had already been cut away by then: the patch was skipped, the hole was not,
+    and the ruts showed up as a slab of background colour. So the grid is DECIMATED rather
+    than skipped. `budget` points are shared out between the ranks and each patch takes the
+    coarsest stride that fits, keeping its full extent. Deformation snaps to the nearest
+    kept node with the deepest value winning (see apply_scm), so a rut keeps the depth it
+    was recorded with and loses only width resolution.
+
+    Drawn with the terrain cells underneath removed, so the two surfaces never coincide:
+    the patch's outer ring IS the cell boundary, where its bilinear base collapses to the
+    same linear interpolation the coarse quad's edge uses, making the seam exact.
     """
     patches = []
+    if not sources:
+        return patches
+    import pyvista as pv
+
+    share = max(4096, int(budget) // len(sources))
     for src, box in zip(sources, boxes):
         delta, frames, rate = src["delta"], src["frames"], src["rate"]
         i0, i1, j0, j1 = box["i0"], box["i1"], box["j0"], box["j1"]
-        cols, rows = i1 - i0 + 3, j1 - j0 + 3  # + the two boundary lines per axis
-        if rows * cols > max_nodes:
-            print(f"  ! rank {src['rank']} deformation spans {cols}x{rows} nodes, over the "
-                  f"{max_nodes} cap; skipped", file=sys.stderr)
+        span_i, span_j = i1 - i0 + 1, j1 - j0 + 1
+        if span_i < 2 or span_j < 2:
             continue
+        # Coarsest stride that fits the share, counting the two boundary lines per axis.
+        # Seeded from the area so the loop is a correction, not a search.
+        stride = max(1, int(math.ceil(math.sqrt(span_i * span_j / float(share)))))
+        while ((span_i - 1) // stride + 3) * ((span_j - 1) // stride + 3) > share:
+            stride += 1
 
-        import pyvista as pv
-
-        # Axes: the hole's own boundary, then every SCM node strictly inside it, then the
-        # far boundary. The first and last spacing is whatever is left over (< 0.1 m); the
-        # interior is exactly on nodes. That makes the seam EXACT -- the patch edge is the
-        # cell edge, where its bilinear base collapses to the same linear interpolation the
-        # coarse quad's edge uses -- while keeping the terrain on its own native vertices.
+        # Axes: the hole's own boundary, then every stride-th SCM node strictly inside it,
+        # then the far boundary. The first and last spacing is whatever is left over
+        # (< stride * delta); the interior sits exactly on nodes, which is what keeps the
+        # seam exact while leaving the terrain on its own native vertices.
+        xs = np.arange(i0, i1 + 1, stride)
+        ys = np.arange(j0, j1 + 1, stride)
         wx0, wx1, wy0, wy1 = box["world"]
-        x = np.concatenate(([wx0], np.arange(i0, i1 + 1) * delta, [wx1]))
-        y = np.concatenate(([wy0], np.arange(j0, j1 + 1) * delta, [wy1]))
+        x = np.concatenate(([wx0], xs * delta, [wx1]))
+        y = np.concatenate(([wy0], ys * delta, [wy1]))
         xx, yy = np.meshgrid(x, y)
         rows, cols = len(y), len(x)
         grid = pv.StructuredGrid(xx, yy, np.zeros_like(xx))
-
-        # Index map built FROM THE GRID'S OWN POINT COORDINATES, never from an assumed
-        # ravel order. VTK orders structured points with the FIRST dimension fastest, so
-        # for a meshgrid(x, y) the y index moves fastest -- point n is (col*rows + row),
-        # not (row*cols + col). Indexing it the other way silently transposes every rut:
-        # the imprints come out across the direction of travel and smeared over the whole
-        # patch instead of along the track, which is precisely how this first shipped.
-        px, py = grid.points[:, 0], grid.points[:, 1]
-        base = sample_base(px, py)
+        base = sample_base(grid.points[:, 0], grid.points[:, 1])
         grid.points[:, 2] = base
 
-        # Node -> point index, built from the grid's own coordinates. VTK orders structured
-        # points with the FIRST dimension fastest, so for meshgrid(x, y) the y index moves
-        # fastest; assuming the other order silently transposes every rut, which is exactly
-        # how this first shipped. Deriving the map from coordinates cannot get that wrong.
-        ci = np.searchsorted(x, px)
-        ri = np.searchsorted(y, py)
-        flat_of = np.full((rows, cols), -1, dtype=np.int64)
-        flat_of[ri, ci] = np.arange(grid.n_points)
-        # Which axis entries ARE nodes (the two boundary lines are not).
-        col_for_i = np.full(i1 - i0 + 1, -1, dtype=np.int64)
-        row_for_j = np.full(j1 - j0 + 1, -1, dtype=np.int64)
-        col_for_i[np.arange(i1 - i0 + 1)] = np.arange(1, cols - 1)
-        row_for_j[np.arange(j1 - j0 + 1)] = np.arange(1, rows - 1)
-        lut = flat_of[np.ix_(row_for_j, col_for_i)]
-        if (lut < 0).any():
-            print(f"  ! rank {src['rank']}: {int((lut < 0).sum())} patch node(s) unmapped",
-                  file=sys.stderr)
-        # Self-check: the point a node maps to must actually SIT at that node.
-        pr, pc = (j1 - j0) // 2, (i1 - i0) // 2
-        pi = lut[pr, pc]
-        if pi >= 0:
-            want = ((i0 + pc) * delta, (j0 + pr) * delta)
-            got = (px[pi], py[pi])
-            if abs(got[0] - want[0]) > 1e-6 or abs(got[1] - want[1]) > 1e-6:
-                raise AssertionError(f"rut index map is wrong: node {want} landed at {got}")
+        # Node -> point index, arithmetic rather than a lookup table: at 0.02 m a table
+        # over the box is 49 MB per rank and buys nothing. VTK ravels structured points
+        # with the FIRST dimension fastest, so for meshgrid(x, y) the y index moves fastest
+        # and point (row, col) is col*rows + row. Assuming the other order silently
+        # TRANSPOSES every rut -- imprints across the direction of travel, smeared over the
+        # whole patch -- which is exactly how this first shipped, so it is checked below
+        # against the grid's own coordinates rather than trusted.
+        def point_of(ii, jj, i0=i0, j0=j0, stride=stride, rows=rows,
+                     nx=len(xs), ny=len(ys)):
+            c = 1 + np.minimum((ii - i0 + stride // 2) // stride, nx - 1)
+            r = 1 + np.minimum((jj - j0 + stride // 2) // stride, ny - 1)
+            return c * rows + r
+
+        # Co-prime sample strides walk the check diagonally across the box, so a transposed
+        # or off-by-one map fails on the first patch built rather than on inspection of the
+        # render. Tolerance is half a stride: that IS the snap the decimation performs.
+        ci = np.arange(i0, i1 + 1, max(1, span_i // 37))
+        cj = np.arange(j0, j1 + 1, max(1, span_j // 41))
+        n = min(len(ci), len(cj))
+        probe = point_of(ci[:n], cj[:n])
+        dx = np.abs(grid.points[probe, 0] - ci[:n] * delta)
+        dy = np.abs(grid.points[probe, 1] - cj[:n] * delta)
+        tol = 0.5 * stride * delta + 1e-6
+        if dx.max() > tol or dy.max() > tol:
+            k = int(np.argmax(np.maximum(dx, dy)))
+            raise AssertionError(
+                f"rut index map is wrong: node ({ci[k] * delta}, {cj[k] * delta}) landed at "
+                f"({grid.points[probe[k], 0]}, {grid.points[probe[k], 1]})")
+
         grid["sinkage"] = np.zeros(grid.n_points)
         # No offset, no lift: the terrain cells underneath are removed, so this is the
-        # only surface here and there is nothing to tie with.
+        # only surface here and there is nothing to tie with. Flat shading rather than
+        # smooth: recomputing vertex normals over a million points every deformation
+        # sample is the whole frame budget, and on a grid this fine the facets are
+        # sub-centimetre anyway.
         pl.add_mesh(grid, scalars="sinkage", cmap=rut_colormap(ground),
-                    clim=(0.0, max(1e-3, clim)), show_scalar_bar=False,
-                    smooth_shading=True, specular=0.05)
+                    clim=(0.0, max(1e-3, clim)), show_scalar_bar=False, specular=0.05)
         patches.append({
-            "rank": src["rank"], "grid": grid, "base": base, "lut": lut,
-            "i0": i0, "j0": j0, "shape": (rows, cols), "frames": frames,
+            "rank": src["rank"], "grid": grid, "base": base, "point_of": point_of,
+            "i0": i0, "i1": i1, "j0": j0, "j1": j1, "stride": stride, "delta": delta,
+            "rows": rows, "cols": cols, "cells": box["cells"], "frames": frames,
             "cursor": 0, "time": -1.0, "rate": rate, "nodes": src["nodes"],
         })
     return patches
@@ -711,21 +737,30 @@ def apply_scm(patches, t):
             p["grid"].points[:, 2] = p["base"]
             p["grid"]["sinkage"][:] = 0.0
             p["cursor"] = 0
-        lut = p["lut"]
-        rows, cols = lut.shape
         z = p["grid"].points[:, 2]
         sink = p["grid"]["sinkage"]
+        base, stride = p["base"], p["stride"]
         moved = False
         while p["cursor"] < len(p["frames"]) and p["frames"][p["cursor"]][0] <= t:
             _ft, ii, jj, zz = p["frames"][p["cursor"]]
-            r, c = jj - p["j0"], ii - p["i0"]
-            ok = (r >= 0) & (r < rows) & (c >= 0) & (c < cols)
-            idx = lut[r[ok], c[ok]]
-            live = idx >= 0
-            idx, hz = idx[live], zz[ok][live]
-            z[idx] = hz
-            sink[idx] = p["base"][idx] - hz
             p["cursor"] += 1
+            ok = ((ii >= p["i0"]) & (ii <= p["i1"])
+                  & (jj >= p["j0"]) & (jj <= p["j1"]))
+            if not ok.all():
+                ii, jj, zz = ii[ok], jj[ok], zz[ok]
+            if not len(ii):
+                continue
+            idx = p["point_of"](ii, jj)
+            if stride > 1:
+                # Several nodes share a grid point once the grid is decimated. Sort by
+                # height DESCENDING so the deepest lands last: numpy's advanced assignment
+                # keeps the last value written for a repeated index, so the deepest node
+                # wins and a rut with undisturbed ground beside it stays a rut instead of
+                # being filled back in by its neighbour.
+                order = np.argsort(-zz, kind="stable")
+                idx, zz = idx[order], zz[order]
+            z[idx] = zz
+            sink[idx] = base[idx] - zz
             moved = True
         p["time"] = t
         if moved:
@@ -734,7 +769,11 @@ def apply_scm(patches, t):
 
 def build_scene(pl, bodies, cache, boxes_only, meta, terrain_decimate, scenery,
                 terrain_radius, directory):
-    """One actor per body, index-aligned with `bodies`, plus the static scenery."""
+    """(actors, terrain grid, terrain colour). Actors are index-aligned with `bodies`.
+
+    The colour comes back because the rut patches need it as the low end of their sinkage
+    ramp, and rebuilding the terrain just to read it costs a second heightmap decode.
+    """
     import pyvista as pv
 
     def merged(obj):
@@ -760,7 +799,7 @@ def build_scene(pl, bodies, cache, boxes_only, meta, terrain_decimate, scenery,
         actors.append(actor)
 
     if not scenery:
-        return actors, None
+        return actors, None, None
 
     # The rings are not circles: each is 180 little boxes laid ON the terrain, following
     # its height, and the pad and the decorative wall rocks are recorded the same way.
@@ -768,6 +807,7 @@ def build_scene(pl, bodies, cache, boxes_only, meta, terrain_decimate, scenery,
     # a synthetic flat circle at a guessed height is wrong by metres on a hillside.
     props = static_props(directory)
     drew_terrain = False  # becomes the terrain grid once one is drawn
+    ground = None
     for prop in props:
         shapes = prop.get("shapes", [])
         is_patch = len(shapes) == 1 and shapes[0].get("type") == "trimesh" and not shapes[0].get("file")
@@ -777,7 +817,7 @@ def build_scene(pl, bodies, cache, boxes_only, meta, terrain_decimate, scenery,
             terr, colour = terrain_mesh(meta, prop, terrain_decimate, terrain_radius)
             if terr is not None:
                 pl.add_mesh(terr, color=colour, smooth_shading=True, specular=0.05)
-                drew_terrain = terr
+                drew_terrain, ground = terr, colour
             continue
         colour = next((tuple(s["color"]) for s in shapes if s.get("color")), "#94a3b8")
         mesh = merged(prop)
@@ -796,8 +836,8 @@ def build_scene(pl, bodies, cache, boxes_only, meta, terrain_decimate, scenery,
         terr, colour = terrain_mesh(meta, None, terrain_decimate, terrain_radius)
         if terr is not None:
             pl.add_mesh(terr, color=colour, smooth_shading=True, specular=0.05)
-            drew_terrain = terr
-    return actors, (drew_terrain if drew_terrain is not False else None)
+            drew_terrain, ground = terr, colour
+    return actors, (drew_terrain if drew_terrain is not False else None), ground
 
 
 def apply_frame(actors, poses, slot):
@@ -829,7 +869,11 @@ def main():
     ap.add_argument("--speed", type=float, default=1.0, help="sim seconds per wall second")
     ap.add_argument("--from", dest="t_from", type=float)
     ap.add_argument("--to", dest="t_to", type=float)
-    ap.add_argument("--max-frames", type=int, default=3000)
+    ap.add_argument("--max-frames", type=int, default=3000,
+                    help="cap on frames held in memory, NOT a frame rate (default 3000). "
+                         "Every body's pose for every frame is resident, so a long "
+                         "run over the cap is resampled onto fewer frames and plays "
+                         "coarser than it was recorded; raise it to play every frame")
     ap.add_argument("--no-running-gear", action="store_true",
                     help="drop track shoes, wheels, sprockets, idlers and suspension "
                          "(1905 of 3472 bodies in a 15-rank run) for frame rate")
@@ -843,6 +887,11 @@ def main():
                     help="ignore rank_*_scm.bin, i.e. draw the terrain undeformed")
     ap.add_argument("--scm-depth", type=float, default=0.08,
                     help="sinkage in metres that colours fully dark (default 0.08)")
+    ap.add_argument("--rut-nodes", type=int, default=2_000_000,
+                    help="grid points shared out between the ranks for their rut "
+                         "patches (default 2000000). One rank sweeps a box of ~6 M nodes "
+                         "at 0.02 m spacing, so the patches are decimated to fit; raise "
+                         "this for finer ruts at the cost of memory and frame rate")
     ap.add_argument("--no-scenery", action="store_true",
                     help="skip the terrain, rings, pad and decorative wall rocks")
     ap.add_argument("--terrain-margin", type=float, default=0.0,
@@ -886,7 +935,7 @@ def main():
 
     cache = MeshCache(local_roots(args.mesh_root))
     site_r = float(((meta or {}).get("site") or {}).get("collector_ring", 37.0))
-    actors, terrain_grid = build_scene(pl, bodies, cache, args.boxes, meta,
+    actors, terrain_grid, ground = build_scene(pl, bodies, cache, args.boxes, meta,
                          0 if args.no_terrain else args.terrain_decimate,
                          not args.no_scenery,
                          (site_r + args.terrain_margin) if args.terrain_margin > 0 else 0.0,
@@ -906,15 +955,23 @@ def main():
         if sources:
             gx, gy = terrain_grid.x[0, :, 0], terrain_grid.y[:, 0, 0]
             boxes = [snap_to_grid(src, gx, gy) for src in sources]
-            _terr, ground = terrain_mesh(meta, None, args.terrain_decimate, 0.0)
-            cut = blank_terrain_cells(terrain_grid, [b["cells"] for b in boxes])
+            # Patches FIRST, then cut the terrain only from under the ones that got built.
+            # Cutting from the boxes instead left a hole wherever a patch did not appear,
+            # and a hole in the ground shows the background: the ruts read as dark blue
+            # rectangles with no relief in them, which is not a subtle failure.
             patches = build_rut_patches(pl, sources, boxes, height_sampler(terrain_grid),
-                                        ground, args.scm_depth)
-            total = sum(p["nodes"] for p in patches)
-            print(f"deformation {len(patches)} rut patch(es) from rank_*_scm.bin at "
-                  f"{sources[0]['rate']:g} Hz, {total} deformed nodes, "
-                  + " + ".join(f"{p['shape'][1]}x{p['shape'][0]}" for p in patches)
-                  + f" grids; {cut} terrain cell(s) cut out beneath them")
+                                        ground or (0.55, 0.55, 0.52), args.scm_depth,
+                                        args.rut_nodes)
+            cut = blank_terrain_cells(terrain_grid, [p["cells"] for p in patches])
+            if patches:
+                grids = " + ".join(
+                    f"{p['cols']}x{p['rows']}@{p['stride'] * p['delta']:.3g}m"
+                    for p in patches)
+                print(f"deformation {len(patches)} rut patch(es) from rank_*_scm.bin at "
+                      f"{sources[0]['rate']:g} Hz, "
+                      f"{sum(p['nodes'] for p in patches)} deformed nodes, {grids} grids "
+                      f"({sources[0]['delta']:g} m nodes, decimated to fit --rut-nodes "
+                      f"{args.rut_nodes}); {cut} terrain cell(s) cut out beneath them")
     if not patches and ((meta or {}).get("terrain") or {}).get("model") == "scm":
         print("deformation none recorded -- terrain drawn as it started, no ruts")
 
@@ -987,6 +1044,9 @@ def main():
             print(f"focus       {bodies[focus]['group']}/{bodies[focus]['part']}")
 
     state = {"slot": 0, "playing": not off, "speed": args.speed, "follow": focus}
+    # Wall-clock playback cursor: `carry` is the fraction of a frame owed from the last
+    # tick, so a speed below the tick rate advances smoothly instead of stalling.
+    clock = {"last": None, "carry": 0.0}
     hud_actor = pl.add_text("", position="upper_left", font_size=10, color="#e2e8f0",
                             name="hud")
 
@@ -1050,30 +1110,100 @@ def main():
 
     def set_speed(mult):
         state["speed"] = max(0.05, min(64.0, state["speed"] * mult))
+        clock["carry"] = 0.0
+        hud()
+
+    def step(n):
+        """Scrub by n frames, and stop playing -- stepping into a running clock is no use.
+
+        The carry goes with it, or the fraction of a frame owed from the last tick lands
+        on top of the step the moment playback resumes.
+        """
+        state["playing"] = False
+        clock["carry"] = 0.0
+        show(state["slot"] + n)
+
+    def fly(right=0.0, ahead=0.0, up=0.0):
+        """WASD-style camera move on IJKL: eye and focal point travel together.
+
+        Movement is in the GROUND PLANE, not along the view vector. This camera looks down
+        at the site from 21 degrees, so flying along the view direction drives into the
+        dirt after a few presses; gliding over the terrain and changing height separately
+        is what actually gets you across a 200 m work area. u/o do the height.
+
+        The step scales with how far the camera is from what it is looking at, so one press
+        covers the same fraction of the frame whether the whole site is in view or one
+        machine is. Auto-repeat does the rest when a key is held.
+        """
+        pos = np.array(pl.camera.position, dtype=float)
+        foc = np.array(pl.camera.focal_point, dtype=float)
+        view = foc - pos
+        ahead_v = np.array([view[0], view[1], 0.0])
+        if np.linalg.norm(ahead_v) < 1e-6:
+            # Straight down (the top view): there is no forward in the ground plane, so
+            # take it from which way up is on screen instead.
+            cam_up = np.array(pl.camera.up, dtype=float)
+            ahead_v = np.array([cam_up[0], cam_up[1], 0.0])
+        norm = np.linalg.norm(ahead_v)
+        if norm < 1e-9:
+            return
+        ahead_v /= norm
+        right_v = np.array([ahead_v[1], -ahead_v[0], 0.0])  # ahead x world-up
+        delta = 0.08 * max(1.0, float(np.linalg.norm(view))) * (
+            right * right_v + ahead * ahead_v + up * np.array([0.0, 0.0, 1.0]))
+        # Any manual move drops follow, or show() snaps the camera back on the next frame.
+        state["follow"] = -1
+        set_cam([tuple(pos + delta), tuple(foc + delta), tuple(pl.camera.up)])
         hud()
 
     pl.add_key_event("space", lambda: (state.update(playing=not state["playing"]), hud()))
-    pl.add_key_event("Right", lambda: show(state["slot"] + 1))
-    pl.add_key_event("Left", lambda: show(state["slot"] - 1))
+    # Timeline on the arrows, camera on IJKL. They used to share: `i` framed the iso view,
+    # which is what `c` does, so nothing is lost by giving the letter to the camera.
+    # Up/Down stay on pyvista's own zoom, which is the one game-camera control it ships.
+    pl.add_key_event("Right", lambda: step(1))
+    pl.add_key_event("Left", lambda: step(-1))
+    pl.add_key_event("i", lambda: fly(ahead=1.0))
+    pl.add_key_event("k", lambda: fly(ahead=-1.0))
+    pl.add_key_event("j", lambda: fly(right=-1.0))
+    pl.add_key_event("l", lambda: fly(right=1.0))
+    pl.add_key_event("u", lambda: fly(up=1.0))
+    pl.add_key_event("o", lambda: fly(up=-1.0))
     pl.add_key_event("bracketright", lambda: set_speed(2.0))
     pl.add_key_event("bracketleft", lambda: set_speed(0.5))
     pl.add_key_event("r", lambda: show(0))
     pl.add_key_event("f", cycle_follow)
     pl.add_key_event("c", free_cam)
-    pl.add_key_event("i", free_cam)
     pl.add_key_event("t", top_cam)
 
-    # The timer fires at the playback rate, so --speed is honoured by advancing sim time
-    # per tick; a scene too heavy to keep up drops frames rather than playing in slow
+    # Playback runs off the WALL CLOCK, not one frame per tick. A repeating VTK timer's
+    # period is fixed when it is created, so "one frame per tick" pinned the rate to
+    # whatever --speed said at startup and [ ] only moved the number in the HUD. Advancing
+    # by the sim time that has actually elapsed means a speed change takes effect on the
+    # next tick, and a scene too heavy to keep up drops frames rather than playing in slow
     # motion, which is what you want when judging whether motion looks right.
     def tick(_step):
-        if state["playing"]:
-            show((state["slot"] + 1) % len(times))
+        now = time.perf_counter()
+        was, clock["last"] = clock["last"], now
+        if not state["playing"] or was is None:
+            return
+        # Capped: a stall -- a drag, a resize, a slow first frame -- must not fast-forward
+        # the run by however long it lasted.
+        clock["carry"] += min(0.5, now - was) * played * state["speed"]
+        step = int(clock["carry"])
+        if step:
+            clock["carry"] -= step
+            show((state["slot"] + step) % len(times))
 
-    interval = max(10, int(1000.0 / max(1.0, played * state["speed"])))
+    # pyvista renders on EVERY timer event whether the callback moved anything or not, so
+    # the tick rate is the render rate: hold it to the frame rate being played, between 10
+    # and 60 Hz. Faster speeds then advance several frames per tick rather than rendering
+    # more often than a screen can show.
+    interval = int(round(1000.0 / min(60.0, max(10.0, played * max(1.0, state["speed"])))))
     pl.add_timer_event(max_steps=10 ** 9, duration=interval, callback=tick)
-    print("keys        space play/pause | <- -> step | [ ] speed | t top | i iso | "
-          "f follow | c free | r restart | q quit")
+    print("keys        space play/pause | <- -> step a frame | [ ] speed\n"
+          "            ijkl fly the camera (i/k forward-back, j/l strafe) | uo up/down | "
+          "up/down zoom\n"
+          "            t top | c free | f follow the next machine | r restart | q quit")
     pl.show()
 
 
