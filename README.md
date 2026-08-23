@@ -396,9 +396,21 @@ The ruts get their own fine grid per rank rather than going onto the terrain: SC
 0.1 m apart and the heightmap is 4.0157 m per vertex, so ruts are forty times finer than
 the ground mesh and cannot be shown on it. Each patch spans only the bounding box its rank
 actually touched -- tens of thousands of points, against the ~100 million a 0.1 m grid over
-the full patch would need. Colour is sinkage against the undisturbed surface, with the
-zero end pinned to the terrain's own colour so undriven ground is invisible and your eye
-finds the tracks; `--scm-depth` sets what counts as fully dark. Scrubbing backwards rewinds
+the full patch would need.
+
+The terrain cells beneath each patch are CUT OUT, and the patch is snapped to whole terrain
+cells so that it can be. This matters more than it sounds: biasing one of two coincident
+surfaces -- polygon offset, a millimetre lift -- only settles the depth-buffer tie, and
+leaves two lots of geometry and shading in the same place, which at site distances reads as
+a rectangular slab hovering over the ground. Removing the covered cells leaves one surface.
+The seam is invisible because along a shared cell edge the patch's bilinear base collapses
+to linear interpolation between the same two corner heights the coarse edge uses -- exact,
+but only if the patch boundary is a cell boundary.
+
+Colour is sinkage against the undisturbed surface, with the zero end pinned to the
+terrain's own colour so undriven ground is invisible and the eye finds the tracks;
+`--scm-depth` sets what counts as fully dark. Cumulative keyframes are handled implicitly:
+heights are absolute, so re-applying a full dump is idempotent. Scrubbing backwards rewinds
 to pristine and replays, so a scrubbed frame matches the same frame reached by playing
 forward. `--no-scm` draws the terrain undeformed.
 

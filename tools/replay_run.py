@@ -531,19 +531,9 @@ def rut_colormap(ground):
     return [ground, "#7d776b", "#655e51", "#4c4539", "#332d24", "#1f1a14"]
 
 
-def scm_patches(pl, directory, ranks, sample_base, ground, clim, lift, max_nodes=4_000_000):
-    """One fine grid per rank covering the nodes that rank ever deformed.
-
-    Separate from the terrain on purpose. The heightmap is 4.0157 m per vertex and SCM
-    nodes are 0.1 m apart, so ruts are forty times finer than the ground mesh and cannot
-    be shown on it. Each patch spans only the bounding box its rank actually touched --
-    tens of thousands of points, not the 100 million a 0.1 m grid over the whole patch
-    would need.
-
-    Drawn with polygon-offset resolution so it never z-fights the terrain underneath: the
-    two surfaces agree exactly wherever nothing has driven, which is most of the patch.
-    """
-    patches = []
+def scm_sources(directory, ranks):
+    """Read every rank_<r>_scm.bin once: nodes, plus the index box each rank ever touched."""
+    out = []
     for rank in ranks:
         path = os.path.join(directory, f"rank_{rank}_scm.bin")
         if not os.path.exists(path):
@@ -559,14 +549,81 @@ def scm_patches(pl, directory, ranks, sample_base, ground, clim, lift, max_nodes
                 and abs(plane[3] - 1.0) < 1e-9):
             print(f"  ! {os.path.basename(path)}: patch plane is not the identity; rut "
                   f"heights are drawn as world z anyway", file=sys.stderr)
+        ii = np.concatenate([f[1] for f in frames])
+        jj = np.concatenate([f[2] for f in frames])
+        out.append({
+            "rank": rank, "delta": delta, "rate": rate, "frames": frames,
+            "i0": int(ii.min()), "i1": int(ii.max()),
+            "j0": int(jj.min()), "j1": int(jj.max()),
+            "nodes": int(len(set(zip(ii.tolist(), jj.tolist())))),
+        })
+    return out
 
-        all_i = np.concatenate([f[1] for f in frames])
-        all_j = np.concatenate([f[2] for f in frames])
-        i0, i1 = int(all_i.min()) - 2, int(all_i.max()) + 2
-        j0, j1 = int(all_j.min()) - 2, int(all_j.max()) + 2
+
+def snap_to_grid(src, gx, gy):
+    """Grow a source's index box out to whole terrain cells, and give the world box.
+
+    Snapping is what makes the seam invisible. Along a shared cell edge the patch's
+    bilinear base collapses to linear interpolation between the same two corner heights the
+    coarse edge uses, so patch and terrain meet exactly -- but only if the patch boundary
+    IS a cell boundary. Cut on an arbitrary line and the two surfaces disagree across it.
+    """
+    d = src["delta"]
+    x0, x1 = src["i0"] * d, src["i1"] * d
+    y0, y1 = src["j0"] * d, src["j1"] * d
+    cx0 = int(np.clip(np.searchsorted(gx, x0) - 1, 0, len(gx) - 2))
+    cx1 = int(np.clip(np.searchsorted(gx, x1), 1, len(gx) - 1))
+    cy0 = int(np.clip(np.searchsorted(gy, y0) - 1, 0, len(gy) - 2))
+    cy1 = int(np.clip(np.searchsorted(gy, y1), 1, len(gy) - 1))
+    wx0, wx1, wy0, wy1 = gx[cx0], gx[cx1], gy[cy0], gy[cy1]
+    return {
+        "i0": int(math.floor(wx0 / d + 0.5)), "i1": int(math.floor(wx1 / d + 0.5)),
+        "j0": int(math.floor(wy0 / d + 0.5)), "j1": int(math.floor(wy1 / d + 0.5)),
+        "cells": (cx0, cx1, cy0, cy1), "world": (wx0, wx1, wy0, wy1),
+    }
+
+
+def blank_terrain_cells(grid, boxes):
+    """Hide the terrain cells the rut patches replace, so no two surfaces coincide.
+
+    Biasing one surface over the other -- polygon offset, a millimetre lift -- only hides
+    the depth-buffer tie; it leaves two lots of geometry and shading in the same place, and
+    at site distances that reads as a rectangular slab hovering over the ground, which is
+    exactly what it looked like. Removing the covered cells leaves one surface everywhere.
+    """
+    if not boxes:
+        return 0
+    rows, cols = grid.dimensions[0], grid.dimensions[1]
+    mask = np.zeros((rows - 1) * (cols - 1), dtype=bool)
+    for cx0, cx1, cy0, cy1 in boxes:
+        for col in range(cx0, cx1):
+            lo = col * (rows - 1) + cy0
+            hi = col * (rows - 1) + cy1
+            mask[lo:hi] = True
+    if mask.any():
+        grid.hide_cells(mask, inplace=True)
+    return int(mask.sum())
+
+
+def build_rut_patches(pl, sources, boxes, sample_base, ground, clim, max_nodes=4_000_000):
+    """One fine grid per rank covering the nodes that rank ever deformed.
+
+    Separate from the terrain on purpose. The heightmap is 4.0157 m per vertex and SCM
+    nodes are 0.1 m apart, so ruts are forty times finer than the ground mesh and cannot
+    be shown on it. Each patch spans only the bounding box its rank actually touched --
+    tens of thousands of points, not the 100 million a 0.1 m grid over the whole patch
+    would need.
+
+    Drawn with polygon-offset resolution so it never z-fights the terrain underneath: the
+    two surfaces agree exactly wherever nothing has driven, which is most of the patch.
+    """
+    patches = []
+    for src, box in zip(sources, boxes):
+        delta, frames, rate = src["delta"], src["frames"], src["rate"]
+        i0, i1, j0, j1 = box["i0"], box["i1"], box["j0"], box["j1"]
         cols, rows = i1 - i0 + 1, j1 - j0 + 1
         if rows * cols > max_nodes:
-            print(f"  ! rank {rank} deformation spans {cols}x{rows} nodes, over the "
+            print(f"  ! rank {src['rank']} deformation spans {cols}x{rows} nodes, over the "
                   f"{max_nodes} cap; skipped", file=sys.stderr)
             continue
 
@@ -576,26 +633,17 @@ def scm_patches(pl, directory, ranks, sample_base, ground, clim, lift, max_nodes
         y = (np.arange(j0, j1 + 1)) * delta
         xx, yy = np.meshgrid(x, y)
         base = sample_base(xx.ravel(), yy.ravel()).reshape(yy.shape)
-        grid = pv.StructuredGrid(xx, yy, base + lift)
+        grid = pv.StructuredGrid(xx, yy, base.copy())
         grid["sinkage"] = np.zeros(base.size)
-        actor = pl.add_mesh(grid, scalars="sinkage", cmap=rut_colormap(ground),
-                            clim=(0.0, max(1e-3, clim)), show_scalar_bar=False,
-                            smooth_shading=True, specular=0.05)
-        # Coincident-surface handling, belt and braces. The patch and the terrain agree
-        # exactly wherever nothing has driven, and a tie in the depth buffer speckles.
-        # Polygon offset biases this surface towards the camera; the millimetre lift is
-        # there because offset alone still speckled at site distances. Both shift the
-        # patch as a whole, so rut DEPTH -- the quantity being read -- is untouched.
-        try:
-            actor.mapper.SetResolveCoincidentTopologyToPolygonOffset()
-            actor.mapper.SetRelativeCoincidentTopologyPolygonOffsetParameters(0.0, -12.0)
-        except AttributeError:
-            pass
+        # No offset, no lift: the terrain cells underneath are removed, so this is the
+        # only surface here and there is nothing to tie with.
+        pl.add_mesh(grid, scalars="sinkage", cmap=rut_colormap(ground),
+                    clim=(0.0, max(1e-3, clim)), show_scalar_bar=False,
+                    smooth_shading=True, specular=0.05)
         patches.append({
-            "rank": rank, "grid": grid, "base": base + lift, "true_base": base,
-            "lift": lift, "i0": i0, "j0": j0,
+            "rank": src["rank"], "grid": grid, "base": base, "i0": i0, "j0": j0,
             "shape": (rows, cols), "frames": frames, "cursor": 0, "time": -1.0,
-            "rate": rate, "nodes": int(len(set(zip(all_i.tolist(), all_j.tolist())))),
+            "rate": rate, "nodes": src["nodes"],
         })
     return patches
 
@@ -622,9 +670,8 @@ def apply_scm(patches, t):
             flat = (jj - p["j0"]) * cols + (ii - p["i0"])
             ok = (flat >= 0) & (flat < rows * cols)
             idx = flat[ok]
-            z[idx] = zz[ok] + p["lift"]
-            # Sinkage against the UNLIFTED surface, so the colour reads true depth.
-            sink[idx] = p["true_base"].ravel()[idx] - zz[ok]
+            z[idx] = zz[ok]
+            sink[idx] = p["base"].ravel()[idx] - zz[ok]
             p["cursor"] += 1
             moved = True
         p["time"] = t
@@ -660,14 +707,14 @@ def build_scene(pl, bodies, cache, boxes_only, meta, terrain_decimate, scenery,
         actors.append(actor)
 
     if not scenery:
-        return actors
+        return actors, None
 
     # The rings are not circles: each is 180 little boxes laid ON the terrain, following
     # its height, and the pad and the decorative wall rocks are recorded the same way.
     # Drawing them from the record is the only way they land where the run had them --
     # a synthetic flat circle at a guessed height is wrong by metres on a hillside.
     props = static_props(directory)
-    drew_terrain = False
+    drew_terrain = False  # becomes the terrain grid once one is drawn
     for prop in props:
         shapes = prop.get("shapes", [])
         is_patch = len(shapes) == 1 and shapes[0].get("type") == "trimesh" and not shapes[0].get("file")
@@ -677,7 +724,7 @@ def build_scene(pl, bodies, cache, boxes_only, meta, terrain_decimate, scenery,
             terr, colour = terrain_mesh(meta, prop, terrain_decimate, terrain_radius)
             if terr is not None:
                 pl.add_mesh(terr, color=colour, smooth_shading=True, specular=0.05)
-                drew_terrain = True
+                drew_terrain = terr
             continue
         colour = next((tuple(s["color"]) for s in shapes if s.get("color")), "#94a3b8")
         mesh = merged(prop)
@@ -692,11 +739,12 @@ def build_scene(pl, bodies, cache, boxes_only, meta, terrain_decimate, scenery,
     # the moment ExcludeExisting() runs. Its height field is still the same image, so the
     # surface is rebuilt from the metadata instead -- with the caveat that this is the
     # terrain as it STARTED. SCM deforms, and ruts do not show here.
-    if terrain_decimate and not drew_terrain:
+    if terrain_decimate and drew_terrain is False:
         terr, colour = terrain_mesh(meta, None, terrain_decimate, terrain_radius)
         if terr is not None:
             pl.add_mesh(terr, color=colour, smooth_shading=True, specular=0.05)
-    return actors
+            drew_terrain = terr
+    return actors, (drew_terrain if drew_terrain is not False else None)
 
 
 def apply_frame(actors, poses, slot):
@@ -742,9 +790,6 @@ def main():
                     help="ignore rank_*_scm.bin, i.e. draw the terrain undeformed")
     ap.add_argument("--scm-depth", type=float, default=0.08,
                     help="sinkage in metres that colours fully dark (default 0.08)")
-    ap.add_argument("--scm-lift", type=float, default=0.004,
-                    help="metres the rut patch is raised to beat depth-buffer ties with "
-                         "the terrain; shifts the patch, not the rut depths (default 0.004)")
     ap.add_argument("--no-scenery", action="store_true",
                     help="skip the terrain, rings, pad and decorative wall rocks")
     ap.add_argument("--terrain-margin", type=float, default=0.0,
@@ -788,7 +833,7 @@ def main():
 
     cache = MeshCache(local_roots(args.mesh_root))
     site_r = float(((meta or {}).get("site") or {}).get("collector_ring", 37.0))
-    actors = build_scene(pl, bodies, cache, args.boxes, meta,
+    actors, terrain_grid = build_scene(pl, bodies, cache, args.boxes, meta,
                          0 if args.no_terrain else args.terrain_decimate,
                          not args.no_scenery,
                          (site_r + args.terrain_margin) if args.terrain_margin > 0 else 0.0,
@@ -803,17 +848,21 @@ def main():
     # Rut patches, on the same surface the terrain was rebuilt from so the base heights
     # they measure sinkage against are the terrain's own.
     patches = []
-    if not args.no_scm and not args.no_terrain:
-        full, ground = terrain_mesh(meta, None, 1, 0.0)
-        if full is not None:
-            patches = scm_patches(pl, args.directory, ranks, height_sampler(full), ground,
-                                  args.scm_depth, args.scm_lift)
-    if patches:
-        total = sum(p["nodes"] for p in patches)
-        print(f"deformation {len(patches)} rut patch(es) from rank_*_scm.bin at "
-              f"{patches[0]['rate']:g} Hz, {total} deformed nodes, "
-              + " + ".join(f"{p['shape'][1]}x{p['shape'][0]}" for p in patches) + " grids")
-    elif ((meta or {}).get("terrain") or {}).get("model") == "scm":
+    if not args.no_scm and terrain_grid is not None:
+        sources = scm_sources(args.directory, ranks)
+        if sources:
+            gx, gy = terrain_grid.x[0, :, 0], terrain_grid.y[:, 0, 0]
+            boxes = [snap_to_grid(src, gx, gy) for src in sources]
+            _terr, ground = terrain_mesh(meta, None, args.terrain_decimate, 0.0)
+            cut = blank_terrain_cells(terrain_grid, [b["cells"] for b in boxes])
+            patches = build_rut_patches(pl, sources, boxes, height_sampler(terrain_grid),
+                                        ground, args.scm_depth)
+            total = sum(p["nodes"] for p in patches)
+            print(f"deformation {len(patches)} rut patch(es) from rank_*_scm.bin at "
+                  f"{sources[0]['rate']:g} Hz, {total} deformed nodes, "
+                  + " + ".join(f"{p['shape'][1]}x{p['shape'][0]}" for p in patches)
+                  + f" grids; {cut} terrain cell(s) cut out beneath them")
+    if not patches and ((meta or {}).get("terrain") or {}).get("model") == "scm":
         print("deformation none recorded -- terrain drawn as it started, no ruts")
 
     site = (meta or {}).get("site") or {}
