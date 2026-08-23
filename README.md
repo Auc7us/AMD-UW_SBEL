@@ -377,8 +377,30 @@ still missing is drawn as a box rather than skipped.
 
 An SCM run records no terrain patch -- the deformable terrain is not a static visual when
 `ExcludeExisting()` runs -- so the surface is rebuilt from the heightmap named in the
-metadata instead. Note what that means: it is the terrain as it STARTED. SCM deforms, and
-ruts do not show.
+metadata instead.
+
+Deformation is read from `rank_<r>_scm.bin` when the recording carries it, and the ruts are
+drawn. Those files are a near-passthrough of `SCMTerrain::GetModifiedNodes()`:
+
+```text
+header  8s "AMDUWSCM", u32 version, u32 rank, f64 rate_hz, f64 delta,
+        f64 plane[7] (pos xyz + quat wxyz), i32 nx, i32 ny
+frame   u32 0x4D435353, f64 time, u32 count, count * (i32 i, i32 j, f32 z)
+```
+
+Node `(i,j)` sits at `(i*delta, j*delta)` in the patch plane frame, heights are absolute,
+and each frame carries only the nodes modified since the last -- so a consumer accumulates,
+and a dropped sample leaves the ground slightly stale rather than permanently wrong.
+
+The ruts get their own fine grid per rank rather than going onto the terrain: SCM nodes are
+0.1 m apart and the heightmap is 4.0157 m per vertex, so ruts are forty times finer than
+the ground mesh and cannot be shown on it. Each patch spans only the bounding box its rank
+actually touched -- tens of thousands of points, against the ~100 million a 0.1 m grid over
+the full patch would need. Colour is sinkage against the undisturbed surface, with the
+zero end pinned to the terrain's own colour so undriven ground is invisible and your eye
+finds the tracks; `--scm-depth` sets what counts as fully dark. Scrubbing backwards rewinds
+to pristine and replays, so a scrubbed frame matches the same frame reached by playing
+forward. `--no-scm` draws the terrain undeformed.
 
 It is 1:1 with what the sim drew, and that takes more than loading the OBJ files. Every
 mesh is fitted to the bounding box the recorder captured, because -- as TrajectoryRecorder
