@@ -1021,11 +1021,23 @@ int main(int argc, char* argv[]) {
     // terrain_height_offset == 0 asks for; RigidTerrain took that offset as a patch
     // coordsys, SCM would take it via SetReferenceFrame. Left implicit while the offset
     // is zero rather than writing an identity transform.
-    SCMTerrain terrain(system, scm_visualization_mesh);
-    terrain.SetSoilParameters(scm_bekker_kphi, scm_bekker_kc, scm_bekker_n, scm_mohr_cohesion, scm_mohr_friction,
+    // Built ONLY on a rank that reads it. A robot rank ray-casts its wheels, shoes and rocks
+    // against the grid; rank 0 needs it when its camera has to draw ground. A rank 0 running
+    // --no_sensor does neither: it renders nothing and owns no vehicle, so every one of the
+    // (2*nx+1)^2 nodes it allocates is written once by Initialize and never read again.
+    // That copy is the single largest allocation on the rank -- 0.39 GiB at 0.1 m spacing,
+    // 9.95 GiB at 0.02 m -- and dropping it is what decides how many ranks fit in RAM,
+    // because every rank builds its own full-patch copy.
+    const bool needs_terrain = owns_robot || draws_zombies;
+    std::unique_ptr<SCMTerrain> terrain;
+    if (needs_terrain)
+        terrain = std::make_unique<SCMTerrain>(system, scm_visualization_mesh);
+    if (needs_terrain) {
+    terrain->SetSoilParameters(scm_bekker_kphi, scm_bekker_kc, scm_bekker_n, scm_mohr_cohesion, scm_mohr_friction,
                              scm_janosi_shear, scm_elastic_k, scm_damping_r);
-    terrain.Initialize(amd_uw_data_path + terrain_heightmap_file, terrain_length, terrain_width, terrain_min_height,
+    terrain->Initialize(amd_uw_data_path + terrain_heightmap_file, terrain_length, terrain_width, terrain_min_height,
                        terrain_max_height, terrain_scm_delta);
+    }
     if (scm_visualization_mesh) {
         // Ground that looks like ground, as the rigid patch did. GetMesh() is the one
         // visual shape SCM owns, so the Hapke material goes straight on it -- there is no
@@ -1036,8 +1048,8 @@ int main(int argc, char* argv[]) {
         // vertex, which would override this. For soil debugging rather than rendering, add
         //   terrain.SetPlotType(SCMTerrain::PLOT_SINKAGE, 0.0, 0.10);
         // before Initialize() and drop the material below.
-        terrain.SetColor(ChColor(0.55f, 0.55f, 0.52f));
-        if (auto mesh = terrain.GetMesh()) {
+        terrain->SetColor(ChColor(0.55f, 0.55f, 0.52f));
+        if (auto mesh = terrain->GetMesh()) {
             mesh->SetWireframe(false);
             mesh->AddMaterial(CreateLunarHapkeMaterial());
         }
@@ -1045,18 +1057,21 @@ int main(int argc, char* argv[]) {
 #ifdef CHRONO_HAS_SCM_GPU
     // Chrono defaults this ON; we gate it on the flag so a run states which ray-cast path
     // it used instead of inheriting one. See --scm_raycast_gpu.
-    terrain.EnableRaycastGpuHip(scm_raycast_gpu);
-    {
+    if (needs_terrain) {
+        terrain->EnableRaycastGpuHip(scm_raycast_gpu);
         // Config::enabled already defaults to true; min_hits is what actually gates the path.
-        scm_gpu::Config gpu_cfg = terrain.GetScmGpuConfig();
+        scm_gpu::Config gpu_cfg = terrain->GetScmGpuConfig();
         gpu_cfg.min_hits = static_cast<std::size_t>(std::max(1, scm_gpu_min_hits));
-        terrain.SetScmGpuConfig(gpu_cfg);
+        terrain->SetScmGpuConfig(gpu_cfg);
     }
 #endif
     if (rank == 0) {
         SynLog() << "SCM terrain: " << terrain_length << " x " << terrain_width << " m at "
                  << terrain_scm_delta << " m grid (" << terrain_heightmap_file << "), visualization mesh "
                  << (scm_visualization_mesh ? "ON" : "OFF") << ".\n";
+        if (!needs_terrain)
+            SynLog() << "SCM terrain: NOT built on rank 0 (headless: --no_sensor). Robot ranks are "
+                        "unaffected; this rank steps no soil.\n";
 #ifdef CHRONO_HAS_SCM_GPU
         SynLog() << "SCM ray-cast: HIP GPU backend " << (scm_raycast_gpu ? "ENABLED" : "disabled")
                  << " (--scm_raycast_gpu).\n";
@@ -1077,19 +1092,24 @@ int main(int argc, char* argv[]) {
     // ray, so the z of the query point is ignored -- kept because every helper below,
     // and RobotRig/RockField, take it as an argument.
     const double height_probe_z = terrain_height_offset + terrain_max_height + terrain_height_probe_clearance;
-    AddOrbitVisualRing(system, terrain, site_center_x, site_center_y, work_circle_radius, height_probe_z,
+    // All of these are fixed, collision-free markers seated by probing terrain heights, so
+    // they exist only to be looked at. A rank with no terrain has neither the probe nor a
+    // viewer; skipping them costs it nothing and keeps every remaining terrain use guarded.
+    if (needs_terrain) {
+    AddOrbitVisualRing(system, *terrain, site_center_x, site_center_y, work_circle_radius, height_probe_z,
                        ChColor(0.95f, 0.75f, 0.10f), "work_circle");
-    AddOrbitVisualRing(system, terrain, site_center_x, site_center_y, builder_path_radius, height_probe_z,
+    AddOrbitVisualRing(system, *terrain, site_center_x, site_center_y, builder_path_radius, height_probe_z,
                        ChColor(0.10f, 0.65f, 0.95f), "builder_path");
-    AddOrbitVisualRing(system, terrain, site_center_x, site_center_y, robot_start_radius, height_probe_z,
+    AddOrbitVisualRing(system, *terrain, site_center_x, site_center_y, robot_start_radius, height_probe_z,
                        ChColor(0.20f, 0.90f, 0.35f), "collector_ring");
-    AddCenterPad(system, terrain, height_probe_z);
+    AddCenterPad(system, *terrain, height_probe_z);
     // AddSpawnRockClumps is deliberately NOT called. It puts ~90 decorative rocks per rank
     // in the builder's working area, and now that the builder works from a single seed heap
     // and then from whatever its collector actually delivers, that dressing reads as
     // feedstock the builder is ignoring. The function is kept -- it is the site-dressing
     // pass to re-enable for a wide establishing shot, where nothing is being picked up.
-    AddPlacedWallRocks(system, terrain, chrono_data_path, num_robot_ranks, height_probe_z);
+    AddPlacedWallRocks(system, *terrain, chrono_data_path, num_robot_ranks, height_probe_z);
+    }
 
     // SCM must own at least one active domain on EVERY rank that steps the system, and
     // rank 0 steps it (see the sim loop's else branch) while owning no robot to hang a
@@ -1103,14 +1123,14 @@ int main(int argc, char* argv[]) {
     // with soil under them. So the honest domain here is a degenerate one -- a 1 cm box
     // on a marker body at the site centre, one ray cast per step -- which says "this
     // rank's regolith is scenery" rather than paying for soil nobody integrates.
-    if (!owns_robot) {
+    if (!owns_robot && needs_terrain) {
         auto scm_marker = chrono_types::make_shared<ChBody>();
         scm_marker->SetName("scm_inert_domain_marker");
         scm_marker->SetFixed(true);
         scm_marker->EnableCollision(false);
         scm_marker->SetPos(ChVector3d(site_center_x, site_center_y, height_probe_z));
         system->AddBody(scm_marker);
-        terrain.AddActiveDomain(scm_marker, VNULL, ChVector3d(0.01, 0.01, 0.01));
+        terrain->AddActiveDomain(scm_marker, VNULL, ChVector3d(0.01, 0.01, 0.01));
     }
 
     auto rock_mat = MakeContactMaterial(contact_method, 0.9f, 0.0f);
@@ -1146,12 +1166,12 @@ int main(int argc, char* argv[]) {
     const double scm_delta_actual = terrain_length / (2.0 * scm_nx);
     if (owns_robot && !record_dir.empty() && scm_record_rate_hz > 0.0) {
         scm_recorder = std::make_unique<ScmRecorder>(record_dir, rank, scm_record_rate_hz,
-                                                     scm_keyframe_period, &terrain, scm_delta_actual,
+                                                     scm_keyframe_period, terrain.get(), scm_delta_actual,
                                                      scm_nx, scm_ny);
     }
 
     if (owns_robot) {
-        robot->InitializeOnTerrain(terrain, rock_mat, chrono_data_path, amd_uw_data_path, height_probe_z,
+        robot->InitializeOnTerrain(*terrain, rock_mat, chrono_data_path, amd_uw_data_path, height_probe_z,
                                    vehicle_start_clearance, seat_clearance, settle_time, step_size, rock_field_config);
     }
 
@@ -1209,7 +1229,7 @@ int main(int argc, char* argv[]) {
         const double builder_heading =
             BuilderOrbitHeadingRad(builder_index, num_robot_ranks);
         const BuilderSeating seating =
-            SeatBuilderOnTerrainPlane(terrain, builder_ground.x(), builder_ground.y(), builder_heading,
+            SeatBuilderOnTerrainPlane(*terrain, builder_ground.x(), builder_ground.y(), builder_heading,
                                       builder_ride_height, height_probe_z);
         SynLog() << "Rank " << rank << " builder seating: terrain tilt " << seating.tilt_deg
                  << " deg, worst error level=" << seating.level_error << " m -> plane="
@@ -1222,7 +1242,7 @@ int main(int argc, char* argv[]) {
         BuilderRig::Options plan_options = builder_options;
         const int wall_slot_count = BuilderWallSlotCount(num_robot_ranks);
         builder_pile_rocks =
-            AddBuilderPileRocks(system, terrain, rock_mat, chrono_data_path, amd_uw_data_path, builder_index,
+            AddBuilderPileRocks(system, *terrain, rock_mat, chrono_data_path, amd_uw_data_path, builder_index,
                                 num_robot_ranks, builder_seed_rock_count, height_probe_z, rock_field_config);
         plan_options.seed_rocks = builder_pile_rocks;
         for (int slot = 0; slot < wall_slot_count; ++slot) {
@@ -1230,7 +1250,7 @@ int main(int argc, char* argv[]) {
             // Release height above the terrain at that slot: the rock is let go from rest
             // and drops the last little bit, so it seats itself instead of being pressed
             // into the regolith by the fingers.
-            p.z() = terrain.GetHeight(ChVector3d(p.x(), p.y(), height_probe_z)) + 0.20;
+            p.z() = terrain->GetHeight(ChVector3d(p.x(), p.y(), height_probe_z)) + 0.20;
             plan_options.wall_slots.push_back(p);
         }
         SynLog() << "Rank " << rank << " build plan: " << wall_slot_count << " wall slots at "
@@ -1327,10 +1347,10 @@ int main(int argc, char* argv[]) {
         {
             const ChVector3d hull_domain_center(-2.2, 0.0, -0.4);
             const ChVector3d hull_domain_dims(7.5, 4.5, 3.0);
-            terrain.AddActiveDomain(builder->GetVehicle()->GetChassisBody(), hull_domain_center, hull_domain_dims);
+            terrain->AddActiveDomain(builder->GetVehicle()->GetChassisBody(), hull_domain_center, hull_domain_dims);
             const ChVector3d rock_domain(1.0, 1.0, 1.0);
             for (const auto& rock : builder_pile_rocks)
-                terrain.AddActiveDomain(rock, ChVector3d(0.0, 0.0, 0.3), rock_domain);
+                terrain->AddActiveDomain(rock, ChVector3d(0.0, 0.0, 0.3), rock_domain);
             SynLog() << "Rank " << rank << " SCM active domains: 1 builder hull ("
                      << hull_domain_dims.x() << " x " << hull_domain_dims.y() << " m) + "
                      << builder_pile_rocks.size() << " seed rocks.\n";
@@ -1587,7 +1607,7 @@ int main(int argc, char* argv[]) {
         vsg_app->EnableShadows();
         vsg_app->AttachVehicle(robot->GetVehicle());
         vsg_app->AttachDriver(robot->GetDriver());
-        vsg_app->AttachTerrain(&terrain);
+        vsg_app->AttachTerrain(terrain.get());
         // The builder is already in this system, so it renders with no extra
         // attachment and the rover chase camera keeps its original target.
         vsg_app->Initialize();
@@ -1637,7 +1657,7 @@ int main(int argc, char* argv[]) {
         if (owns_robot) {
             {
                 ScopedTimer timer(perf_accum.robot_sync);
-                robot->Synchronize(time, terrain);
+                robot->Synchronize(time, *terrain);
             }
             {
                 ScopedTimer timer(perf_accum.bldr_sync);
@@ -1693,9 +1713,9 @@ int main(int argc, char* argv[]) {
             const DriverInputs driver_inputs = robot->GetDriverInputs();
             {
                 ScopedTimer timer(perf_accum.robot_sync);
-                terrain.Synchronize(time);
+                terrain->Synchronize(time);
                 app.Synchronize(time, driver_inputs);
-                terrain.Advance(step_size);
+                terrain->Advance(step_size);
             }
             // Every Synchronize is done; now advance subsystems, then step the one
             // shared system exactly once. The builder advances first because
@@ -1710,7 +1730,7 @@ int main(int argc, char* argv[]) {
                 robot->Advance(step_size);
                 app.Advance(step_size);
             }
-            robot->LogMotionIfNeeded(step_number, motion_log_steps, terrain);
+            robot->LogMotionIfNeeded(step_number, motion_log_steps, *terrain);
 
             // A rank whose physics has gone non-finite is not going to recover, and
             // every rank is in MPI lockstep, so letting it run wastes the whole job:
@@ -1728,8 +1748,10 @@ int main(int argc, char* argv[]) {
             }
         } else {
             ScopedTimer timer(perf_accum.robot_adv);
-            terrain.Synchronize(time);
-            terrain.Advance(step_size);
+            if (terrain) {
+                terrain->Synchronize(time);
+                terrain->Advance(step_size);
+            }
             system->DoStepDynamics(step_size);
         }
 
@@ -1814,10 +1836,10 @@ int main(int argc, char* argv[]) {
     // A run that asked for the GPU and reports 0 steps did every ray cast on the CPU.
 #ifdef CHRONO_HAS_SCM_GPU
     if (owns_robot) {
-        const int gpu_steps = terrain.GetNumRaycastGpuSteps();
+        const int gpu_steps = terrain->GetNumRaycastGpuSteps();
         SynLog() << "Rank " << rank << " SCM ray-cast: " << gpu_steps << " of " << step_number
                  << " steps ran on the GPU (" << (step_number > 0 ? 100.0 * gpu_steps / step_number : 0.0)
-                 << "%); contact-force GPU steps " << terrain.GetNumContactForceGpuSteps() << ".\n";
+                 << "%); contact-force GPU steps " << terrain->GetNumContactForceGpuSteps() << ".\n";
     }
 #endif
 
