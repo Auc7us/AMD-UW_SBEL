@@ -539,7 +539,7 @@ def main():
     ring = float(site.get("collector_ring", 37.0))
     pl.enable_lightkit()
 
-    def frame_radius(radius, focal, elev_deg=32.0, azim_deg=-135.0, fill=0.88):
+    def frame_radius(radius, focal, elev_deg=21.0, azim_deg=-135.0, fill=0.88):
         """Camera that fits a circle of `radius` about `focal` into the window.
 
         Derived from the site, NOT from the scene bounds. Those are two different things
