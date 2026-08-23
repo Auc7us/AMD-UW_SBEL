@@ -43,7 +43,9 @@ add_executable(demo_SYN_construction
     src/MaterialUtils.cpp
     src/RobotRig.cpp
     src/RockField.cpp
+    src/ScmRecorder.cpp
     src/SynAgents.cpp
+    src/TrackSoilMesh.cpp
     src/TrajectoryRecorder.cpp)
 
 if(AMD_UW_ENABLE_ROS2)

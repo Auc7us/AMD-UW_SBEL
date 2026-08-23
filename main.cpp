@@ -54,9 +54,11 @@
 #include "src/LrvArm.h"
 #include "src/MaterialUtils.h"
 #include "src/RockField.h"
+#include "src/ScmRecorder.h"
 #include "src/RobotLayout.h"
 #include "src/RobotRig.h"
 #include "src/SynAgents.h"
+#include "src/TrackSoilMesh.h"
 #include "src/TrajectoryRecorder.h"
 
 using namespace chrono;
@@ -85,6 +87,15 @@ double perf_log_period = 0.0;
 // as animation; anything below the target frame rate has to be interpolated, and rocks
 // tipping out of a bed do not interpolate well.
 double record_rate_hz = 60.0;
+// Deformed-ground capture rate. Far below record_rate_hz on purpose: the SCM file carries
+// only nodes whose height CHANGED since the previous sample, so a higher rate refines when
+// a rut appeared, never whether it appeared.
+double scm_record_rate_hz = 10.0;
+// How often the SCM file re-states every deformed node instead of only the changes. Needs
+// no flag in the format: heights are absolute and a consumer accumulates by overwrite, so
+// a full re-statement is idempotent with the diffs around it -- it just lets a consumer
+// seek, or survive a dropped frame, without replaying from t=0.
+const double scm_keyframe_period = 5.0;
 
 const double terrain_resolution_scale = 4.0;
 const double terrain_pixels_x = 256.0;
@@ -781,6 +792,28 @@ void AddCommandLineOptions(ChCLI& cli) {
     cli.AddOption<bool>("Diagnostics", "no_build",
                         "Builder drives its lane but never picks or places (cost/divergence "
                         "bisection)");
+    // SCM's HIP ray-cast backend.
+    //
+    // It is not a free speedup, it is a DIFFERENT SET OF BODIES. When it succeeds it
+    // replaces the CPU ray-cast loop for that whole step (SCMTerrain.cpp ~1446), and it
+    // only ever intersects ChCollisionShape::TRIANGLEMESH. Everything that has to feel
+    // soil now carries one: the lugged tyres (Polaris_LuggedTire.json), the rocks
+    // (RockField.cpp), and the track shoes' soil-facing pads (TrackSoilMesh.cpp).
+    //
+    // The M113 CHASSIS is still a convex hull, deliberately: the hull only reaches soil
+    // if the vehicle has bellied out, which is its own bug. Under this flag such a
+    // belly-out would sink rather than be supported.
+    cli.AddOption<bool>("Simulation", "scm_raycast_gpu",
+                        "Use SCM's HIP GPU ray-cast backend (needs triangle-mesh collision "
+                        "geometry on every body that must feel soil; the M113 chassis hull is "
+                        "excluded, so a bellied-out hull would sink)");
+    // SCM's contact-force GPU backend is enabled by default in Chrono but only fires on a step
+    // whose hit count reaches scm_gpu::Config::min_hits (8192). Our footprints are far smaller
+    // than that at delta=0.10, so the path never runs. Expose the threshold so a run can measure
+    // whether the GPU wins at our hit counts instead of assuming Chrono's default applies here.
+    cli.AddOption<int>("Simulation", "scm_gpu_min_hits",
+                       "Hit-count threshold above which SCM's contact-force GPU backend runs "
+                       "(Chrono default 8192; lower it to let smaller footprints qualify)", "8192");
     cli.AddOption<std::string>("Diagnostics", "solver", "Robot-rank solver: bb, apgd, or default", "bb");
     cli.AddOption<int>("Diagnostics", "solver_iterations", "Max solver iterations for the robot ranks", "100");
     cli.AddOption<std::vector<int>>("VSG", "vsg", "MPI ranks that should open VSG visualization", "-1");
@@ -815,6 +848,12 @@ void AddCommandLineOptions(ChCLI& cli) {
                                "Parent directory for timestamp-named runs, used when --record_dir is not given",
                                "recordings");
     cli.AddOption<bool>("Recording", "no_record", "Disable pose recording (recording is on by default)");
+    // Deformed ground, alongside the poses. 10 Hz because soil deformation is a slowly
+    // growing footprint, not a fast signal -- and because the file is a diff, so the rate
+    // buys resolution in TIME, not in coverage. 0 disables it.
+    cli.AddOption<double>("Recording", "scm_record_rate",
+                          "SCM deformation capture rate in Hz (0 disables it)",
+                          std::to_string(scm_record_rate_hz));
     cli.AddOption<double>("Recording", "record_rate", "Pose capture rate in Hz", std::to_string(record_rate_hz));
 }
 
@@ -845,6 +884,8 @@ int main(int argc, char* argv[]) {
     const bool no_build = cli.CheckOption("no_build");
     const bool no_sensor = cli.CheckOption("no_sensor");
     const std::string sensor_frame_dir = cli.GetAsType<std::string>("sensor_frame_dir");
+    const bool scm_raycast_gpu = cli.CheckOption("scm_raycast_gpu");
+    const int scm_gpu_min_hits = cli.GetAsType<int>("scm_gpu_min_hits");
     const std::string solver_name = cli.GetAsType<std::string>("solver");
     const int solver_iterations = cli.GetAsType<int>("solver_iterations");
     rock_field_config.first_distance = cli.GetAsType<double>("rock_first_distance");
@@ -857,6 +898,7 @@ int main(int argc, char* argv[]) {
     const std::string record_root = cli.GetAsType<std::string>("record_root");
     const bool no_record = cli.CheckOption("no_record");
     record_rate_hz = cli.GetAsType<double>("record_rate");
+    scm_record_rate_hz = cli.GetAsType<double>("scm_record_rate");
     if (no_record) {
         record_dir.clear();
     } else if (record_dir.empty()) {
@@ -995,10 +1037,29 @@ int main(int argc, char* argv[]) {
             mesh->AddMaterial(CreateLunarHapkeMaterial());
         }
     }
+#ifdef CHRONO_HAS_SCM_GPU
+    // Chrono defaults this ON; we gate it on the flag so a run states which ray-cast path
+    // it used instead of inheriting one. See --scm_raycast_gpu.
+    terrain.EnableRaycastGpuHip(scm_raycast_gpu);
+    {
+        // Config::enabled already defaults to true; min_hits is what actually gates the path.
+        scm_gpu::Config gpu_cfg = terrain.GetScmGpuConfig();
+        gpu_cfg.min_hits = static_cast<std::size_t>(std::max(1, scm_gpu_min_hits));
+        terrain.SetScmGpuConfig(gpu_cfg);
+    }
+#endif
     if (rank == 0) {
         SynLog() << "SCM terrain: " << terrain_length << " x " << terrain_width << " m at "
                  << terrain_scm_delta << " m grid (" << terrain_heightmap_file << "), visualization mesh "
                  << (scm_visualization_mesh ? "ON" : "OFF") << ".\n";
+#ifdef CHRONO_HAS_SCM_GPU
+        SynLog() << "SCM ray-cast: HIP GPU backend " << (scm_raycast_gpu ? "ENABLED" : "disabled")
+                 << " (--scm_raycast_gpu).\n";
+        SynLog() << "SCM contact force: GPU backend fires above " << scm_gpu_min_hits
+                 << " hits/step (--scm_gpu_min_hits).\n";
+#else
+        SynLog() << "SCM ray-cast: CPU only (this Chrono has no SCM GPU backend).\n";
+#endif
     }
 
     // Bind collision shapes now. SCMTerrain::GetHeight reads the height matrix directly so
@@ -1064,6 +1125,24 @@ int main(int argc, char* argv[]) {
         recorder = std::make_unique<TrajectoryRecorder>(record_dir, rank, record_rate_hz, step_size,
                                                         /*write_static=*/rank == 1);
         recorder->ExcludeExisting(system);
+    }
+
+    // Deformed ground. Poses alone cannot be rendered honestly here: the wheels ride in
+    // ruts they cut themselves, so a renderer drawing terrain2_graded.png as given floats
+    // every machine over its own tracks.
+    //
+    // The grid geometry is RE-DERIVED with SCMLoader::Initialize's own formulas rather
+    // than read back off the terrain, because m_delta / m_nx / m_ny are private to
+    // SCMLoader and SCMTerrain is its only friend. Exact for this patch: ceil(512/0.1) is
+    // 5120 with no remainder, so scm_delta_actual comes back as terrain_scm_delta.
+    std::unique_ptr<ScmRecorder> scm_recorder;
+    const int scm_nx = static_cast<int>(std::ceil((terrain_length / 2) / terrain_scm_delta));
+    const int scm_ny = static_cast<int>(std::ceil((terrain_width / 2) / terrain_scm_delta));
+    const double scm_delta_actual = terrain_length / (2.0 * scm_nx);
+    if (owns_robot && !record_dir.empty() && scm_record_rate_hz > 0.0) {
+        scm_recorder = std::make_unique<ScmRecorder>(record_dir, rank, scm_record_rate_hz,
+                                                     scm_keyframe_period, &terrain, scm_delta_actual,
+                                                     scm_nx, scm_ny);
     }
 
     if (owns_robot) {
@@ -1234,6 +1313,12 @@ int main(int argc, char* argv[]) {
         // ray-OBB test instead of 130. The hull footprint is not centred on the chassis
         // reference (Chassis.obj spans x in [-4.903, 0.498]), hence the offset centre; the
         // box is generous in x and y so the tracks stay inside it through a pitch or roll.
+        // Give the track shoes triangle-mesh soil contact BEFORE any domain is registered,
+        // so a --scm_raycast_gpu run has mesh geometry to intersect under the tracks. Only
+        // the soil-facing boxes change; the top pad and guide horn the track bears against
+        // internally stay boxes. See src/TrackSoilMesh.h.
+        MeshifyTrackShoeSoilContact(builder->GetVehicle(), system);
+
         {
             const ChVector3d hull_domain_center(-2.2, 0.0, -0.4);
             const ChVector3d hull_domain_dims(7.5, 4.5, 3.0);
@@ -1417,6 +1502,23 @@ int main(int argc, char* argv[]) {
                                          std::to_string(terrain_min_height) + ",\"max_height\":" +
                                          std::to_string(terrain_max_height) + ",\"scm_delta\":" +
                                          std::to_string(terrain_scm_delta) + "}");
+        // Soil model and grid, so the recording is interpretable and reproducible from
+        // itself rather than from whatever main.cpp happened to hold at the time.
+        recorder->AddMeta("scm", "{\"delta\":" + std::to_string(scm_delta_actual) + ",\"nx\":" +
+                                     std::to_string(scm_nx) + ",\"ny\":" + std::to_string(scm_ny) +
+                                     ",\"extent_x\":" + std::to_string(terrain_length) + ",\"extent_y\":" +
+                                     std::to_string(terrain_width) +
+                                     ",\"soil\":{\"Bekker_Kphi\":" + std::to_string(scm_bekker_kphi) +
+                                     ",\"Bekker_Kc\":" + std::to_string(scm_bekker_kc) + ",\"Bekker_n\":" +
+                                     std::to_string(scm_bekker_n) + ",\"Mohr_cohesion\":" +
+                                     std::to_string(scm_mohr_cohesion) + ",\"Mohr_friction_deg\":" +
+                                     std::to_string(scm_mohr_friction) + ",\"Janosi_shear\":" +
+                                     std::to_string(scm_janosi_shear) + ",\"elastic_K\":" +
+                                     std::to_string(scm_elastic_k) + ",\"damping_R\":" +
+                                     std::to_string(scm_damping_r) + "}" +
+                                     ",\"deformation_file\":\"rank_" + std::to_string(rank) +
+                                     "_scm.bin\",\"deformation_rate_hz\":" +
+                                     std::to_string(scm_record_rate_hz) + "}");
 
         recorder->LabelVehicle(robot->GetVehicle(), "collector");
         recorder->LabelTrailer(robot->GetTrailer().get(), "collector_trailer");
@@ -1514,6 +1616,8 @@ int main(int argc, char* argv[]) {
         // stamp t is the state AT t, not the state after the step that starts at t.
         if (recorder)
             recorder->CaptureIfDue(system, time);
+        if (scm_recorder)
+            scm_recorder->CaptureIfDue(time);
 
         if (owns_robot && step_number % render_steps == 0) {
             ScopedTimer timer(perf_accum.render);
@@ -1698,6 +1802,19 @@ int main(int argc, char* argv[]) {
         }
         step_number++;
     }
+
+    // What actually ran. SCM's HIP backend declines per step -- silently, by design --
+    // whenever the candidate bodies carry no triangle-mesh collision geometry, so the
+    // only honest way to know whether the GPU did any of the ray-casting is this counter.
+    // A run that asked for the GPU and reports 0 steps did every ray cast on the CPU.
+#ifdef CHRONO_HAS_SCM_GPU
+    if (owns_robot) {
+        const int gpu_steps = terrain.GetNumRaycastGpuSteps();
+        SynLog() << "Rank " << rank << " SCM ray-cast: " << gpu_steps << " of " << step_number
+                 << " steps ran on the GPU (" << (step_number > 0 ? 100.0 * gpu_steps / step_number : 0.0)
+                 << "%); contact-force GPU steps " << terrain.GetNumContactForceGpuSteps() << ".\n";
+    }
+#endif
 
     syn_manager.QuitSimulation();
     return 0;

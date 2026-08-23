@@ -320,10 +320,15 @@ void RobotRig::InitializeVehicle(const chrono::ChCoordsys<>& init_pos) {
 
     for (auto& axle : m_vehicle->GetAxles()) {
         for (auto& wheel : axle->GetWheels()) {
+            // Lugged RIGID MESH tyre, not TMeasy. On deformable terrain a TMeasy wheel
+            // is a force element with no collision geometry, so SCM's rays hit nothing
+            // there: the wheel rides the deformed surface but never cuts a rut and never
+            // earns sinkage resistance. See Polaris_LuggedTire.json for why bolting a
+            // shape onto TMeasy instead would double-count the support.
             auto tire = chrono::vehicle::ReadTireJSON(
-                chrono::vehicle::GetVehicleDataFile("LRV/Polaris_TMeasyTire.json"));
-            // Render the configured tire OBJ while keeping TMeasy force-element
-            // dynamics for tire-terrain interaction.
+                chrono::vehicle::GetVehicleDataFile("LRV/Polaris_LuggedTire.json"));
+            // Render the smooth tyre OBJ; the lugs live in the collision mesh, which is
+            // what works the soil.
             m_vehicle->InitializeTire(tire, wheel, chrono::VisualizationType::MESH);
             tire->SetStepsize(m_tire_step_size);
         }
@@ -371,11 +376,14 @@ void RobotRig::InitializeTrailer() {
 
     for (auto& axle : m_trailer->GetAxles()) {
         for (auto& wheel : axle->GetWheels()) {
-            // Trailer-specific tire: a trailer wheel carries ~107 N against the
-            // tractor's ~480 N, and TMeasy stiffness follows its nominal load, so a
-            // single shared tire cannot suit both without being far too stiff for one.
+            // One tyre now serves both, where TMeasy needed two. The split existed
+            // because TMeasy's vertical stiffness follows its NOMINAL LOAD, and a
+            // trailer wheel carries ~107 N against the tractor's ~480 N -- no single
+            // TMeasy tyre suited both. A rigid mesh tyre has no nominal load: its
+            // stiffness is the contact material's, so the same geometry is correct at
+            // any wheel load, and both tyres are the same 0.4089 x 0.30 anyway.
             auto tire = chrono::vehicle::ReadTireJSON(
-                chrono::vehicle::GetVehicleDataFile("LRV/Polaris_TMeasyTire_Trailer.json"));
+                chrono::vehicle::GetVehicleDataFile("LRV/Polaris_LuggedTire.json"));
             m_trailer->InitializeTire(tire, wheel, chrono::VisualizationType::MESH);
             tire->SetStepsize(m_tire_step_size);
         }

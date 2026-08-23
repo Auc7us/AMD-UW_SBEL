@@ -15,3 +15,6 @@ recordings/
 # to be imported from it at runtime now lives at
 # ros2_ws/src/amd_uw_ros2/amd_uw_ros2/inverse_kinematics.py.
 ros2_ws/src/lunar-manip/
+
+# Controller / demo stdout captured next to a run. Regenerated every run.
+*.log

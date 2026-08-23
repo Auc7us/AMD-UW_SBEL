@@ -10,7 +10,7 @@
 #include "RobotLayout.h"
 
 #include "chrono/assets/ChVisualShapeTriangleMesh.h"
-#include "chrono/collision/ChCollisionShapeConvexHull.h"
+#include "chrono/collision/ChCollisionShapeTriangleMesh.h"
 #include "chrono/core/ChTypes.h"
 #include "chrono/physics/ChMassProperties.h"
 #include "chrono/utils/ChConstants.h"
@@ -68,14 +68,26 @@ std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> AddRockFields(
     auto rock_vis_mat = CreateLunarHapkeMaterial();
     std::array<std::shared_ptr<chrono::ChTriangleMeshConnected>, 3> rock_visual_meshes;
     std::array<std::shared_ptr<chrono::ChTriangleMeshConnected>, 3> rock_collision_meshes;
-    std::array<std::shared_ptr<chrono::ChCollisionShapeConvexHull>, 3> rock_ct_shapes;
+    std::array<std::shared_ptr<chrono::ChCollisionShapeTriangleMesh>, 3> rock_ct_shapes;
     std::array<std::shared_ptr<chrono::ChVisualShapeTriangleMesh>, 3> rock_vis_shapes;
 
     for (size_t i = 0; i < rock_visual_obj_files.size(); i++) {
         rock_visual_meshes[i] = LoadRockMesh(rock_visual_obj_files[i], true, config.mesh_scale);
         rock_collision_meshes[i] = LoadRockMesh(rock_collision_obj_files[i], false, config.mesh_scale);
-        rock_ct_shapes[i] = chrono_types::make_shared<chrono::ChCollisionShapeConvexHull>(
-            rock_mat, rock_collision_meshes[i]->GetCoordsVertices());
+        // TRIANGLE MESH, not a convex hull built from the same file's vertices.
+        //
+        // rockN_hull.obj is already a convex hull, and the mesh is right here -- the old
+        // ChCollisionShapeConvexHull(mat, mesh->GetCoordsVertices()) call threw the index
+        // buffer away and had Bullet re-derive a polytope from the point cloud. That
+        // costs nothing in contact quality (is_convex below keeps Bullet on the convex
+        // algorithm) but it made the rocks invisible to SCM's GPU ray-cast backend, which
+        // tests shape type literally and skips everything that is not TRIANGLEMESH.
+        //
+        // is_static=false: rocks are picked up and dropped. is_convex=true: these files
+        // ARE hulls, so say so and keep the cheap, robust contact path.
+        rock_ct_shapes[i] = chrono_types::make_shared<chrono::ChCollisionShapeTriangleMesh>(
+            rock_mat, rock_collision_meshes[i], /*is_static=*/false, /*is_convex=*/true,
+            /*radius=*/0.005);
 
         rock_vis_shapes[i] = chrono_types::make_shared<chrono::ChVisualShapeTriangleMesh>();
         rock_vis_shapes[i]->SetMesh(rock_visual_meshes[i]);
@@ -171,14 +183,18 @@ std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> AddBuilderPileRocks(
     auto rock_vis_mat = CreateLunarHapkeMaterial();
     std::array<std::shared_ptr<chrono::ChTriangleMeshConnected>, 3> visual_meshes;
     std::array<std::shared_ptr<chrono::ChTriangleMeshConnected>, 3> collision_meshes;
-    std::array<std::shared_ptr<chrono::ChCollisionShapeConvexHull>, 3> ct_shapes;
+    std::array<std::shared_ptr<chrono::ChCollisionShapeTriangleMesh>, 3> ct_shapes;
     std::array<std::shared_ptr<chrono::ChVisualShapeTriangleMesh>, 3> vis_shapes;
     double rock_radius = 0.0;
     for (size_t i = 0; i < rock_visual_obj_files.size(); i++) {
         visual_meshes[i] = LoadRockMesh(rock_visual_obj_files[i], true, config.mesh_scale);
         collision_meshes[i] = LoadRockMesh(rock_collision_obj_files[i], false, config.mesh_scale);
-        ct_shapes[i] = chrono_types::make_shared<chrono::ChCollisionShapeConvexHull>(
-            rock_mat, collision_meshes[i]->GetCoordsVertices());
+        // Triangle mesh, same reasoning as AddRockFields above: the hull OBJ is already
+        // convex, the mesh is already loaded, and only TRIANGLEMESH is visible to SCM's
+        // GPU ray-cast backend.
+        ct_shapes[i] = chrono_types::make_shared<chrono::ChCollisionShapeTriangleMesh>(
+            rock_mat, collision_meshes[i], /*is_static=*/false, /*is_convex=*/true,
+            /*radius=*/0.005);
         vis_shapes[i] = chrono_types::make_shared<chrono::ChVisualShapeTriangleMesh>();
         vis_shapes[i]->SetMesh(visual_meshes[i]);
         vis_shapes[i]->SetBackfaceCull(true);
