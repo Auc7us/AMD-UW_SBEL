@@ -632,18 +632,42 @@ def build_rut_patches(pl, sources, boxes, sample_base, ground, clim, max_nodes=4
         x = (np.arange(i0, i1 + 1)) * delta
         y = (np.arange(j0, j1 + 1)) * delta
         xx, yy = np.meshgrid(x, y)
-        base = sample_base(xx.ravel(), yy.ravel()).reshape(yy.shape)
-        grid = pv.StructuredGrid(xx, yy, base.copy())
-        grid["sinkage"] = np.zeros(base.size)
+        grid = pv.StructuredGrid(xx, yy, np.zeros_like(xx))
+
+        # Index map built FROM THE GRID'S OWN POINT COORDINATES, never from an assumed
+        # ravel order. VTK orders structured points with the FIRST dimension fastest, so
+        # for a meshgrid(x, y) the y index moves fastest -- point n is (col*rows + row),
+        # not (row*cols + col). Indexing it the other way silently transposes every rut:
+        # the imprints come out across the direction of travel and smeared over the whole
+        # patch instead of along the track, which is precisely how this first shipped.
+        px, py = grid.points[:, 0], grid.points[:, 1]
+        base = sample_base(px, py)
+        grid.points[:, 2] = base
+        col = np.rint(px / delta).astype(np.int64) - i0
+        row = np.rint(py / delta).astype(np.int64) - j0
+        lut = np.full((rows, cols), -1, dtype=np.int64)
+        lut[row, col] = np.arange(grid.n_points)
+        if (lut < 0).any():
+            print(f"  ! rank {src['rank']}: {int((lut < 0).sum())} patch node(s) unmapped",
+                  file=sys.stderr)
+        # Self-check: the point a node maps to must actually SIT at that node.
+        probe_r, probe_c = rows // 2, cols // 2
+        pi = lut[probe_r, probe_c]
+        if pi >= 0:
+            want = ((i0 + probe_c) * delta, (j0 + probe_r) * delta)
+            got = (px[pi], py[pi])
+            if abs(got[0] - want[0]) > 1e-6 or abs(got[1] - want[1]) > 1e-6:
+                raise AssertionError(f"rut index map is wrong: node {want} landed at {got}")
+        grid["sinkage"] = np.zeros(grid.n_points)
         # No offset, no lift: the terrain cells underneath are removed, so this is the
         # only surface here and there is nothing to tie with.
         pl.add_mesh(grid, scalars="sinkage", cmap=rut_colormap(ground),
                     clim=(0.0, max(1e-3, clim)), show_scalar_bar=False,
                     smooth_shading=True, specular=0.05)
         patches.append({
-            "rank": src["rank"], "grid": grid, "base": base, "i0": i0, "j0": j0,
-            "shape": (rows, cols), "frames": frames, "cursor": 0, "time": -1.0,
-            "rate": rate, "nodes": src["nodes"],
+            "rank": src["rank"], "grid": grid, "base": base, "lut": lut,
+            "i0": i0, "j0": j0, "shape": (rows, cols), "frames": frames,
+            "cursor": 0, "time": -1.0, "rate": rate, "nodes": src["nodes"],
         })
     return patches
 
@@ -658,20 +682,23 @@ def apply_scm(patches, t):
     """
     for p in patches:
         if t < p["time"]:
-            p["grid"].points[:, 2] = p["base"].ravel()
+            p["grid"].points[:, 2] = p["base"]
             p["grid"]["sinkage"][:] = 0.0
             p["cursor"] = 0
         rows, cols = p["shape"]
+        lut = p["lut"]
         z = p["grid"].points[:, 2]
         sink = p["grid"]["sinkage"]
         moved = False
         while p["cursor"] < len(p["frames"]) and p["frames"][p["cursor"]][0] <= t:
             _ft, ii, jj, zz = p["frames"][p["cursor"]]
-            flat = (jj - p["j0"]) * cols + (ii - p["i0"])
-            ok = (flat >= 0) & (flat < rows * cols)
-            idx = flat[ok]
-            z[idx] = zz[ok]
-            sink[idx] = p["base"].ravel()[idx] - zz[ok]
+            r, c = jj - p["j0"], ii - p["i0"]
+            ok = (r >= 0) & (r < rows) & (c >= 0) & (c < cols)
+            idx = lut[r[ok], c[ok]]
+            live = idx >= 0
+            idx, hz = idx[live], zz[ok][live]
+            z[idx] = hz
+            sink[idx] = p["base"][idx] - hz
             p["cursor"] += 1
             moved = True
         p["time"] = t
