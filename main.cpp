@@ -128,7 +128,7 @@ const double terrain_height_probe_clearance = 10.0;
 // normal index triples per face, which is ~13.5 GB per rank on top of the heights. It is
 // therefore built only on ranks that actually render (see scm_visualization_mesh below);
 // a headless rank pays the 839 MB and nothing more.
-const double terrain_scm_delta = 0.10;
+const double terrain_scm_delta_default = 0.10;
 
 // Bekker-Wong soil parameters for the lunar regolith analogue, carried over from the
 // earlier SCM branch. elastic_K must exceed Bekker_Kphi or SCM's yield test never
@@ -811,6 +811,10 @@ void AddCommandLineOptions(ChCLI& cli) {
     // whose hit count reaches scm_gpu::Config::min_hits (8192). Our footprints are far smaller
     // than that at delta=0.10, so the path never runs. Expose the threshold so a run can measure
     // whether the GPU wins at our hit counts instead of assuming Chrono's default applies here.
+    cli.AddOption<double>("Simulation", "scm_delta",
+                          "SCM grid spacing in m. Cost of the ray-cast term grows as 1/delta^2 and "
+                          "the height matrix as (patch/delta)^2, so this is the single knob that "
+                          "decides whether a run fits", std::to_string(terrain_scm_delta_default));
     cli.AddOption<int>("Simulation", "scm_gpu_min_hits",
                        "Hit-count threshold above which SCM's contact-force GPU backend runs "
                        "(Chrono default 8192; lower it to let smaller footprints qualify)", "8192");
@@ -886,6 +890,7 @@ int main(int argc, char* argv[]) {
     const std::string sensor_frame_dir = cli.GetAsType<std::string>("sensor_frame_dir");
     const bool scm_raycast_gpu = cli.CheckOption("scm_raycast_gpu");
     const int scm_gpu_min_hits = cli.GetAsType<int>("scm_gpu_min_hits");
+    const double terrain_scm_delta = cli.GetAsType<double>("scm_delta");
     const std::string solver_name = cli.GetAsType<std::string>("solver");
     const int solver_iterations = cli.GetAsType<int>("solver_iterations");
     rock_field_config.first_distance = cli.GetAsType<double>("rock_first_distance");
