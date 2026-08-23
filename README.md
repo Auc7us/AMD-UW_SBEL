@@ -362,6 +362,18 @@ the next machine, `c` free camera, `r` restart, `q` quit.
 Needs `pyvista` (`pip install pyvista imageio imageio-ffmpeg`), and a display for the
 interactive window -- `--movie` and `--shot` render off-screen and need neither.
 
+Recordings carry ABSOLUTE mesh paths from the machine that produced them, so a run copied
+off the cluster names `/work1/...` and resolves to nothing locally. Those are re-rooted
+automatically: every path has a `data/` segment and what follows it is stable across
+checkouts, so the local `data/` and the sibling Chrono checkout are tried in turn.
+`--mesh-root DIR` adds more. The line it prints says how many were re-rooted, and anything
+still missing is drawn as a box rather than skipped.
+
+An SCM run records no terrain patch -- the deformable terrain is not a static visual when
+`ExcludeExisting()` runs -- so the surface is rebuilt from the heightmap named in the
+metadata instead. Note what that means: it is the terrain as it STARTED. SCM deforms, and
+ruts do not show.
+
 It is 1:1 with what the sim drew, and that takes more than loading the OBJ files. Every
 mesh is fitted to the bounding box the recorder captured, because -- as TrajectoryRecorder
 says in as many words -- `scale` alone is a lie for anything transformed in memory after

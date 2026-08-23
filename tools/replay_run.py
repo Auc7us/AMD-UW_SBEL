@@ -107,6 +107,48 @@ def quat_matrix(q):
     )
 
 
+def local_roots(extra):
+    """Directories to look for a mesh under, when its recorded path does not exist here.
+
+    Recordings carry ABSOLUTE paths from the machine that ran the sim, so anything
+    recorded on the cluster names /work1/... and resolves to nothing locally. Rather than
+    demand a flag, the paths are re-rooted: they all contain a `data/` segment, and what
+    follows it is stable across checkouts.
+    """
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    roots = [os.path.join(here, "data"), here]
+    for env in ("CHRONO_DATA_DIR", "CHRONO_DATA_PATH"):
+        if os.environ.get(env):
+            roots.append(os.environ[env])
+    # The sibling Chrono checkout, which is where the shared robot/rock meshes live.
+    for guess in ("chrono/build/data", "chrono/data", "../chrono/build/data"):
+        cand = os.path.normpath(os.path.join(os.path.dirname(here), guess))
+        if os.path.isdir(cand):
+            roots.append(cand)
+    roots.extend(extra or [])
+    return [r for r in roots if os.path.isdir(r)]
+
+
+def relocate(path, roots):
+    """Find `path` locally, matching progressively shorter tails against each root."""
+    if not path:
+        return None
+    if os.path.exists(path):
+        return path
+    parts = [p for p in path.replace("\\", "/").split("/") if p]
+    # Prefer the tail after the last `data/` segment; fall back to ever-shorter tails, so
+    # a mesh moved between data roots is still found by its own subtree.
+    starts = [i + 1 for i, part in enumerate(parts) if part == "data"]
+    starts.extend(range(len(parts) - 1, 0, -1))
+    for start in starts:
+        tail = os.path.join(*parts[start:])
+        for root in roots:
+            cand = os.path.join(root, tail)
+            if os.path.exists(cand):
+                return cand
+    return None
+
+
 class MeshCache:
     """PolyData cache, keyed twice over.
 
@@ -117,10 +159,13 @@ class MeshCache:
     one by one cost three minutes of scene build; sharing them costs one mesh.
     """
 
-    def __init__(self):
+    def __init__(self, roots=None):
         self._cache = {}
         self._placed = {}
+        self._resolved = {}
+        self.roots = roots or []
         self.misses = set()
+        self.relocated = 0
 
     def get(self, path, scale):
         key = (path, tuple(scale))
@@ -128,14 +173,23 @@ class MeshCache:
             return self._cache[key]
         import pyvista as pv
 
+        local = self._resolved.get(path)
+        if local is None:
+            local = relocate(path, self.roots)
+            self._resolved[path] = local or False
+            if local and local != path:
+                self.relocated += 1
+        elif local is False:
+            local = None
+
         mesh = None
-        if path and os.path.exists(path):
+        if local:
             try:
-                mesh = pv.read(path)
+                mesh = pv.read(local)
                 if any(abs(s - 1.0) > 1e-9 for s in scale):
                     mesh = mesh.scale(scale, inplace=False)
             except Exception as exc:  # noqa: BLE001 - one bad asset must not kill the scene
-                print(f"  ! {os.path.basename(path)}: {exc}", file=sys.stderr)
+                print(f"  ! {os.path.basename(local)}: {exc}", file=sys.stderr)
                 mesh = None
         elif path:
             self.misses.add(path)
@@ -291,7 +345,7 @@ def terrain_mesh(meta, prop, decimate, keep_radius):
     nx, ny = img.dimensions[0], img.dimensions[1]
     grey = arr.reshape((ny, nx)).astype(np.float64)
 
-    shape = (prop or {}).get("shapes", [{}])[0]
+    shape = ((prop or {}).get("shapes") or [{}])[0]
     amin, amax = shape.get("aabb_min"), shape.get("aabb_max")
     if amin and amax:
         x0, x1, y0, y1 = amin[0], amax[0], amin[1], amax[1]
@@ -431,6 +485,7 @@ def build_scene(pl, bodies, cache, boxes_only, meta, terrain_decimate, scenery,
     # Drawing them from the record is the only way they land where the run had them --
     # a synthetic flat circle at a guessed height is wrong by metres on a hillside.
     props = static_props(directory)
+    drew_terrain = False
     for prop in props:
         shapes = prop.get("shapes", [])
         is_patch = len(shapes) == 1 and shapes[0].get("type") == "trimesh" and not shapes[0].get("file")
@@ -439,8 +494,8 @@ def build_scene(pl, bodies, cache, boxes_only, meta, terrain_decimate, scenery,
                 continue
             terr, colour = terrain_mesh(meta, prop, terrain_decimate, terrain_radius)
             if terr is not None:
-                pl.add_mesh(terr, color=colour, smooth_shading=True, specular=0.05,
-                            name="terrain")
+                pl.add_mesh(terr, color=colour, smooth_shading=True, specular=0.05)
+                drew_terrain = True
             continue
         colour = next((tuple(s["color"]) for s in shapes if s.get("color")), "#94a3b8")
         mesh = merged(prop)
@@ -449,7 +504,18 @@ def build_scene(pl, bodies, cache, boxes_only, meta, terrain_decimate, scenery,
         m[:3, 3] = prop.get("first_pos", [0, 0, 0])
         if not np.allclose(m, np.eye(4)):
             mesh = mesh.transform(m, inplace=False)
-        pl.add_mesh(mesh, color=colour, smooth_shading=True, name=f"prop_{prop['part']}")
+        pl.add_mesh(mesh, color=colour, smooth_shading=True)
+
+    # An SCM run records NO patch prop: the deformable terrain is not a static visual at
+    # the moment ExcludeExisting() runs. Its height field is still the same image, so the
+    # surface is rebuilt from the metadata instead -- with the caveat that this is the
+    # terrain as it STARTED. SCM deforms, and ruts do not show here.
+    if terrain_decimate and not drew_terrain:
+        terr, colour = terrain_mesh(meta, None, terrain_decimate, terrain_radius)
+        if terr is not None:
+            pl.add_mesh(terr, color=colour, smooth_shading=True, specular=0.05)
+            if ((meta or {}).get("terrain") or {}).get("model") == "scm":
+                print("terrain     rebuilt from the heightmap (SCM run: undeformed, no ruts)")
     return actors
 
 
@@ -498,6 +564,9 @@ def main():
     ap.add_argument("--shot", help="write a single PNG and exit")
     ap.add_argument("--at", type=float, help="sim time for --shot (default: midpoint)")
     ap.add_argument("--window", default="1600x1000")
+    ap.add_argument("--mesh-root", action="append", metavar="DIR",
+                    help="extra directory to search for meshes whose recorded absolute "
+                         "path does not exist here (repeatable)")
     ap.add_argument("--focus", help="frame the first body whose group/part contains this")
     ap.add_argument("--focus-dist", type=float, default=12.0,
                     help="metres of scene to frame around the focused body, so smaller is "
@@ -524,7 +593,7 @@ def main():
     pl = pv.Plotter(off_screen=off, window_size=(w, h))
     pl.set_background("#0b1120", top="#1e293b")
 
-    cache = MeshCache()
+    cache = MeshCache(local_roots(args.mesh_root))
     site_r = float(((meta or {}).get("site") or {}).get("collector_ring", 37.0))
     actors = build_scene(pl, bodies, cache, args.boxes, meta,
                          0 if args.no_terrain else args.terrain_decimate,
@@ -532,8 +601,11 @@ def main():
                          (site_r + args.terrain_margin) if args.terrain_margin > 0 else 0.0,
                          args.directory)
     if cache.misses:
-        print(f"  ! {len(cache.misses)} mesh file(s) missing, drawn as boxes", file=sys.stderr)
-    print(f"meshes      {cache.loaded()} distinct loaded")
+        print(f"  ! {len(cache.misses)} mesh file(s) not found here, drawn as boxes "
+              f"(try --mesh-root)", file=sys.stderr)
+    print(f"meshes      {cache.loaded()} distinct loaded"
+          + (f", {cache.relocated} re-rooted from the recording's own paths"
+             if cache.relocated else ""))
 
     site = (meta or {}).get("site") or {}
     ring = float(site.get("collector_ring", 37.0))
