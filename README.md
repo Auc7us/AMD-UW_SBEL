@@ -349,10 +349,11 @@ there is nothing to import and no scene to maintain.
 python3 tools/replay_run.py ~/mountdir/recordings/run16              # real time
 python3 tools/replay_run.py <dir> --speed 8                          # 8x
 python3 tools/replay_run.py <dir> --rank 1,2 --from 90 --to 140      # one sector, one cycle
+python3 tools/replay_run.py <dir> --no-running-gear                  # drop tracks, faster
 python3 tools/replay_run.py <dir> --boxes                            # bounding boxes, faster
 python3 tools/replay_run.py <dir> --movie clip.mp4 --fps 20          # off-screen to mp4
 python3 tools/replay_run.py <dir> --shot look.png --at 300           # one frame
-python3 tools/replay_run.py <dir> --focus "builder/Chassis" --all-parts   # close on one machine
+python3 tools/replay_run.py <dir> --focus "builder/Chassis" --focus-dist 7   # close on one machine
 ```
 
 Keys: `space` play/pause, arrows step a frame, `[` `]` speed, `t` top, `i` iso, `f` follow
@@ -398,9 +399,20 @@ to the rings leaves them flying over nothing. It costs nothing to keep -- the he
 site cares about. `--terrain-margin <m>` crops to the rings if you want it, and
 `--terrain-decimate` coarsens it.
 
-Defaults drop track shoes, road wheels, suspension arms and spindles -- 1905 of the 3472
-bodies in a 15-rank run, none of which say whether the site is working. `--all-parts`
-keeps them and will cost you the frame rate.
+Track shoes and their lugs, road wheels, sprockets, idlers and suspension are drawn by
+default: the tracks are most of what a tracked machine looks like, and without them a
+builder is a coloured plate sliding over the ground. That is 1905 of the 3336 bodies in a
+15-rank run, and `--no-running-gear` takes them back out when frame rate matters more than
+looks.
+
+Two things had to be fixed to make that affordable, and both are worth knowing if this
+gets extended. Never pass `name=` to `add_mesh` in a loop: pyvista then calls
+`remove_actor(name)` first, which scans the whole actor collection by name, so building
+3336 bodies was O(n^2) -- 11.2 million VTK collection lookups and three minutes of scene
+build. And placed geometry is cached by shape signature, not just by mesh file: 1905 track
+shoes are the same mesh fitted to the same box at the same local frame, differing only in
+body pose, and body pose lives on the actor. Together those took a full-site frame from
+3 min 15 s to 31 s.
 
 ### Cost diagnostics
 

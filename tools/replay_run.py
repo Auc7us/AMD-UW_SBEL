@@ -17,8 +17,9 @@ Keys: space play/pause, left/right step a frame, [ ] speed, t top view, i iso vi
       f follow the next machine, c free camera, r restart, q quit.
 
 Meshes are loaded once per file and shared between the bodies that use them, so 15 ranks
-of builders cost one hull mesh, not fifteen. --all-parts brings back the track shoes,
-which are 1905 of the 3472 bodies in a 15-rank run and will cost you the frame rate.
+of builders cost one hull mesh, not fifteen. Track shoes, lugs, road wheels and suspension
+are drawn by default; --no-running-gear drops them (1905 of the 3472 bodies in a 15-rank
+run) when frame rate matters more than looks.
 """
 
 import argparse
@@ -33,10 +34,12 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from read_trajectory import Recording, discover_ranks, index_frames, read_frame  # noqa: E402
 
-# Parts that are numerically dominant and add nothing to a previz: 63 track shoes per
-# builder side is most of a recording, and no one judging whether the site works is
-# looking at a road wheel. --all-parts brings them back.
-NOISE = re.compile(
+# Running gear: track shoes and their lugs, road wheels, sprockets, idlers, suspension
+# arms, wheel spindles. Drawn by DEFAULT -- the tracks are most of what a tracked machine
+# looks like, and the lugs are on the shoe mesh, so dropping them leaves a builder as a
+# coloured plate sliding over the ground. It is 1905 of the 3472 bodies in a 15-rank run,
+# so --no-running-gear takes them out again when frame rate matters more than looks.
+RUNNING_GEAR = re.compile(
     r"TrackShoe|RoadWheel|Suspension|Idler|Sprocket|DoubleWishbone|Rack-Pinion"
     r"|spindle|axleTube|ballast",
     re.IGNORECASE,
@@ -105,10 +108,18 @@ def quat_matrix(q):
 
 
 class MeshCache:
-    """One PolyData per (file, scale). A 15-rank run reuses 28 meshes across 3472 bodies."""
+    """PolyData cache, keyed twice over.
+
+    Once per (file, scale) for the raw mesh, and once per fully-placed shape signature --
+    mesh, fit box and local frame -- because that is what actually repeats. A 15-rank run
+    has 1905 track shoes that are the same mesh, fitted to the same box, at the same local
+    frame, differing only in body pose, and body pose lives on the actor. Rebuilding them
+    one by one cost three minutes of scene build; sharing them costs one mesh.
+    """
 
     def __init__(self):
         self._cache = {}
+        self._placed = {}
         self.misses = set()
 
     def get(self, path, scale):
@@ -133,6 +144,12 @@ class MeshCache:
 
     def loaded(self):
         return sum(1 for v in self._cache.values() if v is not None)
+
+    def placed(self, signature, build):
+        """Memoised placed geometry. `build` is only called on a miss."""
+        if signature not in self._placed:
+            self._placed[signature] = build()
+        return self._placed[signature]
 
 
 def fit_to_aabb(mesh, amin, amax):
@@ -171,6 +188,20 @@ def fit_to_aabb(mesh, amin, amax):
     return mesh.transform(m, inplace=False)
 
 
+def shape_signature(shape, boxes_only):
+    """Everything about a shape that determines its geometry, body pose excluded."""
+    def r(v, n=6):
+        return tuple(round(float(x), n) for x in v) if v else None
+
+    return (
+        bool(boxes_only), shape.get("type"), shape.get("file"),
+        r(shape.get("scale")), r(shape.get("size")),
+        round(float(shape.get("radius", 0.0)), 6), round(float(shape.get("height", 0.0)), 6),
+        r(shape.get("aabb_min")), r(shape.get("aabb_max")),
+        r(shape.get("pos")), r(shape.get("rot")),
+    )
+
+
 def shape_geometry(shape, cache, boxes_only):
     """PolyData for one visual shape, already placed in its body's frame.
 
@@ -178,6 +209,11 @@ def shape_geometry(shape, cache, boxes_only):
     "radius"/"height" -- not from a bounding box. run16 carries 92 cylinders and they were
     every one of them drawn as a 20 cm cube before this.
     """
+    return cache.placed(shape_signature(shape, boxes_only),
+                        lambda: _build_shape(shape, cache, boxes_only))
+
+
+def _build_shape(shape, cache, boxes_only):
     import pyvista as pv
 
     kind = shape.get("type")
@@ -305,7 +341,7 @@ def load(directory, ranks, t_from, t_to, fps, keep_all, max_frames):
             continue
         if not index:
             continue
-        keep = [o for o in rec.objects if keep_all or not NOISE.search(o["part"])]
+        keep = [o for o in rec.objects if keep_all or not RUNNING_GEAR.search(o["part"])]
         per_rank.append((rank, rec, index, rate, keep, len(bodies)))
         bodies.extend(keep)
     if not per_rank:
@@ -378,8 +414,12 @@ def build_scene(pl, bodies, cache, boxes_only, meta, terrain_decimate, scenery,
         # The manifest carries each shape's colour, so the playblast looks like the run
         # rather than like a debug view. Group colour only when a body has none.
         colour = next((tuple(s["color"]) for s in obj.get("shapes", []) if s.get("color")), None)
+        # NO name= here. Passing one makes pyvista remove_actor() first, which scans the
+        # whole actor collection by name on every add -- O(n^2), and with 3336 bodies that
+        # was 11.2 million VTK collection lookups and three minutes of scene build. The
+        # actor list below is the handle we actually use.
         actor = pl.add_mesh(merged(obj), color=colour or group_color(obj), smooth_shading=True,
-                            specular=0.25, name=f"b{len(actors)}")
+                            specular=0.25)
         actor.SetVisibility(False)  # until a pose is applied; rocks appear mid-run
         actors.append(actor)
 
@@ -440,7 +480,9 @@ def main():
     ap.add_argument("--from", dest="t_from", type=float)
     ap.add_argument("--to", dest="t_to", type=float)
     ap.add_argument("--max-frames", type=int, default=3000)
-    ap.add_argument("--all-parts", action="store_true", help="include track shoes and wheels")
+    ap.add_argument("--no-running-gear", action="store_true",
+                    help="drop track shoes, wheels, sprockets, idlers and suspension "
+                         "(1905 of 3472 bodies in a 15-rank run) for frame rate")
     ap.add_argument("--boxes", action="store_true", help="bounding boxes instead of meshes")
     ap.add_argument("--no-terrain", action="store_true")
     ap.add_argument("--terrain-decimate", type=int, default=1,
@@ -458,7 +500,8 @@ def main():
     ap.add_argument("--window", default="1600x1000")
     ap.add_argument("--focus", help="frame the first body whose group/part contains this")
     ap.add_argument("--focus-dist", type=float, default=12.0,
-                    help="camera distance for --focus, metres (default 12)")
+                    help="metres of scene to frame around the focused body, so smaller is "
+                         "closer (default 12, about one builder plus its arm)")
     args = ap.parse_args()
 
     import pyvista as pv
@@ -469,10 +512,10 @@ def main():
         raise SystemExit(f"no rank_*_frames.bin in {args.directory}")
 
     meta, bodies, poses, times, rate = load(args.directory, ranks, args.t_from, args.t_to,
-                                            args.fps, args.all_parts, args.max_frames)
+                                            args.fps, not args.no_running_gear, args.max_frames)
     print(f"ranks       {ranks}")
     print(f"bodies      {len(bodies)}"
-          f"{'' if args.all_parts else ' (track shoes/wheels/suspension dropped)'}")
+          f"{' (running gear dropped)' if args.no_running_gear else ' incl. running gear'}")
     print(f"frames      {len(times)} at {args.fps:g}/sim-s from {rate:g} Hz, "
           f"t={times[0]:.2f}..{times[-1]:.2f} s")
 
@@ -494,19 +537,49 @@ def main():
 
     site = (meta or {}).get("site") or {}
     ring = float(site.get("collector_ring", 37.0))
-    iso = [(ring * 1.55, -ring * 1.55, ring * 0.95), (0, 0, 3.0), (0, 0, 1)]
     pl.enable_lightkit()
 
-    def set_cam(view):
-        """Assign a camera and re-fit the clipping range.
+    def frame_radius(radius, focal, elev_deg=32.0, azim_deg=-135.0, fill=0.88):
+        """Camera that fits a circle of `radius` about `focal` into the window.
 
-        VTK computes near/far from the bounds it last saw, and the terrain patch is
-        kilometres wide: leave the range alone and the machines fall outside it or z-fight.
+        Derived from the site, NOT from the scene bounds. Those are two different things
+        and conflating them is what made the view useless: the terrain patch is 1024 m
+        across, so any bounds-based fit frames a kilometre of empty regolith and renders
+        the machines as specks. Fixing THAT by cropping the terrain is the tail wagging
+        the dog -- the run genuinely extends to 210 m and the ground should too.
+
+        Solved rather than guessed: for a vertical field of view `va` and window aspect
+        `a`, a sphere of radius r needs distance r/(fill*tan(va/2)) to fit vertically and
+        r/(fill*a*tan(va/2)) to fit horizontally, so the larger of the two fits both.
+        """
+        va = math.radians(pl.camera.view_angle)
+        w, h = pl.window_size
+        aspect = max(1e-3, w / max(1, h))
+        half = math.tan(va / 2.0)
+        want = radius / max(0.05, fill)
+        dist = max(want / half, want / (half * aspect))
+        el, az = math.radians(elev_deg), math.radians(azim_deg)
+        offset = (dist * math.cos(el) * math.cos(az),
+                  dist * math.cos(el) * math.sin(az),
+                  dist * math.sin(el))
+        return [(focal[0] + offset[0], focal[1] + offset[1], focal[2] + offset[2]),
+                tuple(focal), (0, 0, 1)]
+
+    def set_cam(view):
+        """Assign a camera and clip from the VIEW DISTANCE, not the scene bounds.
+
+        reset_camera_clipping_range() spans everything in the scene, so with a kilometre
+        of terrain loaded the near plane goes far out and the far plane enormous: the depth
+        buffer then has no precision left for the machines and their surfaces z-fight. The
+        range wants to bracket what is being looked at.
         """
         pl.camera_position = view
-        pl.reset_camera_clipping_range()
+        pos, focal = np.array(view[0], dtype=float), np.array(view[1], dtype=float)
+        dist = float(np.linalg.norm(pos - focal))
+        pl.camera.clipping_range = (max(0.05, dist * 0.01), dist * 8.0 + 1000.0)
 
-    set_cam(iso)
+    site_view = frame_radius(ring, (0.0, 0.0, 3.0))
+    set_cam(site_view)
 
     focus = -1
     if args.focus:
@@ -535,9 +608,8 @@ def main():
         if state["follow"] >= 0:
             p = poses[state["slot"], state["follow"]]
             if np.isfinite(p[0]):
-                d = max(1.0, args.focus_dist)
-                set_cam([(float(p[0]) - d * 0.8, float(p[1]) - d * 0.8, float(p[2]) + d * 0.55),
-                         (float(p[0]), float(p[1]), float(p[2])), (0, 0, 1)])
+                set_cam(frame_radius(max(1.0, args.focus_dist) * 0.5,
+                                     (float(p[0]), float(p[1]), float(p[2]))))
         hud()
 
     show(0)
@@ -569,12 +641,12 @@ def main():
 
     def free_cam():
         state["follow"] = -1
-        set_cam(iso)
+        set_cam(frame_radius(ring, (0.0, 0.0, 3.0)))
         hud()
 
     def top_cam():
         state["follow"] = -1
-        set_cam([(0, 0, ring * 2.6), (0, 0, 0), (0, 1, 0)])
+        set_cam(frame_radius(ring, (0.0, 0.0, 0.0), elev_deg=89.9, azim_deg=-90.0))
         hud()
 
     def set_speed(mult):
