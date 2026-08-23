@@ -377,7 +377,10 @@ def terrain_mesh(meta, prop, decimate, keep_radius):
             x, y, z = x[cx], y[cy], z[np.ix_(cy, cx)]
     xx, yy = np.meshgrid(x, y)
     colour = shape.get("color")
-    return pv.StructuredGrid(xx, yy, z), (tuple(colour) if colour else "#8a8578")
+    # Fallback matches main.cpp's ground->SetColor(0.55, 0.55, 0.52) -- an SCM run records
+    # no patch, so there is no colour to read, and the previous khaki guess made the Moon
+    # look like desert.
+    return pv.StructuredGrid(xx, yy, z), (tuple(colour) if colour else (0.55, 0.55, 0.52))
 
 
 SCM_HEADER = struct.Struct("<8sIIdd7dii")
@@ -561,12 +564,15 @@ def scm_sources(directory, ranks):
 
 
 def snap_to_grid(src, gx, gy):
-    """Grow a source's index box out to whole terrain cells, and give the world box.
+    """Grow a source's node box out to whole terrain cells, and give the world box.
 
-    Snapping is what makes the seam invisible. Along a shared cell edge the patch's
-    bilinear base collapses to linear interpolation between the same two corner heights the
-    coarse edge uses, so patch and terrain meet exactly -- but only if the patch boundary
-    IS a cell boundary. Cut on an arbitrary line and the two surfaces disagree across it.
+    The cut has to be on cell boundaries because only whole cells can be blanked. But the
+    terrain pitch is 4.0157 m -- length/(nv_x-1), not a round number -- and SCM nodes are
+    0.1 m apart, so the two grids are INCOMMENSURATE: a patch whose edges are node
+    multiples can miss a cell boundary by up to half a node, leaving a gap that shows
+    background along one side of the hole and an overlap that z-fights along another.
+    That is the rectangular outline. The patch therefore carries the cell boundary itself
+    as its outer ring -- see build_rut_patches -- and this returns both boxes.
     """
     d = src["delta"]
     x0, x1 = src["i0"] * d, src["i1"] * d
@@ -575,10 +581,12 @@ def snap_to_grid(src, gx, gy):
     cx1 = int(np.clip(np.searchsorted(gx, x1), 1, len(gx) - 1))
     cy0 = int(np.clip(np.searchsorted(gy, y0) - 1, 0, len(gy) - 2))
     cy1 = int(np.clip(np.searchsorted(gy, y1), 1, len(gy) - 1))
-    wx0, wx1, wy0, wy1 = gx[cx0], gx[cx1], gy[cy0], gy[cy1]
+    wx0, wx1, wy0, wy1 = float(gx[cx0]), float(gx[cx1]), float(gy[cy0]), float(gy[cy1])
+    # Interior nodes are those strictly inside the hole; the boundary is added separately.
+    eps = 1e-9
     return {
-        "i0": int(math.floor(wx0 / d + 0.5)), "i1": int(math.floor(wx1 / d + 0.5)),
-        "j0": int(math.floor(wy0 / d + 0.5)), "j1": int(math.floor(wy1 / d + 0.5)),
+        "i0": int(math.ceil(wx0 / d + eps)), "i1": int(math.floor(wx1 / d - eps)),
+        "j0": int(math.ceil(wy0 / d + eps)), "j1": int(math.floor(wy1 / d - eps)),
         "cells": (cx0, cx1, cy0, cy1), "world": (wx0, wx1, wy0, wy1),
     }
 
@@ -621,7 +629,7 @@ def build_rut_patches(pl, sources, boxes, sample_base, ground, clim, max_nodes=4
     for src, box in zip(sources, boxes):
         delta, frames, rate = src["delta"], src["frames"], src["rate"]
         i0, i1, j0, j1 = box["i0"], box["i1"], box["j0"], box["j1"]
-        cols, rows = i1 - i0 + 1, j1 - j0 + 1
+        cols, rows = i1 - i0 + 3, j1 - j0 + 3  # + the two boundary lines per axis
         if rows * cols > max_nodes:
             print(f"  ! rank {src['rank']} deformation spans {cols}x{rows} nodes, over the "
                   f"{max_nodes} cap; skipped", file=sys.stderr)
@@ -629,9 +637,16 @@ def build_rut_patches(pl, sources, boxes, sample_base, ground, clim, max_nodes=4
 
         import pyvista as pv
 
-        x = (np.arange(i0, i1 + 1)) * delta
-        y = (np.arange(j0, j1 + 1)) * delta
+        # Axes: the hole's own boundary, then every SCM node strictly inside it, then the
+        # far boundary. The first and last spacing is whatever is left over (< 0.1 m); the
+        # interior is exactly on nodes. That makes the seam EXACT -- the patch edge is the
+        # cell edge, where its bilinear base collapses to the same linear interpolation the
+        # coarse quad's edge uses -- while keeping the terrain on its own native vertices.
+        wx0, wx1, wy0, wy1 = box["world"]
+        x = np.concatenate(([wx0], np.arange(i0, i1 + 1) * delta, [wx1]))
+        y = np.concatenate(([wy0], np.arange(j0, j1 + 1) * delta, [wy1]))
         xx, yy = np.meshgrid(x, y)
+        rows, cols = len(y), len(x)
         grid = pv.StructuredGrid(xx, yy, np.zeros_like(xx))
 
         # Index map built FROM THE GRID'S OWN POINT COORDINATES, never from an assumed
@@ -643,18 +658,29 @@ def build_rut_patches(pl, sources, boxes, sample_base, ground, clim, max_nodes=4
         px, py = grid.points[:, 0], grid.points[:, 1]
         base = sample_base(px, py)
         grid.points[:, 2] = base
-        col = np.rint(px / delta).astype(np.int64) - i0
-        row = np.rint(py / delta).astype(np.int64) - j0
-        lut = np.full((rows, cols), -1, dtype=np.int64)
-        lut[row, col] = np.arange(grid.n_points)
+
+        # Node -> point index, built from the grid's own coordinates. VTK orders structured
+        # points with the FIRST dimension fastest, so for meshgrid(x, y) the y index moves
+        # fastest; assuming the other order silently transposes every rut, which is exactly
+        # how this first shipped. Deriving the map from coordinates cannot get that wrong.
+        ci = np.searchsorted(x, px)
+        ri = np.searchsorted(y, py)
+        flat_of = np.full((rows, cols), -1, dtype=np.int64)
+        flat_of[ri, ci] = np.arange(grid.n_points)
+        # Which axis entries ARE nodes (the two boundary lines are not).
+        col_for_i = np.full(i1 - i0 + 1, -1, dtype=np.int64)
+        row_for_j = np.full(j1 - j0 + 1, -1, dtype=np.int64)
+        col_for_i[np.arange(i1 - i0 + 1)] = np.arange(1, cols - 1)
+        row_for_j[np.arange(j1 - j0 + 1)] = np.arange(1, rows - 1)
+        lut = flat_of[np.ix_(row_for_j, col_for_i)]
         if (lut < 0).any():
             print(f"  ! rank {src['rank']}: {int((lut < 0).sum())} patch node(s) unmapped",
                   file=sys.stderr)
         # Self-check: the point a node maps to must actually SIT at that node.
-        probe_r, probe_c = rows // 2, cols // 2
-        pi = lut[probe_r, probe_c]
+        pr, pc = (j1 - j0) // 2, (i1 - i0) // 2
+        pi = lut[pr, pc]
         if pi >= 0:
-            want = ((i0 + probe_c) * delta, (j0 + probe_r) * delta)
+            want = ((i0 + pc) * delta, (j0 + pr) * delta)
             got = (px[pi], py[pi])
             if abs(got[0] - want[0]) > 1e-6 or abs(got[1] - want[1]) > 1e-6:
                 raise AssertionError(f"rut index map is wrong: node {want} landed at {got}")
@@ -685,8 +711,8 @@ def apply_scm(patches, t):
             p["grid"].points[:, 2] = p["base"]
             p["grid"]["sinkage"][:] = 0.0
             p["cursor"] = 0
-        rows, cols = p["shape"]
         lut = p["lut"]
+        rows, cols = lut.shape
         z = p["grid"].points[:, 2]
         sink = p["grid"]["sinkage"]
         moved = False
@@ -894,7 +920,19 @@ def main():
 
     site = (meta or {}).get("site") or {}
     ring = float(site.get("collector_ring", 37.0))
-    pl.enable_lightkit()
+    # NOT enable_lightkit(): VTK's light kit ships a deliberately WARM key light (warmth
+    # 0.6 against 0.5 neutral), which tints the neutral grey regolith olive -- the terrain
+    # came out looking like desert rather than Moon. One white sun plus a dim white fill is
+    # both neutral and closer to the real thing, there being no atmosphere up there to
+    # scatter light into the shadows. The sun sits mid-elevation rather than at the sim's
+    # near-overhead angle because relief -- ruts, rock shadows, hull edges -- is what this
+    # view exists to show, and an overhead sun flattens all of it.
+    pl.remove_all_lights()
+    sun = pv.Light(color="white", light_type="scene light", intensity=1.05)
+    sun.set_direction_angle(38.0, -55.0)
+    pl.add_light(sun)
+    fill = pv.Light(color="white", light_type="camera light", intensity=0.22)
+    pl.add_light(fill)
 
     def frame_radius(radius, focal, elev_deg=21.0, azim_deg=-135.0, fill=0.88):
         """Camera that fits a circle of `radius` about `focal` into the window.

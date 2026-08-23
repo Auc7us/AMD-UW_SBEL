@@ -368,6 +368,12 @@ would truncate a long run the tool says so rather than silently decimating.
 Needs `pyvista` (`pip install pyvista imageio imageio-ffmpeg`), and a display for the
 interactive window -- `--movie` and `--shot` render off-screen and need neither.
 
+Lighting is one white sun plus a dim white fill, deliberately not VTK's `enable_lightkit()`,
+whose key light is warm by default (warmth 0.6 against 0.5 neutral) and tints neutral grey
+regolith olive -- the Moon came out looking like desert. The sun sits at mid elevation
+rather than the sim's near-overhead angle because relief is what this view exists to show,
+and an overhead sun flattens ruts, rock shadows and hull edges alike.
+
 Recordings carry ABSOLUTE mesh paths from the machine that produced them, so a run copied
 off the cluster names `/work1/...` and resolves to nothing locally. Those are re-rooted
 automatically: every path has a `data/` segment and what follows it is stable across
@@ -398,14 +404,20 @@ the ground mesh and cannot be shown on it. Each patch spans only the bounding bo
 actually touched -- tens of thousands of points, against the ~100 million a 0.1 m grid over
 the full patch would need.
 
-The terrain cells beneath each patch are CUT OUT, and the patch is snapped to whole terrain
-cells so that it can be. This matters more than it sounds: biasing one of two coincident
-surfaces -- polygon offset, a millimetre lift -- only settles the depth-buffer tie, and
-leaves two lots of geometry and shading in the same place, which at site distances reads as
-a rectangular slab hovering over the ground. Removing the covered cells leaves one surface.
-The seam is invisible because along a shared cell edge the patch's bilinear base collapses
-to linear interpolation between the same two corner heights the coarse edge uses -- exact,
-but only if the patch boundary is a cell boundary.
+The terrain cells beneath each patch are CUT OUT. Biasing one of two coincident surfaces --
+polygon offset, a millimetre lift -- only settles the depth-buffer tie, and leaves two lots
+of geometry and shading in the same place, which at site distances reads as a rectangular
+slab hovering over the ground. Removing the covered cells leaves one surface.
+
+The patch then has to fill the hole EXACTLY, and the two grids make that awkward: terrain
+pitch is 4.0157 m (`length/(nv_x-1)`, not a round number) and SCM nodes are 0.1 m apart, so
+they are incommensurate and a patch whose edges are node multiples misses the cell boundary
+by up to half a node. That leaves a gap showing background down one side of the hole and an
+overlap that z-fights down another -- a rectangular outline around the whole driven area.
+So the patch carries the cell boundary itself as its outer ring: first and last spacing is
+whatever is left over, the interior sits exactly on nodes. The seam is then exact to zero,
+because along a shared edge the patch's bilinear base collapses to the same linear
+interpolation the coarse quad's edge uses.
 
 Colour is sinkage against the undisturbed surface, with the zero end pinned to the
 terrain's own colour so undriven ground is invisible and the eye finds the tracks;
