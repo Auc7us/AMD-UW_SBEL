@@ -408,7 +408,14 @@ def load(directory, ranks, t_from, t_to, fps, keep_all, max_frames):
     t1 = min(ref[2][-1][1], t_to if t_to is not None else math.inf)
     if not t1 > t0:
         raise SystemExit(f"empty time window: {t0}..{t1}")
-    n = max(2, min(max_frames, int((t1 - t0) * max(0.1, fps)) + 1))
+    # fps <= 0 means "whatever the recording holds", i.e. no resampling at all.
+    if fps <= 0.0:
+        fps = rate or 60.0
+    want = int((t1 - t0) * max(0.1, fps)) + 1
+    n = max(2, min(max_frames, want))
+    if want > n:
+        print(f"  ! {want} frames wanted at {fps:g}/sim-s but --max-frames is {max_frames}; "
+              f"playing {n}, i.e. {n / max(1e-9, t1 - t0):.2f}/sim-s", file=sys.stderr)
     targets = np.linspace(t0, t1, n)
 
     poses = np.full((n, len(bodies), 7), np.nan, dtype=np.float32)
@@ -541,7 +548,10 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("directory")
     ap.add_argument("--rank", help="comma-separated ranks (default: all)")
-    ap.add_argument("--fps", type=float, default=30.0, help="playback frames per sim second")
+    ap.add_argument("--fps", type=float, default=0.0,
+                    help="playback frames per sim second; 0 (default) uses the recording's "
+                         "own rate, so every recorded frame is played and nothing is "
+                         "resampled -- at 60 Hz that is real time at 60 fps")
     ap.add_argument("--speed", type=float, default=1.0, help="sim seconds per wall second")
     ap.add_argument("--from", dest="t_from", type=float)
     ap.add_argument("--to", dest="t_to", type=float)
@@ -585,8 +595,11 @@ def main():
     print(f"ranks       {ranks}")
     print(f"bodies      {len(bodies)}"
           f"{' (running gear dropped)' if args.no_running_gear else ' incl. running gear'}")
-    print(f"frames      {len(times)} at {args.fps:g}/sim-s from {rate:g} Hz, "
-          f"t={times[0]:.2f}..{times[-1]:.2f} s")
+    span = max(1e-9, times[-1] - times[0])
+    played = (len(times) - 1) / span
+    print(f"frames      {len(times)} at {played:.2f}/sim-s from {rate:g} Hz recorded, "
+          f"t={times[0]:.2f}..{times[-1]:.2f} s"
+          + ("  (1:1, no resampling)" if abs(played - rate) < 0.01 * rate else ""))
 
     off = bool(args.movie or args.shot)
     w, h = (int(v) for v in args.window.lower().split("x"))
@@ -694,7 +707,9 @@ def main():
         return
 
     if args.movie:
-        pl.open_movie(args.movie, framerate=max(1, int(round(args.fps * args.speed))))
+        # Frame rate from what is actually being played, times the speed multiplier: with
+        # the default fps that makes a 60 Hz recording a 60 fps real-time video.
+        pl.open_movie(args.movie, framerate=max(1, int(round(played * args.speed))))
         for slot in range(len(times)):
             show(slot)
             pl.write_frame()
@@ -743,7 +758,7 @@ def main():
         if state["playing"]:
             show((state["slot"] + 1) % len(times))
 
-    interval = max(10, int(1000.0 / max(1.0, args.fps * state["speed"])))
+    interval = max(10, int(1000.0 / max(1.0, played * state["speed"])))
     pl.add_timer_event(max_steps=10 ** 9, duration=interval, callback=tick)
     print("keys        space play/pause | <- -> step | [ ] speed | t top | i iso | "
           "f follow | c free | r restart | q quit")

@@ -351,13 +351,19 @@ python3 tools/replay_run.py <dir> --speed 8                          # 8x
 python3 tools/replay_run.py <dir> --rank 1,2 --from 90 --to 140      # one sector, one cycle
 python3 tools/replay_run.py <dir> --no-running-gear                  # drop tracks, faster
 python3 tools/replay_run.py <dir> --boxes                            # bounding boxes, faster
-python3 tools/replay_run.py <dir> --movie clip.mp4 --fps 20          # off-screen to mp4
+python3 tools/replay_run.py <dir> --movie clip.mp4                   # off-screen to mp4
 python3 tools/replay_run.py <dir> --shot look.png --at 300           # one frame
 python3 tools/replay_run.py <dir> --focus "builder/Chassis" --focus-dist 7   # close on one machine
 ```
 
 Keys: `space` play/pause, arrows step a frame, `[` `]` speed, `t` top, `i` iso, `f` follow
 the next machine, `c` free camera, `r` restart, `q` quit.
+
+Playback is 1:1 with the recording by default -- `--fps` defaults to the rate in the file,
+so every recorded frame is played and nothing is resampled. A 60 Hz recording is therefore
+real time at 60 fps, and `--movie` writes it at exactly that: 1800 recorded frames come out
+as a 30.0 s, 60.00 fps video. `--fps` and `--speed` override it, and if `--max-frames`
+would truncate a long run the tool says so rather than silently decimating.
 
 Needs `pyvista` (`pip install pyvista imageio imageio-ffmpeg`), and a display for the
 interactive window -- `--movie` and `--shot` render off-screen and need neither.
