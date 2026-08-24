@@ -218,9 +218,11 @@ void RobotRig::InitializeOnTerrain(chrono::vehicle::ChTerrain& terrain,
         // A small active domain per rock so SCM actually supports them. Without it,
         // rocks lie outside every active domain, get no soil reaction, and fall
         // through the terrain during settle (spawning "under" the SCM surface).
-        const chrono::ChVector3d rock_domain(1.0, 1.0, 1.0);
+        // Sized in RobotLayout.h: covers the rock plus margin and not a square metre
+        // more, because every extra node is re-probed against a growing hash map on
+        // every step of the run.
         for (auto& rock : m_rocks)
-            scm->AddActiveDomain(rock, chrono::ChVector3d(0.0, 0.0, 0.3), rock_domain);
+            scm->AddActiveDomain(rock, scm_rock_domain_center, scm_rock_domain_dims);
     }
     Settle(terrain, settle_time, step_size);
     if (settle_time > 0) {
@@ -776,9 +778,8 @@ void RobotRig::StartNextHarvestCycle(double time) {
     // without this a later cycle's rocks spawn on the surface and sink straight through it.
     // The cycle-0 rocks get theirs in InitializeOnTerrain; these are the ones that follow.
     if (auto* scm = dynamic_cast<chrono::vehicle::SCMTerrain*>(m_terrain)) {
-        const chrono::ChVector3d rock_domain(1.0, 1.0, 1.0);
         for (size_t i = first_new; i < m_rocks.size(); ++i)
-            scm->AddActiveDomain(m_rocks[i], chrono::ChVector3d(0.0, 0.0, 0.3), rock_domain);
+            scm->AddActiveDomain(m_rocks[i], scm_rock_domain_center, scm_rock_domain_dims);
     }
 
     // DO NOT bind these into the VSG scene from here -- it segfaults. VSG needs new

@@ -33,7 +33,12 @@
 #include "chrono/timestepper/ChTimestepper.h"
 
 #include "chrono_vehicle/ChVehicleDataPath.h"
+#include <unordered_set>
+
 #include "chrono_vehicle/terrain/SCMTerrain.h"
+#include "chrono_vehicle/tracked_vehicle/ChTrackAssembly.h"
+#include "chrono_vehicle/tracked_vehicle/ChTrackShoe.h"
+#include "chrono_vehicle/tracked_vehicle/ChTrackedVehicle.h"
 #include "chrono_vehicle/wheeled_vehicle/ChWheeledVehicleVisualSystemVSG.h"
 
 #include "chrono_sensor/ChSensorManager.h"
@@ -713,6 +718,140 @@ struct PerfAccum {
     }
 };
 
+// ONE SCM active domain for a tracked vehicle's running gear, sized from where the shoes
+// actually are instead of from a box drawn round the whole hull.
+//
+// This replaces a hand-set 7.5 x 4.5 x 3.0 m box centred at x = -2.2. That box had the right
+// idea: a domain only selects which grid nodes fire rays, and the rays then hit whatever shape
+// is above them, so ONE box covering the footprint serves all ~130 shoes for a single ray-OBB
+// test instead of 130 separate domains. What it got wrong was its size. 33.75 m^2 is more than
+// twice the running gear's envelope, and at 0.02 m spacing every surplus square metre is 2500
+// grid nodes ray-cast on all 2000 steps of every simulated second, for the whole run. Measured
+// at 0.1 m spacing: 4049 nodes per step with the hull box, against 1478 with this one.
+//
+// WHY ONE ENVELOPE BOX AND NOT TWO NARROW ONES PER TRACK. Two boxes hugging the tracks are
+// cheaper still -- 1267 nodes per step, a 3.2x cut rather than 2.3x -- and they were tried. They
+// also uncover the soil BETWEEN the tracks, and that turns out to matter: rays from those nodes
+// were reaching the hull underside and returning reaction to the chassis. Removing them
+// destabilised the single-pin track, reproducing the exact failure this project already has on
+// record in RobotLayout.h -- an idler carrier rotating about the vertical, which its prismatic
+// joint forbids. It killed rank 2 at t=18.43 and t=22.57 in two 45 s A/B runs whose only
+// difference from a clean legacy run was this box. So the belly stays covered. The saving comes
+// from the 19 m^2 of bare ground OUTBOARD of the tracks, which nothing ever touches: the
+// vehicle's widest shape measures 2.686 m against the old box's 4.5 m.
+//
+// Sized from the shoe bodies rather than from constants so it cannot drift from whatever track
+// assembly is fitted. Shoe positions trace the whole loop -- bottom run, sprocket, idler, top
+// run -- so their x extent is the true ground contact span and their y extent is the two track
+// centre lines; scm_track_domain_margin covers half a shoe's width on top of that, and the
+// y span between the centre lines carries the belly for free. Attitude is not a concern:
+// UpdateActiveDomain projects the eight corners of the ROTATED OOBB and takes their axis-aligned
+// hull, so pitch and roll can only ever widen the covered region, never narrow it.
+//
+// Returns the number of domains registered (1, or 0 if the vehicle has no track shoes).
+int AddTrackActiveDomains(SCMTerrain& terrain, ChTrackedVehicle* vehicle, int rank) {
+    if (!vehicle)
+        return 0;
+    const ChFrame<>& chassis_ref = vehicle->GetChassisBody()->GetFrameRefToAbs();
+    ChVector3d lo(std::numeric_limits<double>::max());
+    ChVector3d hi(std::numeric_limits<double>::lowest());
+    size_t n_shoes = 0;
+    for (int side = 0; side < 2; ++side) {
+        auto track = vehicle->GetTrackAssembly(static_cast<VehicleSide>(side));
+        if (!track)
+            continue;
+        for (size_t i = 0; i < track->GetNumTrackShoes(); ++i) {
+            // Shoe frame expressed in the chassis reference frame -- the frame AddActiveDomain
+            // measures its OOBB centre in.
+            const ChVector3d p =
+                chassis_ref.TransformPointParentToLocal(track->GetTrackShoe(i)->GetShoeBody()->GetPos());
+            for (int k = 0; k < 3; ++k) {
+                lo[k] = std::min(lo[k], p[k]);
+                hi[k] = std::max(hi[k], p[k]);
+            }
+            ++n_shoes;
+        }
+    }
+    if (n_shoes == 0)
+        return 0;
+
+    const double m = scm_track_domain_margin;
+    const ChVector3d center(0.5 * (lo.x() + hi.x()), 0.5 * (lo.y() + hi.y()), 0.5 * (lo.z() + hi.z()));
+    const ChVector3d dims((hi.x() - lo.x()) + 2 * m,                      //
+                          (hi.y() - lo.y()) + 2 * m,                      //
+                          (hi.z() - lo.z()) + 2 * scm_track_domain_z_pad  //
+    );
+    terrain.AddActiveDomain(vehicle->GetChassisBody(), center, dims);
+    SynLog() << "Rank " << rank << " SCM running-gear domain from " << n_shoes << " shoes: " << dims.x() << " x "
+             << dims.y() << " m at (" << center.x() << ", " << center.y() << "), "
+             << static_cast<long>(dims.x() * dims.y() / (0.02 * 0.02)) << " nodes at 2 cm (hull box was 84375)\n";
+    return 1;
+}
+
+// Keep one invariant: a rock carries an SCM active domain IFF it can still move.
+//
+// WHY THIS EXISTS. A domain's job is to make SCM compute soil where a body can move through it.
+// A rock that has been laid in the wall, or frozen at a drop point as feedstock, is
+// SetFixed(true) -- it cannot move, so it needs no soil reaction. Its domain nonetheless keeps
+// selecting every grid node under it for a height lookup on every step for the rest of the run.
+// A construction run only ever lays more wall, so that cost accumulates monotonically, which is
+// exactly the shape of growth this is here to remove. Frozen rocks are dead weight in the
+// per-step budget and nothing else.
+//
+// It caught more than it was written for: the builder's six seed-pile rocks are SetFixed(true)
+// from the moment they are placed, so their six domains were surplus from t=0 in every run this
+// project has ever done. They now come off at t=0.
+//
+// WHY RECONCILE RATHER THAN HOOK SetFixed. A rock's fixed/dynamic state is flipped from five
+// places across four files -- the collector's dump and its settle-and-freeze (RobotRig), the
+// gripper's pick and its place (LrvArm), and the wall bridge (BuilderArmRosBridge) -- each
+// inside its own state machine. Hooking all five means the invariant holds only while all five
+// stay hooked, and the failure mode is silent and severe: a rock that goes dynamic without a
+// domain gets no soil support and falls through the terrain. Stating the invariant once and
+// re-asserting it every step cannot drift, and it self-heals if a new path appears.
+//
+// A rock is assumed to already hold a domain the first time it is seen, because every creation
+// path registers one (RobotRig::InitializeOnTerrain, RobotRig::AddCycleRocks, and the seed pile
+// in main). So this only ever acts on transitions, never on the initial state.
+struct ScmRockDomains {
+    std::unordered_set<const ChBody*> seen;   // rocks this has looked at at least once
+    std::unordered_set<const ChBody*> holds;  // rocks believed to hold a domain right now
+    long added = 0;
+    long removed = 0;
+};
+
+void ReconcileRockDomains(SCMTerrain& terrain,
+                          const std::vector<std::shared_ptr<ChBodyAuxRef>>& rocks,
+                          ScmRockDomains& state,
+                          double time,
+                          int rank) {
+    for (const auto& rock : rocks) {
+        if (!rock)
+            continue;
+        const ChBody* key = rock.get();
+        if (state.seen.insert(key).second)
+            state.holds.insert(key);  // registered by whichever path created it
+        const bool wants = !rock->IsFixed();
+        const bool has = state.holds.count(key) > 0;
+        if (wants == has)
+            continue;
+        if (wants) {
+            terrain.AddActiveDomain(rock, scm_rock_domain_center, scm_rock_domain_dims);
+            state.holds.insert(key);
+            ++state.added;
+        } else {
+            terrain.RemoveActiveDomain(rock);
+            state.holds.erase(key);
+            ++state.removed;
+        }
+        // Rare -- a rock changes state a handful of times per harvest cycle -- and worth having in
+        // the log, because a domain count that does not fall as the wall goes up is the symptom
+        // this is here to prevent.
+        SynLog() << "Rank " << rank << " SCM rock domain " << (wants ? "added" : "removed") << " at t=" << time
+                 << " (" << rock->GetName() << "); " << terrain.GetNumActiveDomains() << " domains now.\n";
+    }
+}
+
 // Wall-clock stopwatch that adds its own lifetime to an accumulator field.
 class ScopedTimer {
   public:
@@ -1345,14 +1484,10 @@ int main(int argc, char* argv[]) {
         MeshifyTrackShoeSoilContact(builder->GetVehicle(), system);
 
         {
-            const ChVector3d hull_domain_center(-2.2, 0.0, -0.4);
-            const ChVector3d hull_domain_dims(7.5, 4.5, 3.0);
-            terrain->AddActiveDomain(builder->GetVehicle()->GetChassisBody(), hull_domain_center, hull_domain_dims);
-            const ChVector3d rock_domain(1.0, 1.0, 1.0);
+            const int n_track_domains = AddTrackActiveDomains(*terrain, builder->GetVehicle(), rank);
             for (const auto& rock : builder_pile_rocks)
-                terrain->AddActiveDomain(rock, ChVector3d(0.0, 0.0, 0.3), rock_domain);
-            SynLog() << "Rank " << rank << " SCM active domains: 1 builder hull ("
-                     << hull_domain_dims.x() << " x " << hull_domain_dims.y() << " m) + "
+                terrain->AddActiveDomain(rock, scm_rock_domain_center, scm_rock_domain_dims);
+            SynLog() << "Rank " << rank << " SCM active domains: " << n_track_domains << " builder track + "
                      << builder_pile_rocks.size() << " seed rocks.\n";
         }
         // Nothing may command this builder until its track has found equilibrium on the
@@ -1627,6 +1762,7 @@ int main(int argc, char* argv[]) {
         return std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - wall_start).count();
     };
     PerfAccum perf_accum;
+    ScmRockDomains rock_domain_state;
     double perf_window_start_wall = 0.0;
     double perf_window_start_sim = 0.0;
     double next_perf_log = perf_log_period;
@@ -1711,6 +1847,10 @@ int main(int argc, char* argv[]) {
                 }
             }
             const DriverInputs driver_inputs = robot->GetDriverInputs();
+            // Before the terrain is advanced, so a rock that just went dynamic has soil under it
+            // on the very step it starts to move.
+            ReconcileRockDomains(*terrain, robot->GetRocks(), rock_domain_state, time, rank);
+            ReconcileRockDomains(*terrain, builder_pile_rocks, rock_domain_state, time, rank);
             {
                 ScopedTimer timer(perf_accum.robot_sync);
                 terrain->Synchronize(time);
@@ -1787,6 +1927,22 @@ int main(int argc, char* argv[]) {
                  << " bsync=" << (perf_accum.bldr_sync * n) << " radv=" << (perf_accum.robot_adv * n)
                  << " badv=" << (perf_accum.bldr_adv * n) << " sensor=" << (perf_accum.sensor * n)
                  << " render=" << (perf_accum.render * n) << "\n";
+            // SCM's own counters, because this is where a 2 cm run's time actually goes and
+            // neither number is visible in the section breakdown above. `nodes` is the count of
+            // grid nodes that fired a ray on the last step -- the sum over every active domain of
+            // its projected footprint, so it jumps whenever a domain is added and never falls on
+            // its own. `deformed` is the sparse node map's size, which only grows. `rc` is SCM's
+            // own ray-cast timer for the last step, in ms.
+            //
+            // The pathology to watch for is rc climbing while nodes holds steady: that is not more
+            // work, it is the SAME work getting slower because `deformed` has outgrown the cache
+            // and every one of those `nodes` height lookups turned into a DRAM round trip.
+            if (terrain) {
+                perf << "       scm   nodes=" << terrain->GetNumRayCasts() << " hits=" << terrain->GetNumRayHits()
+                     << " deformed=" << terrain->GetNumDeformedNodes() << " domains=" << terrain->GetNumActiveDomains()
+                     << " rc_ms=" << terrain->GetTimerRayCasting()
+                     << " ad_ms=" << terrain->GetTimerActiveDomains() << "\n";
+            }
             perf << "       chtim step=" << (perf_accum.sys_step * n) << " coll=" << (perf_accum.sys_coll * n)
                  << " [broad=" << (perf_accum.sys_broad * n) << " narrow=" << (perf_accum.sys_narrow * n)
                  << "] setup=" << (perf_accum.sys_setup * n) << " solve=" << (perf_accum.sys_solve * n)

@@ -495,4 +495,55 @@ inline chrono::ChVector3d BuilderPileCenter(int builder_index, int num_builders,
                               site_center_y + builder_pile_radius * std::sin(angle), 0.0);
 }
 
+// ---------------------------------------------------------------------------
+// SCM active-domain sizing
+// ---------------------------------------------------------------------------
+//
+// An active domain does one job: it selects which grid nodes fire a ray this step.
+// Soil is only computed where a domain covers it, so a domain must cover its body's
+// contact footprint -- but every square metre it covers BEYOND that footprint is paid
+// for on every step of the run, forever, and at 2 cm spacing a square metre is 2500
+// nodes.
+//
+// The cost is not the ray. It is that each node's ray origin needs its current height,
+// and SCMLoader::GetHeight() resolves that through m_grid_map.find() -- one random hash
+// probe per node per step. m_grid_map holds every node ever deformed, so it GROWS: a
+// 13.7 h two-rover run at 2 cm went 52.8k -> 891k entries (5 MB -> 85 MB), and once it
+// outgrew L3 every probe became two DRAM round trips. Measured on that run: wall/sim
+// climbed 70 -> 120 cumulative, which for linear growth means the instantaneous rate
+// roughly tripled. 194k nodes/step x ~150 ns of added probe latency is ~29 ms/step,
+// and at a 5e-4 s step that is ~58 wall-seconds per simulated second of pure overhead.
+//
+// So domains are sized to the footprint plus a stated margin, and nothing more. The
+// margin only has to absorb geometry, not attitude: UpdateActiveDomain projects the
+// eight corners of the ROTATED OOBB and takes their axis-aligned hull, so pitch and
+// roll can only ever EXPAND the covered region. A box sized in the body frame cannot
+// uncover its own contact patch.
+
+// Rocks measure at most 0.263 x 0.284 x 0.227 m (read off a run's object manifest), so
+// 0.6 m square leaves >= 0.16 m of margin on the widest one.
+//
+// Was 1.0 x 1.0 x 1.0 centred (0, 0, 0.3). Unrotated that is 2500 nodes against 900;
+// under free rotation the projected hull is bounded by the box diagonal, so 7500 against
+// 2700. Twelve rock domains were 90k of the 194k nodes cast per step on one rank -- the
+// single largest term, larger than the eight wheels and the whole builder combined.
+//
+// The z extent is what reaches the soil, so it is kept only just deep enough: the box
+// spans 0.2 m below the rock reference frame, exactly as the 1 m cube did.
+inline const chrono::ChVector3d scm_rock_domain_dims(0.6, 0.6, 0.6);
+inline const chrono::ChVector3d scm_rock_domain_center(0.0, 0.0, 0.1);
+
+// Margin added around the measured track-shoe footprint when building a tracked vehicle's
+// running-gear domain. Shoe positions give only the track centre lines, so this must exceed
+// half an M113 single-pin shoe's width (~0.19 m); 0.35 m clears that with 0.16 m to spare
+// outboard and adds 0.7 m of run-out fore and aft. Measured result: 5.167 x 2.859 m, which
+// is 36933 nodes at 2 cm spacing against 84375 for the 7.5 x 4.5 m box it replaces, and
+// still wider than the vehicle's widest shape (2.686 m) so nothing is uncovered.
+inline constexpr double scm_track_domain_margin = 0.35;
+
+// How far a track domain reaches below and above the shoe loop. The domain only has to
+// contain the ray segments fired from the soil under it, and those span the surface by
+// SCM's own test offsets; 1 m each way is far more than either needs.
+inline constexpr double scm_track_domain_z_pad = 1.0;
+
 }  // namespace amd_uw
