@@ -47,11 +47,12 @@ constexpr double lift_delay = 1.5;
 constexpr double place_tol = 0.15;
 constexpr double place_min_settle = 0.4;
 constexpr double place_timeout = 6.0;
-// The jaws must be CLEAR of the rock before the rock is let go -- see the OPENING phase.
-// Clear means back at the separation they hold when empty, less a millimetre of slew
-// tolerance; the timeout is a backstop for a finger that jams on geometry.
-constexpr double release_open_sep = finger_open_sep - 0.001;
-constexpr double release_open_timeout = 2.0;
+// How far the pads retreat off the rock before the weld is dropped -- see the OPENING
+// phase. Only the ~2 mm a side of commanded interpenetration has to be undone, so 15 mm is
+// a wide margin and costs 15/finger_slew_rate = 50 ms. The timeout is a backstop for a
+// finger that jams on geometry.
+constexpr double release_backoff = 0.015;
+constexpr double release_backoff_timeout = 0.5;
 constexpr double release_hold_time = 1.0;
 constexpr double stow_hold_time = 2.0;
 // The arm folds up IN PLACE before it swings away, and these bound that first stage: it is
@@ -745,8 +746,9 @@ void LrvArm::Update(double time) {
             std::cout << "[LrvArm " + m_log_tag + "] PLACING->RELEASING t=" << time << " elapsed=" << elapsed
                       << " |gripper-place|=" << place_err << " gripper_speed=" << gripper_speed
                       << (elapsed > place_timeout ? " (timeout)" : "") << "\n";
-            // Jaws open, rock still welded. See the OPENING phase for why the weld
-            // outlives the grip.
+            // Start opening, rock still welded. See the OPENING phase for why the weld
+            // outlives the grip by 50 ms.
+            m_grip_close_pos = m_applied_close_pos;
             m_close_pos = 0.0;
             CommandFingerPosition(0.0);
             m_phase = Phase::OPENING;
@@ -755,40 +757,49 @@ void LrvArm::Update(double time) {
         return;
     }
 
-    // LET GO ONLY ONCE THE JAWS ARE CLEAR OF THE ROCK.
+    // BACK THE PADS OFF THE ROCK, THEN LET GO. IN THAT ORDER, 50 ms APART.
     //
     // The rock is not held by friction, it is WELDED to the end effector, and TryLockRock
     // turns its collision OFF at the same moment so it cannot fight the fingers or the
     // terrain while it is carried. The fingers are ChLinkMotorLinearPosition -- position
     // CONSTRAINTS with no force limit -- and the closure they are given at lock time is
-    // 0.5 * (finger_open_sep - actual_sep) + 0.002, deliberately 2 mm per side past the
-    // separation that was measured on contact. With the rock's collision off there is
-    // nothing to stop them, so they close those 2 mm and the whole carry is spent with
-    // both pads INSIDE the rock.
+    // 0.5 * (finger_open_sep - actual_sep) + 0.002, deliberately 2 mm a side past the
+    // separation measured on contact. With the rock's collision off nothing stops them, so
+    // they close those 2 mm and the whole carry is spent with both pads inside the rock.
     //
-    // The old release then did RemoveRockLock() -- which re-enables collision -- and
-    // commanded the fingers open in the same call. That handed the contact solver two
-    // bodies already overlapping by ~2 mm a side and asked it to fix that in one step. It
-    // fixed it by firing the rock out of the jaws: measured on robot 1 at t=65.9, a 16 kg
-    // rock left a settled, stationary gripper at +0.75 m/s VERTICALLY and reached 2.0 m/s
-    // sideways over the next 0.6 s -- accelerating the whole time the pads were still
-    // sweeping out through it -- and cleared the trailer. Upward, from a standstill, is
-    // the tell: nothing was above it and gravity does not do that. Nothing visible hit the
-    // rock because the thing hitting it was inside it.
+    // Releasing straight out of that state -- RemoveRockLock(), which re-enables collision,
+    // in the same call that commands the fingers open -- hands the contact solver two
+    // bodies already overlapping and asks it to fix that in one step. It fixed it by firing
+    // the rock out of the jaws: a 16 kg rock left a settled, stationary gripper at
+    // +0.96 m/s VERTICALLY and reached 2.0 m/s sideways over the next 0.6 s, and cleared
+    // the trailer. Upward, from a standstill, is the tell -- nothing was above it.
     //
-    // So the weld now outlives the grip. The jaws open first, with the rock still welded
-    // and still non-colliding, which costs finger_close_pos / finger_slew_rate ~= 0.5 s
-    // and moves the rock not at all. Only when the pads are back at their empty separation
-    // is the weld dropped and collision restored -- on a body that is now touching
-    // nothing, at rest, and free to fall straight down. release_hold_time then still
-    // covers the fall: 0.5 m at lunar gravity is 0.79 s.
+    // So the weld outlives the grip, but only just. The pads start opening while the rock
+    // is still welded, and the weld is dropped as soon as they have retreated
+    // release_backoff past the closure they gripped at -- 15 mm against ~2 mm of
+    // interpenetration, which at finger_slew_rate takes 50 ms. The rock is then let go with
+    // its collision restored and NO pad touching it, so it starts falling at once and
+    // nothing pushes it sideways. The pads keep opening away from it as it goes: 0.1 s
+    // later they have receded 30 mm a side while the rock has fallen 8 mm, so it drops
+    // between widening jaws and never scrapes them.
+    //
+    // Waiting for the jaws to reach FULL open before letting go also worked, and was what
+    // this did first -- but it holds the rock motionless in mid-air for 220 ms, which reads
+    // as the rock floating and then falling. 50 ms does not read as anything.
+    //
+    // Deferring the collision restore instead -- weld dropped, jaws held shut, collision
+    // off until the rock has fallen clear -- was rejected on the numbers. place_height is
+    // 0.5 m to the GRIPPER and the rock hangs 0.128 m below gripper centre, so it falls
+    // about 0.25 m to the bed, which at lunar gravity is 0.56 s. Clearing the pads takes
+    // ~0.43 s of that, leaving 0.13 s before touchdown for a rock whose size varies with
+    // which of the three meshes it got. Too thin: run out of margin and the rock lands with
+    // its collision still off and sinks through the bed.
     if (m_phase == Phase::OPENING) {
-        const double sep = (m_finger_1->GetPos() - m_finger_2->GetPos()).Length();
-        const bool clear = sep >= release_open_sep;
-        if (clear || time - m_phase_time > release_open_timeout) {
+        const double backed_off = m_grip_close_pos - m_applied_close_pos;
+        if (backed_off >= release_backoff || time - m_phase_time > release_backoff_timeout) {
             std::cout << "[LrvArm " + m_log_tag + "] OPENING->RELEASING t=" << time
-                      << " sep=" << sep << " (clear needs " << release_open_sep << ")"
-                      << (clear ? "" : " (timeout)") << "\n";
+                      << " pad_backoff=" << backed_off << " (needs " << release_backoff << ")"
+                      << (backed_off >= release_backoff ? "" : " (timeout)") << "\n";
             RemoveRockLock();
             m_phase = Phase::RELEASING;
             m_phase_time = time;

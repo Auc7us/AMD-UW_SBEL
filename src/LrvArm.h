@@ -160,6 +160,7 @@ class LrvArm {
     // Fingers get the same treatment. The motors are built at +/-0.15 m, so that is
     // where the applied value starts.
     std::array<std::shared_ptr<chrono::ChFunctionSetpoint>, 2> m_finger_fn;
+    double m_grip_close_pos = 0.0;  // closure the pads held the rock at, for the release back-off
     double m_cmd_close_pos = 0.15;
     double m_applied_close_pos = 0.15;
 
