@@ -47,6 +47,11 @@ constexpr double lift_delay = 1.5;
 constexpr double place_tol = 0.15;
 constexpr double place_min_settle = 0.4;
 constexpr double place_timeout = 6.0;
+// The jaws must be CLEAR of the rock before the rock is let go -- see the OPENING phase.
+// Clear means back at the separation they hold when empty, less a millimetre of slew
+// tolerance; the timeout is a backstop for a finger that jams on geometry.
+constexpr double release_open_sep = finger_open_sep - 0.001;
+constexpr double release_open_timeout = 2.0;
 constexpr double release_hold_time = 1.0;
 constexpr double stow_hold_time = 2.0;
 // The arm folds up IN PLACE before it swings away, and these bound that first stage: it is
@@ -740,7 +745,51 @@ void LrvArm::Update(double time) {
             std::cout << "[LrvArm " + m_log_tag + "] PLACING->RELEASING t=" << time << " elapsed=" << elapsed
                       << " |gripper-place|=" << place_err << " gripper_speed=" << gripper_speed
                       << (elapsed > place_timeout ? " (timeout)" : "") << "\n";
-            OpenGripper();
+            // Jaws open, rock still welded. See the OPENING phase for why the weld
+            // outlives the grip.
+            m_close_pos = 0.0;
+            CommandFingerPosition(0.0);
+            m_phase = Phase::OPENING;
+            m_phase_time = time;
+        }
+        return;
+    }
+
+    // LET GO ONLY ONCE THE JAWS ARE CLEAR OF THE ROCK.
+    //
+    // The rock is not held by friction, it is WELDED to the end effector, and TryLockRock
+    // turns its collision OFF at the same moment so it cannot fight the fingers or the
+    // terrain while it is carried. The fingers are ChLinkMotorLinearPosition -- position
+    // CONSTRAINTS with no force limit -- and the closure they are given at lock time is
+    // 0.5 * (finger_open_sep - actual_sep) + 0.002, deliberately 2 mm per side past the
+    // separation that was measured on contact. With the rock's collision off there is
+    // nothing to stop them, so they close those 2 mm and the whole carry is spent with
+    // both pads INSIDE the rock.
+    //
+    // The old release then did RemoveRockLock() -- which re-enables collision -- and
+    // commanded the fingers open in the same call. That handed the contact solver two
+    // bodies already overlapping by ~2 mm a side and asked it to fix that in one step. It
+    // fixed it by firing the rock out of the jaws: measured on robot 1 at t=65.9, a 16 kg
+    // rock left a settled, stationary gripper at +0.75 m/s VERTICALLY and reached 2.0 m/s
+    // sideways over the next 0.6 s -- accelerating the whole time the pads were still
+    // sweeping out through it -- and cleared the trailer. Upward, from a standstill, is
+    // the tell: nothing was above it and gravity does not do that. Nothing visible hit the
+    // rock because the thing hitting it was inside it.
+    //
+    // So the weld now outlives the grip. The jaws open first, with the rock still welded
+    // and still non-colliding, which costs finger_close_pos / finger_slew_rate ~= 0.5 s
+    // and moves the rock not at all. Only when the pads are back at their empty separation
+    // is the weld dropped and collision restored -- on a body that is now touching
+    // nothing, at rest, and free to fall straight down. release_hold_time then still
+    // covers the fall: 0.5 m at lunar gravity is 0.79 s.
+    if (m_phase == Phase::OPENING) {
+        const double sep = (m_finger_1->GetPos() - m_finger_2->GetPos()).Length();
+        const bool clear = sep >= release_open_sep;
+        if (clear || time - m_phase_time > release_open_timeout) {
+            std::cout << "[LrvArm " + m_log_tag + "] OPENING->RELEASING t=" << time
+                      << " sep=" << sep << " (clear needs " << release_open_sep << ")"
+                      << (clear ? "" : " (timeout)") << "\n";
+            RemoveRockLock();
             m_phase = Phase::RELEASING;
             m_phase_time = time;
         }
@@ -813,7 +862,7 @@ void LrvArm::Update(double time) {
 
 bool LrvArm::IsBusy() const {
     return m_phase == Phase::APPROACH || m_phase == Phase::CLOSING || m_phase == Phase::LIFTING || m_phase == Phase::RETRACTING ||
-           m_phase == Phase::PLACING || m_phase == Phase::RELEASING || m_phase == Phase::STOWING;
+           m_phase == Phase::PLACING || m_phase == Phase::OPENING || m_phase == Phase::RELEASING || m_phase == Phase::STOWING;
 }
 
 ArmStatusSnapshot LrvArm::GetStatus() const {
@@ -827,6 +876,7 @@ const char* LrvArm::GetPhaseName() const {
         case Phase::CLOSING: return "CLOSING";
         case Phase::LIFTING: return "LIFTING";
         case Phase::PLACING: return "PLACING";
+        case Phase::OPENING: return "OPENING";
         case Phase::RELEASING: return "RELEASING";
         case Phase::RETRACTING: return "RETRACTING";
         case Phase::STOWING: return "STOWING";

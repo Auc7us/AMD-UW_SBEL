@@ -105,7 +105,7 @@ class LrvArm {
     // in LrvArm.cpp. Phase is internal only -- the state reported over ROS is the separate
     // coarse m_status.state (0 idle / 1 busy / 2 done / 3 failed) -- so adding a value here
     // cannot shift anything a controller compares against.
-    enum class Phase { IDLE, APPROACH, CLOSING, LIFTING, PLACING, RELEASING, RETRACTING, STOWING, DONE, FAILED };
+    enum class Phase { IDLE, APPROACH, CLOSING, LIFTING, PLACING, OPENING, RELEASING, RETRACTING, STOWING, DONE, FAILED };
 
     void CommandJointAngles(const std::array<double, 4>& theta);
     void CommandFingerPosition(double close_pos);
