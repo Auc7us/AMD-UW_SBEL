@@ -60,7 +60,10 @@ class PurePursuitController(Node):
         # Steering slew-rate limit (units/s of the [-1,1] command). Caps how fast the
         # commanded steer angle can change so pure-pursuit corrections come in smoothly
         # instead of snapping. 2.5 => full lock in ~0.4 s. Lower = gentler/slower.
-        self.declare_parameter("steering_ramp_per_s", 2.5)
+        # 1.5 => full lock in ~0.7 s. Was 2.5 (~0.4 s), which slams the lateral load into
+        # the axle rather than building it; the jerk is what spikes the joint, not the
+        # steady-state cornering force.
+        self.declare_parameter("steering_ramp_per_s", 1.5)
         self.declare_parameter("switch_radius_m", 1.0)
         self.declare_parameter("lookahead_min_m", 2.0)
         # Upper bound on the pure-pursuit lookahead. Without it the lookahead becomes
@@ -78,8 +81,19 @@ class PurePursuitController(Node):
         # low-traction regolith, which loses steering authority exactly when it is
         # needed. So turn on a bounded arc, under power, with room to swing: there is
         # 20+ m of open ground on the return leg, so a wide arc costs nothing.
-        self.declare_parameter("reverse_turn_steering", 0.6)
-        self.declare_parameter("reverse_turn_speed_mps", 1.2)
+        # 0.40 of full lock, not 0.60. At wheelbase_m 2.5 that is atan-free arithmetic:
+        # 0.40 * max_steering_angle_rad = 0.24 rad, so the arc radius is
+        # 2.5 / tan(0.24) = 10.2 m against 6.6 m at 0.60. On SCM the tires do not slip
+        # cleanly at the limit, they BULLDOZE -- soil piles against the sidewall and the
+        # lateral load goes into the axle instead of into yaw -- and the recovery from that
+        # is a locked steering axle that ruins the rest of the run. The return leg has 20+
+        # m of open ground, so the wider arc costs nothing but a couple of seconds.
+        self.declare_parameter("reverse_turn_steering", 0.40)
+        self.declare_parameter("reverse_turn_speed_mps", 1.0)
+        # Lateral acceleration the regolith will actually give, m/s^2. Cornering demand is
+        # v^2 * curvature; mu*g at lunar gravity is about 1.3, and SCM bulldozing resistance
+        # is not a clean friction circle, so this is deliberately under that.
+        self.declare_parameter("max_lateral_accel_mps2", 1.0)
         self.declare_parameter("wheelbase_m", 2.5)
         self.declare_parameter("max_steering_angle_rad", 0.6)
         self.declare_parameter("rock_side_offset_m", 1.5)
@@ -962,8 +976,7 @@ class PurePursuitController(Node):
         # arrives running ALONG the ring and never crosses the builder's orbit. See
         # home_approach_target.
         steering = self.compute_steering(self.home_approach_target())
-        if self._hard_turning:
-            target_speed = min(target_speed, float(self.get_parameter("reverse_turn_speed_mps").value))
+        target_speed = self.turn_speed(steering, target_speed)
         command = self.compute_speed_command(target_speed_override=target_speed)
         command.steering = steering
         self.command = self.ramp_command(command)
@@ -1067,10 +1080,57 @@ class PurePursuitController(Node):
 
         target = self.get_drive_target()
         steering = self.compute_steering(target)
-        speed_command = self.compute_speed_command(self.pickup_approach_target_speed(switch_radius))
+        # Same bounds as the home approach. This is the call site that had none at all.
+        speed_command = self.compute_speed_command(
+            self.turn_speed(steering, self.pickup_approach_target_speed(switch_radius)))
         speed_command.steering = steering
         self.command = self.ramp_command(speed_command)
         self.publish_command(self.command)
+
+    def turn_speed(self, steering_norm: float, base_speed: float) -> float:
+        """Speed to drive at, given the steer angle actually commanded.
+
+        A turn on regolith is bounded on BOTH sides and the old code only bounded one.
+
+        Too fast and cornering demand v^2 * curvature exceeds what the soil will give.
+        Too slow and an Ackermann vehicle produces no yaw moment at all: the tires just
+        plow, the rover digs in, and the lateral load goes into the steering axle. Logged
+        perf lines caught it doing exactly that -- `steer=-0.50 thr=0.72 speed=0.52`, three
+        quarters throttle at half lock making half a metre per second.
+
+        The reason it starved is that the hard-turn speed was applied as
+        min(target_speed, reverse_turn_speed_mps), while the comment above it said "the
+        turn runs at its own fixed speed". min() is not that: once the approach ramp had
+        wound target_speed below reverse_turn_speed_mps, the turn inherited the ramp's
+        speed instead of its own. So a hard turn taken while decelerating -- which is every
+        turn at the end of a leg -- ran at whatever was left.
+        """
+        if self._hard_turning:
+            base_speed = float(self.get_parameter("reverse_turn_speed_mps").value)
+        return min(base_speed, self.traction_speed_limit(steering_norm))
+
+    def traction_speed_limit(self, steering_norm: float) -> float:
+        """Upper bound the regolith can hold at this steer angle, m/s.
+
+        THE BUG THIS EXISTS TO CLOSE. compute_steering is called from two places -- the
+        home approach and the outbound/pickup path -- and the hard-turn speed cap was
+        applied at only the first. So a rover that hit the hard-turn regime on its way OUT,
+        which is what happens on the turn that starts a new cycle, took a 0.36 rad arc at
+        the full target_speed_mps. Launched at 5 m/s that is v^2 * curvature =
+        25 * tan(0.36)/2.5 = 3.8 m/s^2 of cornering demand against ~1.3 available: it
+        bulldozes, the lateral load goes into the steering axle, and the axle locks.
+
+        Deriving it from the traction budget rather than a fixed number means the limit
+        follows whatever steer angle is actually commanded, so ordinary pure-pursuit
+        corrections at cruise are covered too, not just the hard-turn case.
+        """
+        max_angle = max(1e-6, float(self.get_parameter("max_steering_angle_rad").value))
+        wheelbase = max(1e-6, float(self.get_parameter("wheelbase_m").value))
+        a_lat = max(1e-6, float(self.get_parameter("max_lateral_accel_mps2").value))
+        curvature = abs(math.tan(clamp(abs(steering_norm), 0.0, 1.0) * max_angle)) / wheelbase
+        if curvature <= 1e-6:
+            return float("inf")
+        return math.sqrt(a_lat / curvature)
 
     def compute_steering(self, target: Tuple[float, float]) -> float:
         target_x, target_y = target
