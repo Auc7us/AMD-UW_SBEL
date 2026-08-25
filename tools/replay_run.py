@@ -544,8 +544,28 @@ def rut_colormap(ground):
     return [ground, "#7d776b", "#655e51", "#4c4539", "#332d24", "#1f1a14"]
 
 
+NODE_SHIFT = 20
+NODE_BIAS = 1 << (NODE_SHIFT - 1)
+
+
+def pack_nodes(i, j):
+    """One int64 key per (i, j), sorting by i then j. |j| must stay under 2^19, which a
+    0.02 m grid reaches at 10 km -- three times the whole 1024 m patch."""
+    return ((np.asarray(i, dtype=np.int64) << NODE_SHIFT)
+            + (np.asarray(j, dtype=np.int64) + NODE_BIAS))
+
+
+def unpack_nodes(key):
+    return key >> NODE_SHIFT, (key & ((1 << NODE_SHIFT) - 1)) - NODE_BIAS
+
+
 def scm_sources(directory, ranks):
-    """Read every rank_<r>_scm.bin once: nodes, plus the index box each rank ever touched."""
+    """Read every rank_<r>_scm.bin once: its frames, and the node SET it ever deformed.
+
+    The recorder republishes a node in every keyframe after it first moves, so the frames
+    hold the same node many times over -- 5.1 M rows describing 254 k distinct nodes, on a
+    16-rank run. Deduplicating once, here, is what every later stage tiles and counts from.
+    """
     out = []
     for rank in ranks:
         path = os.path.join(directory, f"rank_{rank}_scm.bin")
@@ -562,209 +582,338 @@ def scm_sources(directory, ranks):
                 and abs(plane[3] - 1.0) < 1e-9):
             print(f"  ! {os.path.basename(path)}: patch plane is not the identity; rut "
                   f"heights are drawn as world z anyway", file=sys.stderr)
-        ii = np.concatenate([f[1] for f in frames])
-        jj = np.concatenate([f[2] for f in frames])
-        out.append({
-            "rank": rank, "delta": delta, "rate": rate, "frames": frames,
-            "i0": int(ii.min()), "i1": int(ii.max()),
-            "j0": int(jj.min()), "j1": int(jj.max()),
-            "nodes": int(len(set(zip(ii.tolist(), jj.tolist())))),
-        })
+        ukey, inv = np.unique(pack_nodes(np.concatenate([f[1] for f in frames]),
+                                         np.concatenate([f[2] for f in frames])),
+                              return_inverse=True)
+        ui, uj = unpack_nodes(ukey)
+        out.append({"rank": rank, "delta": delta, "rate": rate,
+                    "frames": compress_frames(frames, inv.astype(np.int32), len(ukey)),
+                    "ui": ui, "uj": uj, "nodes": int(len(ui))})
     return out
 
 
-def snap_to_grid(src, gx, gy):
-    """Grow a source's node box out to whole terrain cells, and give the world box.
 
-    The cut has to be on cell boundaries because only whole cells can be blanked. But the
-    terrain pitch is 4.0157 m -- length/(nv_x-1), not a round number -- and SCM nodes are
-    0.1 m apart, so the two grids are INCOMMENSURATE: a patch whose edges are node
-    multiples can miss a cell boundary by up to half a node, leaving a gap that shows
-    background along one side of the hole and an overlap that z-fights along another.
-    That is the rectangular outline. The patch therefore carries the cell boundary itself
-    as its outer ring -- see build_rut_patches -- and this returns both boxes.
+def compress_frames(frames, ids, n_nodes):
+    """Rewrite the frames as (time, node ids, height), keeping only rows that CHANGE a
+    node's height, and addressing nodes by their index in the rank's own node set.
+
+    Two things are being paid for here, once, so that playback does not pay them per row.
+
+    The recorder writes a keyframe every 5 s carrying every node touched since the run
+    began -- its recovery mechanism, so a consumer joining mid-file or dropping a sample is
+    only stale, never permanently wrong. A consumer accumulating from t=0 has already been
+    told all of it: measured on a 16-rank run, 22 keyframes per rank hold 56.6% of all 5.1
+    M rows and not one of them changes a height. Dropping them is exact, not approximate --
+    a row survives iff it differs from the last height written to that node.
+
+    And a node's place in the rut meshes never moves, so resolving it belongs here, against
+    the 254 k node SET, rather than in apply_scm against the 5.1 M rows -- a 20x difference
+    in how often the same answer is computed. This returns the ids; build_rut_layers turns
+    them into mesh points once each.
+
+    One behaviour does change, and only when --rut-fine asks for an overlay COARSER than
+    the recording's node pitch, which is not the default. Several nodes then share a fine
+    point, and apply_scm resolves that within a frame by letting the deepest win. Between
+    frames the most recent write wins, so a shallow node can now take a point back off a
+    deeper neighbour and keep it -- where before, the next keyframe re-asserted the whole
+    set and the sort restored the deeper one within 5 s. At the default overlay pitch each
+    point has exactly one node and nothing is shared, so nothing here applies.
     """
-    d = src["delta"]
-    x0, x1 = src["i0"] * d, src["i1"] * d
-    y0, y1 = src["j0"] * d, src["j1"] * d
-    cx0 = int(np.clip(np.searchsorted(gx, x0) - 1, 0, len(gx) - 2))
-    cx1 = int(np.clip(np.searchsorted(gx, x1), 1, len(gx) - 1))
-    cy0 = int(np.clip(np.searchsorted(gy, y0) - 1, 0, len(gy) - 2))
-    cy1 = int(np.clip(np.searchsorted(gy, y1), 1, len(gy) - 1))
-    wx0, wx1, wy0, wy1 = float(gx[cx0]), float(gx[cx1]), float(gy[cy0]), float(gy[cy1])
-    # Interior nodes are those strictly inside the hole; the boundary is added separately.
-    eps = 1e-9
-    return {
-        "i0": int(math.ceil(wx0 / d + eps)), "i1": int(math.floor(wx1 / d - eps)),
-        "j0": int(math.ceil(wy0 / d + eps)), "j1": int(math.floor(wy1 / d - eps)),
-        "cells": (cx0, cx1, cy0, cy1), "world": (wx0, wx1, wy0, wy1),
-    }
+    edges = np.concatenate(([0], np.cumsum([len(f[1]) for f in frames])))
+    last = np.full(n_nodes, np.nan)
+    out = []
+    for k, f in enumerate(frames):
+        s, e = edges[k], edges[k + 1]
+        fi, z = ids[s:e], f[3]
+        if len(fi):
+            changed = last[fi] != z
+            last[fi] = z
+            fi, z = fi[changed], z[changed]
+        out.append((f[0], fi, z))
+    return out
 
 
-def blank_terrain_cells(grid, boxes):
-    """Hide the terrain cells the rut patches replace, so no two surfaces coincide.
+def deformed_cells(sources, gx, gy):
+    """The terrain cells any rank ever deformed, as sorted keys cx * len(gy) + cy.
+
+    THIS, and not a per-rank bounding box, is what the rut layers cover, because a rank's
+    work is not shaped anything like its bounding box. Each rank harvests a line of rocks
+    running radially out to 170 m, so its ruts are one long DIAGONAL lane -- and the
+    axis-aligned box around a diagonal lane is mostly not the lane. Measured over a 16-rank
+    run: 897 terrain cells carry deformation, and the sixteen bounding boxes around them
+    span 7019, a 7.8x overdraw whose boxes overlapped each other across 2768 cell-pairs.
+
+    That overlap was not merely wasteful. Every box was filled with an opaque coarse
+    surface, so sixteen of them stacked on top of one another, and whichever drew last hid
+    the fine rut tiles of every rank beneath it. Only the ranks whose lanes happened to
+    fall in uncontested ground showed ruts at all; the rest picked them up part way through
+    a run, at the moment their collector drove far enough out to leave the pile-up around
+    the site. Cells are shared by more than one rank in 21 places out of 897, so covering
+    the cells instead of the boxes removes the occlusion rather than just reducing it.
+    """
+    ny = len(gy)
+    keys = []
+    for src in sources:
+        d = src["delta"]
+        cx = np.clip(np.searchsorted(gx, src["ui"] * d) - 1, 0, len(gx) - 2)
+        cy = np.clip(np.searchsorted(gy, src["uj"] * d) - 1, 0, ny - 2)
+        keys.append(np.unique(cx.astype(np.int64) * ny + cy))
+    return np.unique(np.concatenate(keys)) if keys else np.empty(0, dtype=np.int64)
+
+
+def blank_terrain_cells(grid, cells, gy):
+    """Hide the terrain cells the rut layers replace, so no two surfaces coincide.
 
     Biasing one surface over the other -- polygon offset, a millimetre lift -- only hides
     the depth-buffer tie; it leaves two lots of geometry and shading in the same place, and
     at site distances that reads as a rectangular slab hovering over the ground, which is
     exactly what it looked like. Removing the covered cells leaves one surface everywhere.
     """
-    if not boxes:
+    if not len(cells):
         return 0
     rows, cols = grid.dimensions[0], grid.dimensions[1]
+    cx, cy = cells // len(gy), cells % len(gy)
     mask = np.zeros((rows - 1) * (cols - 1), dtype=bool)
-    for cx0, cx1, cy0, cy1 in boxes:
-        for col in range(cx0, cx1):
-            lo = col * (rows - 1) + cy0
-            hi = col * (rows - 1) + cy1
-            mask[lo:hi] = True
-    if mask.any():
-        grid.hide_cells(mask, inplace=True)
+    mask[cx * (rows - 1) + cy] = True
+    grid.hide_cells(mask, inplace=True)
     return int(mask.sum())
 
 
-def build_rut_patches(pl, sources, boxes, sample_base, ground, clim, budget=2_000_000):
-    """One decimated fine grid per rank, covering the nodes that rank ever deformed.
+def tile_lines(a, b, step, tol):
+    """Grid lines across the terrain cell [a, b]: both edges, and every global tile
+    boundary strictly inside them.
 
-    Separate from the terrain on purpose. The heightmap carries one vertex per 4.0157 m and
-    SCM nodes are `delta` apart -- 0.02 m in these runs, two hundred times finer -- so ruts
-    cannot be drawn on the ground mesh at all. Each patch spans only the bounding box its
-    own rank touched.
-
-    That box is still enormous at 0.02 m. A collector working a 60 x 34 m sector sweeps
-    3415 x 1809 = 6.2 M nodes, of which under 9% are ever deformed, so drawing every node
-    is not affordable -- and refusing to draw is worse than it sounds, because the terrain
-    underneath had already been cut away by then: the patch was skipped, the hole was not,
-    and the ruts showed up as a slab of background colour. So the grid is DECIMATED rather
-    than skipped. `budget` points are shared out between the ranks and each patch takes the
-    coarsest stride that fits, keeping its full extent. Deformation snaps to the nearest
-    kept node with the deepest value winning (see apply_scm), so a rut keeps the depth it
-    was recorded with and loses only width resolution.
-
-    Drawn with the terrain cells underneath removed, so the two surfaces never coincide:
-    the patch's outer ring IS the cell boundary, where its bilinear base collapses to the
-    same linear interpolation the coarse quad's edge uses, making the seam exact.
+    The two grids are INCOMMENSURATE -- the terrain pitch is 1024/255 = 4.0157 m and tiles
+    are 0.32 m -- so a cell edge almost never falls on a tile line. Carrying the edge as a
+    line of its own is what makes the seam with the surrounding terrain exact instead of
+    off by up to half a tile, and it also puts every quad wholly inside one terrain cell
+    and wholly inside one tile, so a quad's centre decides both without a tie. `tol` drops
+    an interior line that lands within one node of an edge, which would otherwise leave a
+    sliver too thin to give its points distinct nearest nodes.
     """
-    patches = []
-    if not sources:
-        return patches
+    k = np.arange(int(math.ceil(a / step)), int(math.floor(b / step)) + 1)
+    inner = k * step
+    inner = inner[(inner > a + tol) & (inner < b - tol)]
+    return np.concatenate(([a], inner, [b]))
+
+
+def build_rut_layers(pl, sources, cells, gx, gy, sample_base, ground, clim,
+                     coarse_m=0.16, fine_m=0.04, budget=2_000_000):
+    """Two meshes for the whole scene: a coarse surface filling the cut terrain cells, and
+    a fine overlay on exactly the tiles that were ever deformed.
+
+    WHY TWO LAYERS. One decimated grid over the deformed region has to pay for the region,
+    and a region is mostly undisturbed: measured over a 16-rank run, 4.13 M deformed nodes
+    sat inside 897 terrain cells of 100 M nodes, about 4%. Spending a fixed point budget on
+    all of it gives the ruts the coarsest stride the region will fit -- 0.36 m, at which a
+    one-metre rut is 2.8 points across and reads as a hairline. So the budget goes where
+    the deformation is: the ground is tiled at `coarse_m`, and a tile that any node ever
+    deformed is cut out of the coarse layer and re-drawn at `fine_m`. Cost then scales with
+    rut AREA rather than region area, and every rank gets the same resolution regardless of
+    how far it wandered.
+
+    Tile size is what decides how tightly the fine layer hugs a rut, so a SMALLER coarse
+    cell costs FEWER fine points, not more: over the same run, coarse 0.32 m needs 2.49 M
+    fine points at 0.04 m where coarse 1.0 m needs 4.26 M.
+
+    WHY ONE MESH EACH, rather than a pair per rank. The tile grid is global -- indexed from
+    node 0, not from any one rank's box -- so a tile names the same square of ground to
+    every rank, and one coarse layer can know which squares the fine layer has taken,
+    whoever deformed them. Two surfaces can then never occupy one place, which is what went
+    wrong when each rank filled its own bounding box (see deformed_cells). It also drops
+    the scene from 32 actors to 2.
+    """
+    if not sources or not len(cells):
+        return [], None
     import pyvista as pv
 
-    share = max(4096, int(budget) // len(sources))
-    for src, box in zip(sources, boxes):
-        delta, frames, rate = src["delta"], src["frames"], src["rate"]
-        i0, i1, j0, j1 = box["i0"], box["i1"], box["j0"], box["j1"]
-        span_i, span_j = i1 - i0 + 1, j1 - j0 + 1
-        if span_i < 2 or span_j < 2:
-            continue
-        # Coarsest stride that fits the share, counting the two boundary lines per axis.
-        # Seeded from the area so the loop is a correction, not a search.
-        stride = max(1, int(math.ceil(math.sqrt(span_i * span_j / float(share)))))
-        while ((span_i - 1) // stride + 3) * ((span_j - 1) // stride + 3) > share:
-            stride += 1
+    delta = sources[0]["delta"]
+    T = max(1, int(round(coarse_m / delta)))  # tile edge, in nodes
+    step = T * delta
 
-        # Axes: the hole's own boundary, then every stride-th SCM node strictly inside it,
-        # then the far boundary. The first and last spacing is whatever is left over
-        # (< stride * delta); the interior sits exactly on nodes, which is what keeps the
-        # seam exact while leaving the terrain on its own native vertices.
-        xs = np.arange(i0, i1 + 1, stride)
-        ys = np.arange(j0, j1 + 1, stride)
-        wx0, wx1, wy0, wy1 = box["world"]
-        x = np.concatenate(([wx0], xs * delta, [wx1]))
-        y = np.concatenate(([wy0], ys * delta, [wy1]))
-        xx, yy = np.meshgrid(x, y)
-        rows, cols = len(y), len(x)
-        grid = pv.StructuredGrid(xx, yy, np.zeros_like(xx))
-        base = sample_base(grid.points[:, 0], grid.points[:, 1])
-        grid.points[:, 2] = base
+    # Global tile grid. floor division, so a tile spans the same nodes either side of zero.
+    tkeys = np.unique(np.concatenate(
+        [pack_nodes(np.floor_divide(s["ui"], T), np.floor_divide(s["uj"], T))
+         for s in sources]))
 
-        # Node -> point index, arithmetic rather than a lookup table: at 0.02 m a table
-        # over the box is 49 MB per rank and buys nothing. VTK ravels structured points
-        # with the FIRST dimension fastest, so for meshgrid(x, y) the y index moves fastest
-        # and point (row, col) is col*rows + row. Assuming the other order silently
-        # TRANSPOSES every rut -- imprints across the direction of travel, smeared over the
-        # whole patch -- which is exactly how this first shipped, so it is checked below
-        # against the grid's own coordinates rather than trusted.
-        def point_of(ii, jj, i0=i0, j0=j0, stride=stride, rows=rows,
-                     nx=len(xs), ny=len(ys)):
-            c = 1 + np.minimum((ii - i0 + stride // 2) // stride, nx - 1)
-            r = 1 + np.minimum((jj - j0 + stride // 2) // stride, ny - 1)
-            return c * rows + r
+    # Fine resolution is capped by the budget, so --rut-nodes still means what it did: the
+    # most points this is allowed to spend. Coarsen the OVERLAY, never the tiling -- the
+    # tiling is what keeps the cost proportional to rut area.
+    for _ in range(8):
+        fs = max(1, int(round(fine_m / delta)))
+        while T % fs:
+            fs -= 1
+        if (T // fs + 1) ** 2 * len(tkeys) <= budget:
+            break
+        fine_m *= 2.0
+    n = T // fs           # fine cells along a tile edge
+    P = (n + 1) * (n + 1)  # fine points per tile
 
-        # Co-prime sample strides walk the check diagonally across the box, so a transposed
-        # or off-by-one map fails on the first patch built rather than on inspection of the
-        # render. Tolerance is half a stride: that IS the snap the decimation performs.
-        ci = np.arange(i0, i1 + 1, max(1, span_i // 37))
-        cj = np.arange(j0, j1 + 1, max(1, span_j // 41))
-        n = min(len(ci), len(cj))
-        probe = point_of(ci[:n], cj[:n])
-        dx = np.abs(grid.points[probe, 0] - ci[:n] * delta)
-        dy = np.abs(grid.points[probe, 1] - cj[:n] * delta)
-        tol = 0.5 * stride * delta + 1e-6
-        if dx.max() > tol or dy.max() > tol:
-            k = int(np.argmax(np.maximum(dx, dy)))
-            raise AssertionError(
-                f"rut index map is wrong: node ({ci[k] * delta}, {cj[k] * delta}) landed at "
-                f"({grid.points[probe[k], 0]}, {grid.points[probe[k], 1]})")
+    # ---- fine overlay: one patch per deformed tile -------------------------------------
+    ti, tj = unpack_nodes(tkeys)
+    M = len(tkeys)
+    off = np.arange(0, T + 1, fs)
+    NI = (ti * T)[:, None, None] + off[None, :, None]
+    NJ = (tj * T)[:, None, None] + off[None, None, :]
+    px = np.broadcast_to(NI * delta, (M, n + 1, n + 1)).astype(np.float64).ravel()
+    py = np.broadcast_to(NJ * delta, (M, n + 1, n + 1)).astype(np.float64).ravel()
+    # float32 throughout the rut meshes. VTK's mapper builds its vertex buffer in float, so
+    # double points are converted on every rebuild -- an extra pass over 26.7 M values, on
+    # top of storing 214 MB where 107 MB would do. At the 200 m these coordinates reach,
+    # float32 resolves 0.024 mm, against ruts measured in centimetres.
+    fbase = sample_base(px, py).astype(np.float32)
+    idx = np.arange(P).reshape(n + 1, n + 1)
+    quad = np.stack([idx[:-1, :-1], idx[1:, :-1], idx[1:, 1:], idx[:-1, 1:]],
+                    axis=-1).reshape(-1, 4)
+    allq = (quad[None, :, :] + (np.arange(M) * P)[:, None, None]).reshape(-1, 4)
+    # Faces in the CONSTRUCTOR, not assigned afterwards. pv.PolyData(points) with no cells
+    # builds one VERTEX cell per point, and assigning .faces later leaves them there -- so
+    # the overlay drew 8.9 M point glyphs on top of its own quads. That is the speckle of
+    # 2 cm dots over a flat tile, and it cost half a second a frame to draw. There is no
+    # legitimate reason for this mesh to carry vertex cells.
+    fine = pv.PolyData(np.column_stack([px, py, fbase]).astype(np.float32),
+                       np.column_stack([np.full(len(allq), 4), allq]).ravel())
+    fine.verts = np.empty(0, dtype=np.int64)  # belt and braces across pyvista versions
+    fine["sinkage"] = np.zeros(fine.n_points, dtype=np.float32)
 
-        grid["sinkage"] = np.zeros(grid.n_points)
-        # No offset, no lift: the terrain cells underneath are removed, so this is the
-        # only surface here and there is nothing to tie with. Flat shading rather than
-        # smooth: recomputing vertex normals over a million points every deformation
-        # sample is the whole frame budget, and on a grid this fine the facets are
-        # sub-centimetre anyway.
-        pl.add_mesh(grid, scalars="sinkage", cmap=rut_colormap(ground),
+    def fine_point(a, b, T=T, fs=fs, n=n, P=P, tkeys=tkeys):
+        ta, tb = np.floor_divide(a, T), np.floor_divide(b, T)
+        slot = np.searchsorted(tkeys, pack_nodes(ta, tb))
+        u = np.clip((a - ta * T + fs // 2) // fs, 0, n)
+        v = np.clip((b - tb * T + fs // 2) // fs, 0, n)
+        return slot * P + u * (n + 1) + v
+
+    # A transposed or off-by-one map smears every rut across its own tile, which is not
+    # something to notice by eye. Probe it against nodes that are known to be in the set.
+    pi, pj = sources[0]["ui"][:2048], sources[0]["uj"][:2048]
+    probe = fine_point(pi, pj)
+    dx = np.abs(fine.points[probe, 0] - pi * delta)
+    dy = np.abs(fine.points[probe, 1] - pj * delta)
+    tol = 0.5 * fs * delta + 1e-6
+    if dx.max() > tol or dy.max() > tol:
+        k = int(np.argmax(np.maximum(dx, dy)))
+        raise AssertionError(
+            f"fine rut map is wrong: node ({pi[k] * delta}, {pj[k] * delta}) landed at "
+            f"({fine.points[probe[k], 0]}, {fine.points[probe[k], 1]})")
+
+    # ---- coarse layer: the cut terrain cells, minus the tiles the fine layer took -------
+    ny = len(gy)
+    xy, faces, base = [], [], 0
+    for key in cells.tolist():
+        cx, cy = key // ny, key % ny
+        x = tile_lines(float(gx[cx]), float(gx[cx + 1]), step, delta)
+        y = tile_lines(float(gy[cy]), float(gy[cy + 1]), step, delta)
+        xx, yy = np.meshgrid(x, y, indexing="ij")
+        ta = np.floor(0.5 * (x[:-1] + x[1:]) / step).astype(np.int64)
+        tb = np.floor(0.5 * (y[:-1] + y[1:]) / step).astype(np.int64)
+        k = pack_nodes(ta[:, None], tb[None, :])
+        pos = np.clip(np.searchsorted(tkeys, k), 0, M - 1)
+        taken = tkeys[pos] == k
+        g = np.arange(len(x) * len(y)).reshape(len(x), len(y)) + base
+        q = np.stack([g[:-1, :-1], g[1:, :-1], g[1:, 1:], g[:-1, 1:]], axis=-1).reshape(-1, 4)
+        faces.append(q[~taken.ravel()])
+        xy.append(np.column_stack([xx.ravel(), yy.ravel()]))
+        base += len(x) * len(y)
+
+    # Adjacent cells share their common edge, so weld the duplicated points: two points in
+    # one place would each need the deformation written to them, and only one of them would
+    # get it.
+    allxy = np.concatenate(xy)
+    _, first, inv = np.unique(np.rint(allxy / 1e-6).astype(np.int64), axis=0,
+                              return_index=True, return_inverse=True)
+    cxy = allxy[first]
+    cbase = sample_base(cxy[:, 0], cxy[:, 1]).astype(np.float32)
+    cq = inv[np.concatenate(faces)]
+    coarse = pv.PolyData(np.column_stack([cxy, cbase]).astype(np.float32),
+                         np.column_stack([np.full(len(cq), 4), cq]).ravel())
+    coarse.verts = np.empty(0, dtype=np.int64)
+    coarse["sinkage"] = np.zeros(coarse.n_points, dtype=np.float32)
+
+    # Coarse points take the height of their NEAREST node. Most sit on a tile line and so
+    # on a node exactly; the ones on a terrain cell edge cannot, the grids being
+    # incommensurate, and rounding puts them within half a node -- a centimetre -- of the
+    # right height. Sorted once here so a frame's nodes can be matched by searchsorted.
+    cnode = pack_nodes(np.rint(cxy[:, 0] / delta).astype(np.int64),
+                       np.rint(cxy[:, 1] / delta).astype(np.int64))
+    corder = np.argsort(cnode, kind="stable")
+    csorted = cnode[corder]
+
+    def coarse_point(a, b, csorted=csorted, corder=corder):
+        pos = np.clip(np.searchsorted(csorted, pack_nodes(a, b)), 0, len(csorted) - 1)
+        return corder[pos], csorted[pos] == pack_nodes(a, b)
+
+    cmap = rut_colormap(ground)
+    for mesh in (coarse, fine):
+        pl.add_mesh(mesh, scalars="sinkage", cmap=cmap,
                     clim=(0.0, max(1e-3, clim)), show_scalar_bar=False, specular=0.05)
-        patches.append({
-            "rank": src["rank"], "grid": grid, "base": base, "point_of": point_of,
-            "i0": i0, "i1": i1, "j0": j0, "j1": j1, "stride": stride, "delta": delta,
-            "rows": rows, "cols": cols, "cells": box["cells"], "frames": frames,
-            "cursor": 0, "time": -1.0, "rate": rate, "nodes": src["nodes"],
-        })
-    return patches
+
+    layers = {"coarse": coarse, "fine": fine, "coarse_base": cbase,
+              "fine_base": fbase, "tiles": M, "stride": T, "fine_step": fs,
+              "delta": delta, "cells": len(cells)}
+
+    # Resolve each rank's node SET to mesh points and base heights, once. compress_frames
+    # already reduced playback to node ids, so a frame costs one gather per array from
+    # these -- and they are 254 k long, where reading fbase[] directly walked an 8.9 M
+    # array whose 214 MB the renderer evicts from cache between every frame.
+    patches = []
+    for src in sources:
+        fp = fine_point(src["ui"], src["uj"])
+        cp, hit = coarse_point(src["ui"], src["uj"])
+        patches.append({"rank": src["rank"], "frames": src["frames"], "cursor": 0,
+                        "time": -1.0, "rate": src["rate"], "nodes": src["nodes"],
+                        "fp": fp, "fb": fbase[fp], "cp": cp, "cb": cbase[cp], "hit": hit})
+    return patches, layers
 
 
-def apply_scm(patches, t):
-    """Accumulate deformation up to sim time `t` onto every rut patch.
+def apply_scm(patches, layers, t):
+    """Accumulate deformation up to sim time `t` onto both layers.
 
-    Forward playback applies only the samples crossed since the last call. A jump
-    backwards rewinds to the pristine surface and replays -- cheap, because the whole run
-    is only tens of thousands of node writes, and correct, which incremental-only cannot
-    be when scrubbing.
+    Forward playback applies only the samples crossed since the last call. A jump backwards
+    rewinds to the pristine surfaces and replays -- cheap, because the whole run is only
+    tens of thousands of node writes, and correct, which incremental-only cannot be when
+    scrubbing. The two meshes are shared by every rank, so one rank rewinding rewinds all
+    of them: the surfaces carry no record of which rank wrote what.
+
+    Both layers are written, not just the fine one. The coarse layer owns the points along
+    the boundary of every cut tile, and leaving those flat puts a step at the seam wherever
+    a rut runs off the edge of its own tile.
     """
+    if layers is None:
+        return
+    coarse, fine = layers["coarse"], layers["fine"]
+    if any(t < p["time"] for p in patches):
+        for mesh, base in ((coarse, layers["coarse_base"]), (fine, layers["fine_base"])):
+            mesh.points[:, 2] = base
+            mesh["sinkage"][:] = 0.0
+        for p in patches:
+            p["cursor"], p["time"] = 0, -1.0
+    moved = False
     for p in patches:
-        if t < p["time"]:
-            p["grid"].points[:, 2] = p["base"]
-            p["grid"]["sinkage"][:] = 0.0
-            p["cursor"] = 0
-        z = p["grid"].points[:, 2]
-        sink = p["grid"]["sinkage"]
-        base, stride = p["base"], p["stride"]
-        moved = False
         while p["cursor"] < len(p["frames"]) and p["frames"][p["cursor"]][0] <= t:
-            _ft, ii, jj, zz = p["frames"][p["cursor"]]
+            _ft, nid, zz = p["frames"][p["cursor"]]
             p["cursor"] += 1
-            ok = ((ii >= p["i0"]) & (ii <= p["i1"])
-                  & (jj >= p["j0"]) & (jj <= p["j1"]))
-            if not ok.all():
-                ii, jj, zz = ii[ok], jj[ok], zz[ok]
-            if not len(ii):
+            if not len(nid):
                 continue
-            idx = p["point_of"](ii, jj)
-            if stride > 1:
-                # Several nodes share a grid point once the grid is decimated. Sort by
-                # height DESCENDING so the deepest lands last: numpy's advanced assignment
-                # keeps the last value written for a repeated index, so the deepest node
-                # wins and a rut with undisturbed ground beside it stays a rut instead of
-                # being filled back in by its neighbour.
-                order = np.argsort(-zz, kind="stable")
-                idx, zz = idx[order], zz[order]
-            z[idx] = zz
-            sink[idx] = base[idx] - zz
+            # Deepest last: several nodes share a point wherever a layer is coarser than
+            # the node pitch, and numpy's advanced assignment keeps the last write, so
+            # sorting by height descending leaves the deepest node owning the point. A rut
+            # beside undisturbed ground then stays a rut instead of being filled back in.
+            order = np.argsort(-zz, kind="stable")
+            nid, zz = nid[order], zz[order]
+            fi = p["fp"][nid]
+            fine.points[:, 2][fi] = zz
+            fine["sinkage"][fi] = p["fb"][nid] - zz
+            h = p["hit"][nid]
+            if h.any():
+                cn, cz = nid[h], zz[h]
+                ci = p["cp"][cn]
+                coarse.points[:, 2][ci] = cz
+                coarse["sinkage"][ci] = p["cb"][cn] - cz
             moved = True
         p["time"] = t
-        if moved:
-            p["grid"].Modified()
+    if moved:
+        coarse.Modified()
+        fine.Modified()
 
 
 def build_scene(pl, bodies, cache, boxes_only, meta, terrain_decimate, scenery,
@@ -840,19 +989,63 @@ def build_scene(pl, bodies, cache, boxes_only, meta, terrain_decimate, scenery,
     return actors, (drew_terrain if drew_terrain is not False else None), ground
 
 
-def apply_frame(actors, poses, slot):
-    """Push one frame onto the actors. Bodies that do not exist yet stay hidden."""
+def frame_matrices(actors):
+    """One vtkMatrix4x4 per actor, attached once and thereafter written in place.
+
+    `actor.user_matrix = m` looks harmless and is the single most expensive thing this
+    script did. PyVista's property setter builds a fresh vtkMatrix4x4 and marshals the
+    sixteen values across on every assignment: measured at 95 us per actor, so 313 ms per
+    frame for 3283 bodies -- against 15 ms to actually RENDER that same scene, ruts and
+    all. Playback was never GPU-bound; it was spending 95% of the frame in a setter.
+
+    Attaching the matrix once and mutating it costs one DeepCopy of a flat 16-tuple.
+    """
+    import vtk
+
+    mats = []
+    for actor in actors:
+        m = vtk.vtkMatrix4x4()
+        actor.SetUserMatrix(m)
+        mats.append(m)
+    return mats
+
+
+def apply_frame(actors, poses, slot, mats=None):
+    """Push one frame onto the actors. Bodies that do not exist yet stay hidden.
+
+    The quaternion -> rotation conversion is done for every body at once. Per-body it was
+    5.9 ms a frame, which is small next to the setter above but free to remove: the same
+    arithmetic vectorised over (N, 4) is 0.1 ms.
+    """
     row = poses[slot]
+    live = np.isfinite(row[:, 0])
+
+    q = row[:, 3:7]
+    n = np.sqrt((q * q).sum(axis=1))
+    n[~np.isfinite(n) | (n < 1e-12)] = 1.0
+    w, x, y, z = (q / n[:, None]).T
+    r00 = 1 - 2 * (y * y + z * z); r01 = 2 * (x * y - w * z); r02 = 2 * (x * z + w * y)
+    r10 = 2 * (x * y + w * z); r11 = 1 - 2 * (x * x + z * z); r12 = 2 * (y * z - w * x)
+    r20 = 2 * (x * z - w * y); r21 = 2 * (y * z + w * x); r22 = 1 - 2 * (x * x + y * y)
+    px, py, pz = row[:, 0], row[:, 1], row[:, 2]
+
     for i, actor in enumerate(actors):
-        p = row[i]
-        if not np.isfinite(p[0]):
+        if not live[i]:
             if actor.GetVisibility():
                 actor.SetVisibility(False)
             continue
-        m = np.eye(4)
-        m[:3, :3] = quat_matrix(p[3:7])
-        m[:3, 3] = p[0:3]
-        actor.user_matrix = m
+        m = mats[i] if mats is not None else actor.GetUserMatrix()
+        if m is None:  # no pre-attached matrix (older call site): fall back to the setter
+            mm = np.eye(4)
+            mm[:3, :3] = quat_matrix(row[i, 3:7])
+            mm[:3, 3] = row[i, 0:3]
+            actor.user_matrix = mm
+        else:
+            m.DeepCopy((r00[i], r01[i], r02[i], px[i],
+                        r10[i], r11[i], r12[i], py[i],
+                        r20[i], r21[i], r22[i], pz[i],
+                        0.0, 0.0, 0.0, 1.0))
+            actor.Modified()
         if not actor.GetVisibility():
             actor.SetVisibility(True)
 
@@ -887,11 +1080,16 @@ def main():
                     help="ignore rank_*_scm.bin, i.e. draw the terrain undeformed")
     ap.add_argument("--scm-depth", type=float, default=0.08,
                     help="sinkage in metres that colours fully dark (default 0.08)")
-    ap.add_argument("--rut-nodes", type=int, default=2_000_000,
-                    help="grid points shared out between the ranks for their rut "
-                         "patches (default 2000000). One rank sweeps a box of ~6 M nodes "
-                         "at 0.02 m spacing, so the patches are decimated to fit; raise "
-                         "this for finer ruts at the cost of memory and frame rate")
+    ap.add_argument("--rut-nodes", type=int, default=12_000_000,
+                    help="cap on rut-overlay points; the overlay is coarsened until it "
+                         "fits (default 12M)")
+    ap.add_argument("--rut-fine", type=float, default=0.0,
+                    help="rut overlay resolution in metres; 0 means the recording's own "
+                         "SCM node pitch, i.e. no decimation of the deformation (default)")
+    ap.add_argument("--rut-coarse", type=float, default=0.16,
+                    help="tile size in metres for the surface AROUND the ruts. Also the "
+                         "granularity at which the overlay hugs them, so a smaller tile "
+                         "costs FEWER overlay points, not more (default 0.32)")
     ap.add_argument("--no-scenery", action="store_true",
                     help="skip the terrain, rings, pad and decorative wall rocks")
     ap.add_argument("--terrain-margin", type=float, default=0.0,
@@ -940,6 +1138,7 @@ def main():
                          not args.no_scenery,
                          (site_r + args.terrain_margin) if args.terrain_margin > 0 else 0.0,
                          args.directory)
+    frame_mats = frame_matrices(actors)
     if cache.misses:
         print(f"  ! {len(cache.misses)} mesh file(s) not found here, drawn as boxes "
               f"(try --mesh-root)", file=sys.stderr)
@@ -949,30 +1148,34 @@ def main():
 
     # Rut patches, on the same surface the terrain was rebuilt from so the base heights
     # they measure sinkage against are the terrain's own.
-    patches = []
+    patches, layers = [], None
     if not args.no_scm and terrain_grid is not None:
         sources = scm_sources(args.directory, ranks)
         if sources:
             gx, gy = terrain_grid.x[0, :, 0], terrain_grid.y[:, 0, 0]
-            boxes = [snap_to_grid(src, gx, gy) for src in sources]
-            # Patches FIRST, then cut the terrain only from under the ones that got built.
-            # Cutting from the boxes instead left a hole wherever a patch did not appear,
-            # and a hole in the ground shows the background: the ruts read as dark blue
-            # rectangles with no relief in them, which is not a subtle failure.
-            patches = build_rut_patches(pl, sources, boxes, height_sampler(terrain_grid),
-                                        ground or (0.55, 0.55, 0.52), args.scm_depth,
-                                        args.rut_nodes)
-            cut = blank_terrain_cells(terrain_grid, [p["cells"] for p in patches])
-            if patches:
-                grids = " + ".join(
-                    f"{p['cols']}x{p['rows']}@{p['stride'] * p['delta']:.3g}m"
-                    for p in patches)
-                print(f"deformation {len(patches)} rut patch(es) from rank_*_scm.bin at "
+            cells = deformed_cells(sources, gx, gy)
+            # Layers FIRST, then cut the terrain only from under what got built. Cutting
+            # first left a hole wherever a layer did not appear, and a hole in the ground
+            # shows the background: the ruts read as dark blue rectangles with no relief
+            # in them, which is not a subtle failure.
+            patches, layers = build_rut_layers(pl, sources, cells, gx, gy,
+                                               height_sampler(terrain_grid),
+                                               ground or (0.55, 0.55, 0.52), args.scm_depth,
+                                               args.rut_coarse,
+                                               args.rut_fine or sources[0]["delta"],
+                                               args.rut_nodes)
+            if layers:
+                cut = blank_terrain_cells(terrain_grid, cells, gy)
+                step = layers["fine_step"] * layers["delta"]
+                tile = layers["stride"] * layers["delta"]
+                print(f"deformation {len(patches)} rank(s) from rank_*_scm.bin at "
                       f"{sources[0]['rate']:g} Hz, "
-                      f"{sum(p['nodes'] for p in patches)} deformed nodes, {grids} grids "
-                      f"({sources[0]['delta']:g} m nodes, decimated to fit --rut-nodes "
-                      f"{args.rut_nodes}); {cut} terrain cell(s) cut out beneath them")
-    if not patches and ((meta or {}).get("terrain") or {}).get("model") == "scm":
+                      f"{sum(p['nodes'] for p in patches)} deformed nodes; overlay at "
+                      f"{step:.3g} m on {layers['tiles']} tiles of {tile:.3g} m "
+                      f"({layers['fine'].n_points} pts), surround "
+                      f"{layers['coarse'].n_points} pts over {cut} terrain cell(s) cut "
+                      f"out beneath them")
+    if not layers and ((meta or {}).get("terrain") or {}).get("model") == "scm":
         print("deformation none recorded -- terrain drawn as it started, no ruts")
 
     site = (meta or {}).get("site") or {}
@@ -1059,9 +1262,9 @@ def main():
 
     def show(slot):
         state["slot"] = max(0, min(len(times) - 1, slot))
-        apply_frame(actors, poses, state["slot"])
-        if patches:
-            apply_scm(patches, times[state["slot"]])
+        apply_frame(actors, poses, state["slot"], frame_mats)
+        if layers:
+            apply_scm(patches, layers, times[state["slot"]])
         if state["follow"] >= 0:
             p = poses[state["slot"], state["follow"]]
             if np.isfinite(p[0]):
