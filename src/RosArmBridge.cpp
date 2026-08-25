@@ -20,10 +20,6 @@ constexpr double grab_z_offset = 0.05;
 // bed (~1.0 x 1.2 m) so they land on the bed at any heading, instead of a spread
 // tied to the whole rock field that flung them meters off to the side.
 constexpr double place_height = 0.5;  // local-z release height above the bed
-constexpr int place_cols = 4;         // lateral slots (across the bed, y)
-constexpr int place_rows = 4;         // longitudinal slots (along the bed, x)
-constexpr double place_step_y = 0.25;
-constexpr double place_step_x = 0.25;
 
 // Duplicate-publisher detection: ignore the first seconds (DDS discovery, plus
 // phantom publishers left by hard-killed nodes) and require the count to stay high
@@ -312,14 +308,27 @@ chrono::ChVector3d RosArmBridge::PlacePoint(int slot) const {
     if (!m_trailer || !m_trailer->GetChassis())
         return chrono::ChVector3d(0.0, 0.0, place_height);
 
-    // Grid slot on the bed (wraps if more rocks than slots), centered on the bed.
-    const int col = slot % place_cols;
-    const int row = (slot / place_cols) % place_rows;
-    const double y_local = (col - 0.5 * (place_cols - 1)) * place_step_y;
-    const double x_local = (row - 0.5 * (place_rows - 1)) * place_step_x;
-    // Express in the trailer's local frame and map to world, so the drop point
-    // stays over the bed whatever way the trailer is pointing.
-    const chrono::ChVector3d local(x_local, y_local, place_height);
+    // EVERY rock goes to the middle of the bed, whatever slot it is.
+    //
+    // This used to spread loads over a 4x4 grid at 0.25 m pitch, which puts a corner slot
+    // 0.53 m from bed centre. That spacing only makes sense if the arm can hit a slot, and
+    // it cannot: the gripper is typically ~0.27 m from its place target at the moment it
+    // opens (logged as |gripper-place| at PLACING->RELEASING), and the rock then falls
+    // place_height before it lands. Measured |rock-place| over a run sits at 0.42-0.56 m.
+    // Aim at a corner slot with that error budget and roughly half the misses go over the
+    // side rather than into the bed.
+    //
+    // Aiming at the centre spends the same error budget against the bed's full half-width
+    // instead of what is left after the slot offset, so the same miss lands inside. The
+    // cost is that loads stack rather than spread, which the bed can absorb: a cycle
+    // carries two rocks of ~0.23 m against a 0.5 m release height.
+    //
+    // `slot` is kept in the signature because the caller counts placements with it and the
+    // status topic reports it; it simply no longer steers the aim point.
+    (void)slot;
+    // Expressed in the trailer's local frame and mapped to world, so the drop point stays
+    // over the bed whatever way the trailer is pointing.
+    const chrono::ChVector3d local(0.0, 0.0, place_height);
     return m_trailer->GetChassis()->GetBody()->TransformPointLocalToParent(local);
 }
 
