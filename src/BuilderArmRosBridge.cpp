@@ -55,6 +55,28 @@ constexpr double feedstock_reach_max = 5.0;
 // has to be visible in the log rather than inferred from the wall not growing.
 constexpr double starved_report_period = 30.0;
 
+// How many times the arm may be sent after the same rock before it is written off. See
+// the failure branch in Synchronize for why one attempt is not enough.
+constexpr int max_grab_attempts = 3;
+
+// FETCH. How far past feedstock_reach_max a rock may lie and still be worth moving the
+// station for, and how far the station may be moved to get it.
+//
+// Deliveries do not land in the envelope. Measured on run_20260825_221818, every one of
+// the eight rocks the collectors delivered ended up outside it -- nearest 5.53 m against
+// a 5.0 m limit -- and the geometry says why: the drop point sits on the 37 m collector
+// ring while the arm base rides the 33 m builder orbit, so a load lands 4.5-5.1 m further
+// out AND 2.9-3.7 m along. The radial part is inside reach on its own; it is the arc that
+// pushes the total over. So take the arc out by sliding the station along to meet the
+// rock, which costs a short creep and touches no site geometry.
+//
+// 0.10 rad is 3.3 m of arc at this radius, enough to cancel the whole observed offset. It
+// is also safe for the wall: the slot the builder is here to fill sits about 2.74 m from
+// the arm base, and 3.3 m of arc puts it at sqrt(2.74^2 + 3.3^2) = 4.3 m, still inside the
+// 5.2 m the arm can actually solve for.
+constexpr double fetch_reach_margin = 2.5;      // m past feedstock_reach_max
+constexpr double station_fetch_max_rad = 0.10;  // rad
+
 // How long a parked builder may sit unable to reach its OWN WALL SLOT before the station
 // is advanced past it.
 //
@@ -345,6 +367,9 @@ void BuilderArmRosBridge::Synchronize(double time, bool apply_commands) {
         }
         if (status.state == 2 && status.success) {
             m_placed_count = m_active_slot + 1;
+            // The fetch nudge belonged to the slot just filled. Carry it into the next
+            // slot and the builder parks off its own wall slot.
+            m_station_fetch_offset = 0.0;
             // Sim time, not the log's wall stamp: this runs ~30x slower than real time and
             // the ratio moves with rank count, so wall stamps cannot be compared between
             // builders or between runs. Every timing question about this cycle is asked
@@ -361,14 +386,39 @@ void BuilderArmRosBridge::Synchronize(double time, bool apply_commands) {
                         time, m_placed_count, m_wall_slots.size(),
                         rock ? rock->GetName().c_str() : "unnamed", m_placed_count);
         } else {
-            // A slot that could not be served must not stall the whole course. The rock
-            // stays consumed -- retrying the one the arm just failed on is how a builder
-            // spends the rest of a run on a single unreachable stone -- and the slot is
-            // skipped, so the gap in the wall is honest about what happened.
-            m_placed_count = m_active_slot + 1;
-            RCLCPP_WARN(m_node->get_logger(),
-                        "t=%.2f slot %d failed (error_code=%d); writing that rock off and moving to slot %d.",
-                        time, m_active_slot, status.error_code, m_placed_count);
+            // BOUNDED RETRY, not a write-off on the first miss.
+            //
+            // Writing the rock off immediately was chosen to stop a builder spending a
+            // whole run on one unreachable stone, and that risk is real -- but the cost of
+            // the cure is worse, because booking happens the moment the arm STARTS and
+            // nothing ever un-books it. One failed grab retires the rock permanently.
+            // Measured on run_20260825_221818: rank 1 laid 5 of its 6 seed rocks and then
+            // sat still for the remaining 490 s of sim with its sixth rock lying 4.73 m
+            // from the arm base -- inside the 2.0-5.0 m envelope, unlaid, and unofferable.
+            // Furthest-first makes that worse by aiming the first attempt at exactly the
+            // rock most likely to be missed.
+            //
+            // So count attempts per rock and give it back to the pool until the count runs
+            // out. The slot is not skipped on a retry either: the same slot is still owed a
+            // rock, and skipping it would leave a hole in the wall for a grab that is about
+            // to be tried again.
+            const int tries = rock ? ++m_grab_attempts[rock.get()] : max_grab_attempts;
+            if (tries < max_grab_attempts) {
+                if (rock)
+                    m_consumed.erase(rock.get());
+                RCLCPP_WARN(m_node->get_logger(),
+                            "t=%.2f slot %d failed (error_code=%d) on attempt %d of %d; "
+                            "returning that rock to the pile and retrying the same slot.",
+                            time, m_active_slot, status.error_code, tries, max_grab_attempts);
+            } else {
+                m_placed_count = m_active_slot + 1;
+                m_station_fetch_offset = 0.0;
+                RCLCPP_WARN(m_node->get_logger(),
+                            "t=%.2f slot %d failed (error_code=%d) on attempt %d of %d; writing "
+                            "that rock off and moving to slot %d.",
+                            time, m_active_slot, status.error_code, tries, max_grab_attempts,
+                            m_placed_count);
+            }
         }
         // This rock's state is ours now. Tell the arm to let go of its reference, or the
         // next StartPickPlace's RemoveRockLock() would unfix the stone we just laid.
@@ -504,6 +554,50 @@ void BuilderArmRosBridge::PublishBuildTopics(double time) {
                         "%.1f-%.1f m of the arm base.",
                         m_placed_count, time - m_starved_since, spare, nearest_txt,
                         feedstock_reach_min, feedstock_reach_max);
+        }
+
+        // Starved with a rock lying just out of reach: slide the station along to meet it
+        // rather than wait for a delivery that has already arrived. Taken once per slot --
+        // see m_fetch_offset_slot -- because the rock stops being a near miss the instant
+        // the nudge works, and recomputing then would undo it.
+        if (m_fetch_offset_slot != m_placed_count) {
+            const auto arm_base = m_arm.GetIkFramePos();
+            const chrono::ChBodyAuxRef* best = nullptr;
+            double best_d = std::numeric_limits<double>::max();
+            for (const auto& rock : m_feedstock) {
+                if (!rock || m_consumed.count(rock.get()))
+                    continue;
+                const double d = (rock->GetPos() - arm_base).Length();
+                if (d <= feedstock_reach_max || d > feedstock_reach_max + fetch_reach_margin)
+                    continue;
+                if (d < best_d) {
+                    best_d = d;
+                    best = rock.get();
+                }
+            }
+            if (best) {
+                // Only the ARC is cancelled. The station is an orbit angle, so this moves
+                // the arm base along its lane towards the rock's bearing and leaves the
+                // radius -- which is already inside reach -- alone.
+                const double rock_bearing =
+                    std::atan2(best->GetPos().y() - site_center_y, best->GetPos().x() - site_center_x);
+                const double base_bearing =
+                    std::atan2(arm_base.y() - site_center_y, arm_base.x() - site_center_x);
+                double delta = rock_bearing - base_bearing;
+                while (delta > chrono::CH_PI)
+                    delta -= chrono::CH_2PI;
+                while (delta < -chrono::CH_PI)
+                    delta += chrono::CH_2PI;
+                m_station_fetch_offset =
+                    std::clamp(delta, -station_fetch_max_rad, station_fetch_max_rad);
+                m_fetch_offset_slot = m_placed_count;
+                RCLCPP_INFO(m_node->get_logger(),
+                            "t=%.2f fetching: rock at %.2f m is %.2f m past the %.1f m limit; "
+                            "sliding the station %+.1f deg (%.2f m of arc) to reach it.",
+                            time, best_d, best_d - feedstock_reach_max, feedstock_reach_max,
+                            m_station_fetch_offset * 180.0 / chrono::CH_PI,
+                            m_station_fetch_offset * arm_base.Length());
+            }
         }
     } else {
         m_starved_since = -1.0;

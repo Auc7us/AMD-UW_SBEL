@@ -421,6 +421,12 @@ void BuilderRig::SetDeliveredRockSource(
 
 void BuilderRig::SetStationAngle(double angle_rad) {
 #ifdef AMD_UW_ENABLE_ROS2
+    // The arm bridge gets to slide the station along its lane when it is starved and a
+    // rock is lying just outside its envelope. Added here rather than in main.cpp so the
+    // caller keeps computing the slot's own angle and nothing else has to know about it.
+    // See BuilderArmRosBridge::GetStationFetchOffset.
+    if (m_arm_ros_bridge)
+        angle_rad += m_arm_ros_bridge->GetStationFetchOffset();
     if (m_vehicle_ros_bridge)
         m_vehicle_ros_bridge->SetStationAngle(angle_rad);
 #else

@@ -6,6 +6,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -83,6 +84,10 @@ class BuilderArmRosBridge {
     // Rocks laid so far == the next wall slot == how far round the lane the hull should
     // now be. BuilderRig turns this into the station angle it publishes.
     int GetPlacedCount() const { return m_placed_count; }
+    // Angular nudge the builder is asking for so a rock lying just outside its envelope
+    // comes into it. Added to the station angle by BuilderRig; zero unless the arm is
+    // starved with a near miss on the ground. See the starved branch of PublishBuildTopics.
+    double GetStationFetchOffset() const { return m_station_fetch_offset; }
     bool BuildComplete() const { return m_placed_count >= static_cast<int>(m_wall_slots.size()); }
 
   private:
@@ -124,12 +129,20 @@ class BuilderArmRosBridge {
     // written off), keyed by raw pointer because the pool holds the owning references.
     std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> m_feedstock;
     std::unordered_set<const chrono::ChBodyAuxRef*> m_consumed;
+    // Failed grabs per rock. A rock is only written off for good once this reaches
+    // max_grab_attempts; until then a failure puts it back in the pile.
+    std::unordered_map<const chrono::ChBodyAuxRef*, int> m_grab_attempts;
     DeliveredRockSource m_delivered_source;
     std::shared_ptr<chrono::ChBodyAuxRef> m_selected;  // rock currently on offer
     double m_last_feed_refresh = -1.0;
     std::vector<chrono::ChVector3d> m_wall_slots;
 
     int m_placed_count = 0;
+    // Latched for the slot it was taken for: the moment a fetched rock enters the
+    // envelope the builder stops being starved, and recomputing the offset then would
+    // snap the station back and take the rock straight out of reach again.
+    double m_station_fetch_offset = 0.0;
+    int m_fetch_offset_slot = -1;
     bool m_hull_parked = false;
     double m_last_started_seq = -1.0;
     double m_settled_seq = -2.0;  // command_seq whose completion was already booked
