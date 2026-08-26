@@ -173,6 +173,26 @@ class RobotRig {
     void ReportDumpOutcome(double time);
     void CheckWheelSinkage(double time, chrono::vehicle::ChTerrain& terrain);
     void CheckStuck(double time, chrono::vehicle::ChTerrain& terrain);
+    // Hard end-stop on every upright's rotation about its kingpin. See the definition:
+    // the tie rod is a distance constraint with TWO solutions, and the second one is a
+    // knuckle turned ~108 deg, so the stop exists to make that root unreachable.
+    void ApplySteeringStops(double time);
+
+    // One entry per upright, built on the first ApplySteeringStops call.
+    struct SteeringStop {
+        std::shared_ptr<chrono::ChBody> upright;
+        chrono::ChQuaternion<> rest;      // upright rotation in the chassis frame at t=0
+        unsigned int accumulator = 0;
+        bool engaged = false;            // latched for reporting, not for physics
+        bool alarmed = false;            // ditto; the alarm fires every step otherwise
+        const char* label = "";
+    };
+    std::vector<SteeringStop> m_steering_stops;
+    // One accumulator on the chassis carries the summed reaction of all four stops, so
+    // the barrier is an internal torque pair and not a torque out of nowhere.
+    unsigned int m_steering_stop_reaction = 0;
+    bool m_steering_stops_ready = false;
+    int m_steering_stop_reports = 0;
     // Names the body that is blowing up while it is still finite, and the
     // constraints pulling on it. See the definition for why NaN itself is too
     // late to diagnose from.
