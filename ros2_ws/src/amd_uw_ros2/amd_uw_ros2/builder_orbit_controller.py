@@ -1,4 +1,5 @@
 import math
+import time
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -216,6 +217,35 @@ class BuilderOrbitController(Node):
         # lane the builder can no longer reach the slot it is there to fill. 0.9 keeps a
         # little margin under that.
         self.declare_parameter("station_radius_tol_m", 0.9)
+        # RADIAL REPAIR IN PLACE, instead of paying a lap for a drift.
+        #
+        # A parked builder creeps inward and nothing pulls it back: the sim-side anchor
+        # holds the pose it was parked at and deliberately does not correct it, because
+        # sliding a braked 10.5 t tracked hull sideways needs 15.3 kN against an anchor
+        # ceiling of 7.5 kN (see the anchor note in BuilderRig). So the drift is this
+        # controller's to fix, and until now the only mechanism was the release band --
+        # give up station, drive all the way round, come back.
+        #
+        # Measured on run_20260825_221818, rank 2: parked at 194.2 deg from t=110 and drifted
+        # from r=33.24 to r=31.68 over 170 s, 9 mm/s, until the release band fired at t=285.
+        # The lap back cost 380 s of sim and the run ended before it arrived -- one drift
+        # bought a 380 s outage. The angle was never the problem; it sat within a hundredth
+        # of a degree of its station the whole time.
+        #
+        # So when the builder is at its own station and only the RADIUS is wrong, correct
+        # the radius where it stands. It is a skid-steer: it can turn towards the lane,
+        # creep the metre or so it needs, and turn back. Entered before the drift reaches
+        # the release band, so the common case never becomes a lap at all.
+        self.declare_parameter("radial_repair_enter_m", 0.40)
+        self.declare_parameter("radial_repair_exit_m", 0.12)
+        self.declare_parameter("radial_repair_speed_mps", 0.5)
+        # A repair that is not converging must hand back to the lane rather than grind in
+        # place forever -- the failure it replaces was at least productive between laps.
+        self.declare_parameter("radial_repair_timeout_s", 90.0)
+        # The pivot phase, which is a different problem from the creep: see the note in
+        # the repair branch for why it needs the steering cap off and the brake released.
+        self.declare_parameter("radial_repair_pivot_steering", 0.9)
+        self.declare_parameter("radial_repair_pivot_speed_mps", 0.25)
         # Radial band at which an ALREADY-HELD station is given up, as opposed to the band
         # required to take one. Hysteresis, and it is what stops one builder laying a
         # quarter of what its neighbours lay.
@@ -316,6 +346,8 @@ class BuilderOrbitController(Node):
             1.0, float(self.get_parameter("control_rate_hz").value)
         )
         self.dt = 1.0 / rate_hz
+        self.repairing_radius = False
+        self.repair_started = None
         self.create_timer(self.dt, self.on_timer)
 
         self.get_logger().info(
@@ -491,9 +523,11 @@ class BuilderOrbitController(Node):
             self.reported_off_lane = False
             self.get_logger().info(f"back on the lane ({radius_error:+.2f} m).")
 
+        # Hoisted out of the arrival test below: the radial repair branch needs the same
+        # band to decide whether the builder is at its own station.
+        tolerance = abs(float(self.get_parameter("station_tolerance_rad").value))
+        release = max(tolerance, abs(float(self.get_parameter("station_release_rad").value)))
         if error is not None:
-            tolerance = abs(float(self.get_parameter("station_tolerance_rad").value))
-            release = max(tolerance, abs(float(self.get_parameter("station_release_rad").value)))
             # Arrival is judged on ABSOLUTE angular proximity, not on remaining
             # travel. Remaining travel is forced into [0, 2*pi), so overshooting
             # the station by one control tick makes it read ~2*pi -- "nearly a
@@ -515,6 +549,95 @@ class BuilderOrbitController(Node):
                     f"{radius_release:.2f} m release band"
                 )
                 self.get_logger().info(f"{why}; driving round to re-acquire.")
+
+        # --------------------------------------------------------------- radial repair
+        # Only when the ANGLE is already right. Off-station the lane controller above is
+        # the right thing to be running, and radial error there is corrected by driving.
+        near_station = error is not None and abs(wrap_to_pi(error)) <= release
+        enter = abs(float(self.get_parameter("radial_repair_enter_m").value))
+        exit_band = abs(float(self.get_parameter("radial_repair_exit_m").value))
+        timeout = abs(float(self.get_parameter("radial_repair_timeout_s").value))
+        if not self.repairing_radius and near_station and abs(radius_error) > enter:
+            self.repairing_radius = True
+            self.repair_started = time.monotonic()
+            self.holding_station = False
+            self.get_logger().info(
+                f"{radius_error:+.2f} m off the {radius:.1f} m lane at station; repairing the "
+                f"radius here rather than driving a lap for it."
+            )
+        elif self.repairing_radius:
+            if abs(radius_error) <= exit_band:
+                self.repairing_radius = False
+                self.get_logger().info(
+                    f"radius repaired to {radius_error:+.2f} m; taking station again."
+                )
+            elif not near_station:
+                self.repairing_radius = False
+                self.get_logger().warn(
+                    f"pushed off station while repairing the radius ({radius_error:+.2f} m); "
+                    f"back to the lane."
+                )
+            elif timeout > 0.0 and self.repair_started is not None \
+                    and time.monotonic() - self.repair_started > timeout:
+                self.repairing_radius = False
+                self.get_logger().warn(
+                    f"radius repair gave up after {timeout:.0f} s at {radius_error:+.2f} m; "
+                    f"driving the lane instead."
+                )
+
+        if self.repairing_radius:
+            # Aim straight at the lane, radially. Pure pursuit along the orbit is the wrong
+            # law here: its aim point is ahead ALONG the circle, which is the one direction
+            # that does not change the radius.
+            cx = float(self.get_parameter("center_x").value)
+            cy = float(self.get_parameter("center_y").value)
+            # Outward if inside the lane, inward if outside it.
+            sign = -1.0 if radius_error < 0.0 else 1.0
+            bearing = math.atan2(self.state.y - cy, self.state.x - cx)
+            if sign < 0.0:
+                target_heading = bearing            # drive away from the centre
+            else:
+                target_heading = wrap_to_pi(bearing + math.pi)
+            head_err = wrap_to_pi(target_heading - self.state.yaw)
+            kp = float(self.get_parameter("steering_kp").value)
+            max_throttle = clamp(float(self.get_parameter("max_throttle").value), 0.0, 1.0)
+            speed_kp = max(0.0, float(self.get_parameter("speed_kp").value))
+            # Turning to face the lane needs a PIVOT, and a pivot needs throttle with the
+            # brake OFF. On this driveline steering is differential braking --
+            # ChTrackDrivelineBDS does braking_left += steering -- so a steering command
+            # issued on top of brake=1.0 moves nothing at all, and the hull would sit
+            # there turning its steering command over and over while never aligning.
+            #
+            # It also needs more steering than the lane law allows. steering_limit is
+            # capped at 0.5 to keep lane-following away from the rail, where the hull
+            # keeps most of its speed; here the speed is the thing being got rid of, so
+            # the cap comes off and the hull turns about itself instead of arcing round
+            # its orbit and undoing the repair it came to do.
+            aligned = abs(head_err) < math.radians(25.0)
+            if not aligned:
+                pivot_limit = abs(float(self.get_parameter("radial_repair_pivot_steering").value))
+                pivot_speed = max(0.0, float(self.get_parameter("radial_repair_pivot_speed_mps").value))
+                target_steering = clamp(kp * head_err, -pivot_limit, pivot_limit)
+                self.steering_command = approach(
+                    self.steering_command, target_steering, steering_delta
+                )
+                effort = speed_kp * (pivot_speed - abs(self.state.speed))
+                self.publish_command(self.steering_command, clamp(effort, 0.0, max_throttle), 0.0)
+                return
+
+            limit = abs(float(self.get_parameter("steering_limit").value)) or 1.0
+            target_steering = clamp(kp * head_err, -limit, limit)
+            self.steering_command = approach(
+                self.steering_command, target_steering, steering_delta
+            )
+            repair_speed = max(0.0, float(self.get_parameter("radial_repair_speed_mps").value))
+            effort = speed_kp * (repair_speed - self.state.speed)
+            self.publish_command(
+                self.steering_command,
+                clamp(effort, 0.0, max_throttle),
+                1.0 if effort <= 0.0 else 0.0,
+            )
+            return
 
         if self.holding_station:
             # Station keeping is ACTIVE, not just the brake.
