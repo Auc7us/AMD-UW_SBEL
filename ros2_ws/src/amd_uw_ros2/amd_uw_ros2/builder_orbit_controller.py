@@ -216,6 +216,10 @@ class BuilderOrbitController(Node):
         # lane the builder can no longer reach the slot it is there to fill. 0.9 keeps a
         # little margin under that.
         self.declare_parameter("station_radius_tol_m", 0.9)
+        # Purely a reporting threshold now -- see the radial note in on_timer. Nothing in
+        # the control law reacts to it, so it is set where a drift becomes worth knowing
+        # about rather than where it becomes worth acting on.
+        self.declare_parameter("radius_warn_m", 1.5)
         # Radial band at which an ALREADY-HELD station is given up, as opposed to the band
         # required to take one. Hysteresis, and it is what stops one builder laying a
         # quarter of what its neighbours lay.
@@ -475,46 +479,61 @@ class BuilderOrbitController(Node):
         # Radial error is computed above, with the steering law that uses it. Part of the
         # arrival test too -- see station_radius_tol_m -- because being at the right
         # bearing is not the same as being in the right place, and the arm needs the place.
+        # RADIAL ERROR NEVER COSTS A LAP. It is reported and nothing else.
+        #
+        # This used to be an arrival AND release test, and the release is what made a drift
+        # expensive: give up station, drive all the way round, come back. On run
+        # 20260825_221818 rank 2's builder drifted 1.56 m inward over 170 s of parked time,
+        # released at t=285, and the lap back cost 380 s -- the run ended before it arrived.
+        # With sixteen ranks on this orbit a lap is not merely slow, it drives one builder
+        # through the next one's station. The whole arrangement only works if every builder
+        # advances forward, one slot pitch at a time, and never doubles back.
+        #
+        # Correcting it in place does not work either, and was tried: pivoting a braked
+        # tracked hull on regolith walks it further off the lane than the creep pulls it
+        # back, measured going -0.40 -> -1.30 -> -2.10 -> -2.86 -> -3.38 -> -3.75 -> -3.95 m
+        # over six attempts before the run ended. Reverted.
+        #
+        # What actually corrects it is the ordinary forward creep to the next slot: pure
+        # pursuit aims at a point ON the lane, so every advance pulls the radius in. That
+        # only stops happening when the builder stops advancing, which is starvation -- a
+        # different bug, fixed on the sim side. So: take station on the ANGLE, let the arm's
+        # own reach test decide whether it can work from here, and if it cannot, the
+        # unservable-slot timeout advances the station and the builder creeps FORWARD out of
+        # the problem.
         radius_tol = abs(float(self.get_parameter("station_radius_tol_m").value))
-        radius_release = max(radius_tol, abs(float(self.get_parameter("station_radius_release_m").value)))
-        # Two bands, not one: what it takes to TAKE station, and what it takes to give one
-        # up. See station_radius_release_m.
-        on_lane = abs(radius_error) <= radius_tol
-        stay_on_lane = abs(radius_error) <= radius_release
-        if not stay_on_lane and not self.reported_off_lane:
+        off_lane_warn = abs(float(self.get_parameter("radius_warn_m").value))
+        if abs(radius_error) > off_lane_warn and not self.reported_off_lane:
             self.reported_off_lane = True
             self.get_logger().warn(
-                f"{radius_error:+.2f} m off the {radius:.1f} m lane; driving the lane back "
-                f"before taking station."
+                f"{radius_error:+.2f} m off the {radius:.1f} m lane, past the {off_lane_warn:.1f} m "
+                f"reporting band. Working from here anyway; the creep to the next slot is what "
+                f"pulls it back."
             )
-        elif stay_on_lane and self.reported_off_lane:
+        elif abs(radius_error) <= radius_tol and self.reported_off_lane:
             self.reported_off_lane = False
             self.get_logger().info(f"back on the lane ({radius_error:+.2f} m).")
 
         if error is not None:
             tolerance = abs(float(self.get_parameter("station_tolerance_rad").value))
-            release = max(tolerance, abs(float(self.get_parameter("station_release_rad").value)))
             # Arrival is judged on ABSOLUTE angular proximity, not on remaining
             # travel. Remaining travel is forced into [0, 2*pi), so overshooting
             # the station by one control tick makes it read ~2*pi -- "nearly a
             # full lap to go" -- and the builder commits to another whole orbit
             # instead of stopping the few centimetres past where it wanted to be.
             # Approaching from either side counts as being on station.
-            if not self.holding_station and abs(wrap_to_pi(error)) <= tolerance and on_lane:
+            if not self.holding_station and abs(wrap_to_pi(error)) <= tolerance:
                 self.holding_station = True
                 self.get_logger().info(
-                    f"holding station at {math.degrees(self.station_angle):.1f} deg."
+                    f"holding station at {math.degrees(self.station_angle):.1f} deg "
+                    f"(radius {radius_error:+.2f} m)."
                 )
-            elif self.holding_station and (abs(wrap_to_pi(error)) > release or not stay_on_lane):
-                self.holding_station = False
-                why = (
-                    f"pushed {math.degrees(abs(wrap_to_pi(error))):.1f} deg off station, past the "
-                    f"{math.degrees(release):.1f} deg release band"
-                    if abs(wrap_to_pi(error)) > release
-                    else f"pushed {radius_error:+.2f} m off the lane, past the "
-                    f"{radius_release:.2f} m release band"
-                )
-                self.get_logger().info(f"{why}; driving round to re-acquire.")
+            # NO RELEASE BRANCH. Station is given up in exactly one place -- on_station_angle,
+            # when the sim advances the slot -- and the new station is always AHEAD. Anything
+            # else releasing it hands the builder a lap, and station keeping already handles
+            # both ways of being off the mark without one: it creeps forward if it is short,
+            # and stands on the brake if it has crept past. station_release_rad is now
+            # unused; it is left declared so an existing launch file does not fail on it.
 
         if self.holding_station:
             # Station keeping is ACTIVE, not just the brake.
