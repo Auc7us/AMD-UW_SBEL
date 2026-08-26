@@ -49,10 +49,26 @@ class PurePursuitController(Node):
         super().__init__("pure_pursuit_controller")
 
         self._hard_turning = False
+        self._last_speed_trace = None
         self.declare_parameter("robot_id", 1)
         self.declare_parameter("control_rate_hz", 20.0)
         self.declare_parameter("target_speed_mps", 1.0)
-        self.declare_parameter("speed_kp", 0.55)
+        # Speed loop gain. Raised from 0.55, where the achieved speed was a function of the
+        # TARGET rather than of what the rover could do.
+        #
+        # It is a bare proportional loop, so it settles wherever throttle balances drag and
+        # keeps whatever steady-state error that implies. At 0.55 an error of 1.49 m/s asks
+        # for 0.82 throttle -- not saturated -- so the rover sat at 1.48 m/s while being
+        # commanded 2.97, measured over 778 trace samples with no cap binding on any of
+        # them: hard_turning=0 throughout and the traction bound at 9-40 m/s. Lowering the
+        # launch target from 5.0 to 3.0 therefore cut the throttle rather than the speed
+        # limit, which is why top speed fell from 2.46-2.61 m/s to 1.57-1.86 m/s.
+        #
+        # 1.2 saturates the throttle until the rover is within 0.83 m/s of target and tapers
+        # inside that. Cornering stays bounded by traction_speed_limit, which is computed
+        # from the ramped steering and holds full lock to 2.2 m/s, and the kingpin stops
+        # backstop the knuckle if any of that is wrong.
+        self.declare_parameter("speed_kp", 1.2)
         self.declare_parameter("speed_tolerance_mps", 0.08)
         self.declare_parameter("target_speed_ramp_mps2", 10.0)
         self.declare_parameter("throttle_ramp_per_s", 10.0)
@@ -91,9 +107,17 @@ class PurePursuitController(Node):
         self.declare_parameter("reverse_turn_steering", 0.40)
         self.declare_parameter("reverse_turn_speed_mps", 1.0)
         # Lateral acceleration the regolith will actually give, m/s^2. Cornering demand is
-        # v^2 * curvature; mu*g at lunar gravity is about 1.3, and SCM bulldozing resistance
-        # is not a clean friction circle, so this is deliberately under that.
-        self.declare_parameter("max_lateral_accel_mps2", 1.0)
+        # v^2 * curvature. mu*g at lunar gravity is 0.9 * 1.62 = 1.46, and SCM bulldozing
+        # resistance is not a clean friction circle, so this sits just under it.
+        #
+        # Was 1.0, which combined with feeding the bound the raw steering DEMAND cost more
+        # than half the rover's speed for a load it never generated. 1.3 leaves the bound
+        # inactive at cruise -- at the 0.56 of lock the uprights actually reached, it
+        # allows 3.05 m/s against a 3.0 m/s target -- and still holds full lock to 2.2 m/s,
+        # which is the case it exists for.
+        self.declare_parameter("max_lateral_accel_mps2", 1.3)
+        # Wall seconds between speed-limiter trace lines; 0 disables. See speed_trace.
+        self.declare_parameter("speed_trace_period_s", 1.0)
         self.declare_parameter("wheelbase_m", 2.5)
         self.declare_parameter("max_steering_angle_rad", 0.6)
         self.declare_parameter("rock_side_offset_m", 1.5)
@@ -976,7 +1000,7 @@ class PurePursuitController(Node):
         # arrives running ALONG the ring and never crosses the builder's orbit. See
         # home_approach_target.
         steering = self.compute_steering(self.home_approach_target())
-        target_speed = self.turn_speed(steering, target_speed)
+        target_speed = self.turn_speed(self.actual_steering(), target_speed)
         command = self.compute_speed_command(target_speed_override=target_speed)
         command.steering = steering
         self.command = self.ramp_command(command)
@@ -1082,10 +1106,45 @@ class PurePursuitController(Node):
         steering = self.compute_steering(target)
         # Same bounds as the home approach. This is the call site that had none at all.
         speed_command = self.compute_speed_command(
-            self.turn_speed(steering, self.pickup_approach_target_speed(switch_radius)))
+            self.turn_speed(self.actual_steering(), self.pickup_approach_target_speed(switch_radius)))
         speed_command.steering = steering
         self.command = self.ramp_command(speed_command)
         self.publish_command(self.command)
+
+    def speed_trace(self, base_speed: float, capped: float, steering_norm: float) -> None:
+        """Say which limiter is actually binding, once a second.
+
+        Added because guessing cost a run. Top speed fell from 2.46-2.61 m/s (run
+        20260825_025343, before any of this) to 1.57-1.86 m/s against an unchanged 3.0 m/s
+        target, and the traction bound looked like the culprit -- it was not: fixing it to
+        read the ramped command instead of the raw demand moved the measured top speed by
+        less than 0.1 m/s. So print every candidate side by side and let the log say which
+        one is holding the rover down.
+        """
+        period = max(0.0, float(self.get_parameter("speed_trace_period_s").value))
+        if period <= 0.0:
+            return
+        now = time.monotonic()
+        if self._last_speed_trace is not None and now - self._last_speed_trace < period:
+            return
+        self._last_speed_trace = now
+        traction = self.traction_speed_limit(steering_norm)
+        turn_cap = float(self.get_parameter("reverse_turn_speed_mps").value)
+        target = max(0.0, float(self.get_parameter("target_speed_mps").value))
+        if self._hard_turning and abs(capped - turn_cap) < 1e-6:
+            binding = "hard-turn"
+        elif traction < base_speed - 1e-6 and abs(capped - traction) < 1e-6:
+            binding = "traction"
+        elif base_speed < target - 1e-6:
+            binding = "approach-ramp"
+        else:
+            binding = "none (asking for target)"
+        self.get_logger().info(
+            f"speed: actual={self.state.speed:5.2f} ramped_target={self.ramped_target_speed:5.2f} "
+            f"asked={base_speed:5.2f} -> capped={capped:5.2f} | hard_turning={int(self._hard_turning)} "
+            f"turn_cap={turn_cap:4.2f} traction_cap={traction:5.2f} "
+            f"(ramped steer {steering_norm:+.2f}) | binding={binding}"
+        )
 
     def turn_speed(self, steering_norm: float, base_speed: float) -> float:
         """Speed to drive at, given the steer angle actually commanded.
@@ -1105,12 +1164,32 @@ class PurePursuitController(Node):
         speed instead of its own. So a hard turn taken while decelerating -- which is every
         turn at the end of a leg -- ran at whatever was left.
         """
+        asked = base_speed
         if self._hard_turning:
             base_speed = float(self.get_parameter("reverse_turn_speed_mps").value)
-        return min(base_speed, self.traction_speed_limit(steering_norm))
+        capped = min(base_speed, self.traction_speed_limit(steering_norm))
+        self.speed_trace(asked, capped, steering_norm)
+        return capped
 
     def traction_speed_limit(self, steering_norm: float) -> float:
-        """Upper bound the regolith can hold at this steer angle, m/s.
+        """Upper bound the regolith can hold at the steer angle the WHEELS ARE AT, m/s.
+
+        THE ARGUMENT IS THE RAMPED COMMAND, NOT THE DEMAND, and that distinction is the
+        whole cost of getting this wrong. Fed the raw pure-pursuit demand, the bound
+        punishes the rover for an angle the ramp is deliberately preventing it from
+        reaching: a demand of 1.0 caps the speed at sqrt(1.3/0.2747) = 2.2 m/s while the
+        wheels are still passing through 0.2, generating a fifth of the cornering load the
+        bound was computed for. Measured over 115 s against the two runs before this
+        existed, at the same delta and the same 3.0 m/s target:
+
+          before   max 3.55-4.02 m/s, mean while moving 1.27-1.35 m/s
+          demand   max 1.63-1.86 m/s, mean while moving 0.80 m/s
+
+        A 55% cut in top speed for a load that was never applied -- the front uprights
+        peaked at 19.4 deg, 0.56 of full lock, so the demand that set the bound was never
+        anywhere near what the wheels did. The rover then corners slowly, takes longer to
+        converge on the lane, and holds a steering demand for longer, which lowers the
+        bound again.
 
         THE BUG THIS EXISTS TO CLOSE. compute_steering is called from two places -- the
         home approach and the outbound/pickup path -- and the hard-turn speed cap was
@@ -1131,6 +1210,14 @@ class PurePursuitController(Node):
         if curvature <= 1e-6:
             return float("inf")
         return math.sqrt(a_lat / curvature)
+
+    def actual_steering(self) -> float:
+        """The steering the wheels are at, as far as this node can know it.
+
+        The last ramped command, i.e. one tick old at 20 Hz. That is the number the
+        traction bound has to be computed from -- see traction_speed_limit.
+        """
+        return self.command.steering
 
     def compute_steering(self, target: Tuple[float, float]) -> float:
         target_x, target_y = target
