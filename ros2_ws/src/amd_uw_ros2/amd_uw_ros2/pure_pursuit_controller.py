@@ -117,7 +117,9 @@ class PurePursuitController(Node):
         # which is the case it exists for.
         self.declare_parameter("max_lateral_accel_mps2", 1.3)
         # Wall seconds between speed-limiter trace lines; 0 disables. See speed_trace.
-        self.declare_parameter("speed_trace_period_s", 1.0)
+        # 10 s rather than 1: an unattended 3 h 40 m cluster slot at 1 s would put 13200
+        # lines per rover into the job log, and with four robots that is the log.
+        self.declare_parameter("speed_trace_period_s", 10.0)
         self.declare_parameter("wheelbase_m", 2.5)
         self.declare_parameter("max_steering_angle_rad", 0.6)
         self.declare_parameter("rock_side_offset_m", 1.5)
