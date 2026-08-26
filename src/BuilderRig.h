@@ -145,6 +145,10 @@ class BuilderRig {
     // Diagnostic escape hatch (--no_build). The arm bridge only offers a pick while the
     // builder is parked, so with this off it drives its lane and never builds.
     bool m_hull_park_enabled = true;
+    // A station may only ever move FORWARD along the orbit. See SetStationAngle.
+    double m_last_station_angle = 0.0;
+    bool m_station_angle_seen = false;
+    int m_station_retreats = 0;
 };
 
 }  // namespace amd_uw

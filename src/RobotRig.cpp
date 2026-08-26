@@ -1605,7 +1605,10 @@ void RobotRig::ApplySteeringStops(double time) {
                 // and the measured angle is zero at the pose the vehicle was built in.
                 stop.rest = m_vehicle->GetChassisBody()->GetRot().GetConjugate() * upright->GetRot();
                 stop.accumulator = upright->AddAccumulator();
-                stop.label = (side == chrono::vehicle::LEFT) ? "L" : "R";
+                // Axle AND side. The front knuckle is steered and the rear is not, so
+                // "upright L" alone cannot say which of two different faults engaged.
+                stop.label = (axle == 0) ? ((side == chrono::vehicle::LEFT) ? "front-L" : "front-R")
+                                         : ((side == chrono::vehicle::LEFT) ? "rear-L" : "rear-R");
                 m_steering_stops.push_back(stop);
             }
         }

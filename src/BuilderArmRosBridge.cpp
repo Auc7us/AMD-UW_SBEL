@@ -263,13 +263,18 @@ void BuilderArmRosBridge::ClearStrandedFeedstock(double time) {
         }
         const double place_reach =
             BuildComplete() ? 0.0 : (m_wall_slots[m_placed_count] - base).Length();
+        // "nearest 0.00 m" read as a measurement when it was a sentinel for "there are
+        // none", which is the opposite of what it looks like at a glance.
+        char nearest_txt[32] = "n/a";
+        if (spare > 0)
+            std::snprintf(nearest_txt, sizeof(nearest_txt), "%.2f m", nearest);
         RCLCPP_INFO(m_node->get_logger(),
                     "t=%.2f status: slot %d/%zu parked=%d arm_busy=%d | feedstock %zu known, "
-                    "%zu spare, %zu in reach, nearest %.2f m, %d cleared | slot is %.2f m away | "
+                    "%zu spare, %zu in reach, nearest %s, %d cleared | slot is %.2f m away | "
                     "base r=%.2f m, fetch offset %+.2f deg",
                     time, m_placed_count, m_wall_slots.size(), m_hull_parked ? 1 : 0,
                     m_arm.IsBusy() ? 1 : 0, m_feedstock.size(), spare, in_reach,
-                    spare ? nearest : 0.0, m_stranded_count, place_reach,
+                    nearest_txt, m_stranded_count, place_reach,
                     std::hypot(base.x() - site_center_x, base.y() - site_center_y),
                     m_station_fetch_offset * 180.0 / chrono::CH_PI);
     }

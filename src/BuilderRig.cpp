@@ -427,6 +427,47 @@ void BuilderRig::SetStationAngle(double angle_rad) {
     // See BuilderArmRosBridge::GetStationFetchOffset.
     if (m_arm_ros_bridge)
         angle_rad += m_arm_ros_bridge->GetStationFetchOffset();
+
+    // A STATION MAY ONLY EVER MOVE FORWARD. A retreating station is not a small error, it
+    // is a lap: the orbit controller can only travel one way, so a station three degrees
+    // behind the builder reads as three hundred and fifty-seven degrees ahead, and with
+    // sixteen ranks sharing this lane that lap goes through the station behind.
+    //
+    // Two things have caused a retreat. The first was a reach-based pull on the station
+    // that collapsed when its rock left reach -- removed, and the note in main.cpp records
+    // it. The second is the fetch offset here: sliding the station 4.9 deg to reach a rock
+    // and then clearing the offset when the slot is filled moves the station back by
+    // 4.9 - 1.72 = 3.2 deg, past a builder that has already driven to the fetched spot.
+    // Measured doing exactly that on run_20260826_190550 at t=180, builder 2, which was
+    // 3.5 deg past its station and opening.
+    //
+    // Clamping here rather than at either source means anything that computes a station
+    // gets the guarantee, including whatever computes one next. The wall spans 73 slots at
+    // 0.03 rad, 125 deg in total, so a monotonic angle cannot run out of room.
+    if (m_station_angle_seen) {
+        double delta = angle_rad - m_last_station_angle;
+        while (delta > chrono::CH_PI)
+            delta -= chrono::CH_2PI;
+        while (delta < -chrono::CH_PI)
+            delta += chrono::CH_2PI;
+        if (delta < 0.0) {
+            // Said out loud. A refused retreat is the fetch offset being handed back, and
+            // it is the difference between a builder that stays on station and one that
+            // drives 357 deg to get back to it -- so it belongs in the log as an event
+            // that happened, not as the absence of a lap.
+            if (m_station_retreats < 20) {
+                ++m_station_retreats;
+                std::cout << "[BuilderRig] station tried to retreat "
+                          << -delta * 180.0 / chrono::CH_PI << " deg; holding it at "
+                          << m_last_station_angle * 180.0 / chrono::CH_PI
+                          << " deg instead (a retreat costs a full lap)\n";
+            }
+            angle_rad = m_last_station_angle;
+        }
+    }
+    m_last_station_angle = angle_rad;
+    m_station_angle_seen = true;
+
     if (m_vehicle_ros_bridge)
         m_vehicle_ros_bridge->SetStationAngle(angle_rad);
 #else
