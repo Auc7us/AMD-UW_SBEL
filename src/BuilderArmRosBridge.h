@@ -81,6 +81,10 @@ class BuilderArmRosBridge {
     // would be moving under a solved pose, and the rock would be laid on the roll.
     void SetHullParked(bool parked) { m_hull_parked = parked; }
 
+    // Delete feedstock the builder has driven past. See the definition: a rock behind the
+    // builder can never be laid, and this is a one-way orbit.
+    void ClearStrandedFeedstock(double time);
+
     // Rocks laid so far == the next wall slot == how far round the lane the hull should
     // now be. BuilderRig turns this into the station angle it publishes.
     int GetPlacedCount() const { return m_placed_count; }
@@ -143,6 +147,8 @@ class BuilderArmRosBridge {
     // snap the station back and take the rock straight out of reach again.
     double m_station_fetch_offset = 0.0;
     int m_fetch_offset_slot = -1;
+    int m_stranded_count = 0;
+    double m_last_status_report = -1.0;
     bool m_hull_parked = false;
     double m_last_started_seq = -1.0;
     double m_settled_seq = -2.0;  // command_seq whose completion was already booked

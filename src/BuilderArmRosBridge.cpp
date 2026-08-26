@@ -77,6 +77,31 @@ constexpr int max_grab_attempts = 3;
 constexpr double fetch_reach_margin = 2.5;      // m past feedstock_reach_max
 constexpr double station_fetch_max_rad = 0.10;  // rad
 
+// STRANDED FEEDSTOCK. How far past a rock the builder must be before that rock is deleted,
+// and where it goes.
+//
+// The orbit is one-way and it has to stay that way. Sixteen ranks share this lane, so a
+// builder that doubles back to retrieve something drives into the station behind it, and
+// the demo is a demo of ranks NOT colliding. A rock the builder has passed is therefore
+// not merely inconvenient to reach, it is unreachable forever -- 15 deg is 8.6 m of arc at
+// this radius against a 5.2 m arm -- so leaving it lying there only puts an object in the
+// render that the machines visibly ignore.
+//
+// 15 deg also puts the deletion well behind the builder before it happens, so nothing
+// vanishes in shot. The grace period is there for the same reason: part of the seed heap
+// starts behind the arm base, and clearing it at t=0 would be a handful of rocks popping
+// out of existence on the first frame.
+//
+// The stash is the same trick SynAgents uses for unused zombie rocks -- fixed, collision
+// off, parked 5 km down. It costs nothing in the solver and it cannot be seen.
+constexpr double stranded_clear_rad = 15.0 * chrono::CH_PI / 180.0;
+constexpr double stranded_clear_grace = 30.0;  // s of sim before any rock is cleared
+const chrono::ChVector3d stranded_stash_position(0.0, 0.0, -5000.0);
+
+// How often a builder prints what it is holding, waiting for, and standing on. A 3 h run
+// is unreadable without it and unanswerable afterwards.
+constexpr double builder_status_period = 30.0;
+
 // How long a parked builder may sit unable to reach its OWN WALL SLOT before the station
 // is advanced past it.
 //
@@ -178,6 +203,78 @@ BuilderArmRosBridge::~BuilderArmRosBridge() {
 // same rule means there is only one behaviour to reason about, and the changeover from
 // heap to delivery needs no handling at all -- the heap simply stops being the nearest
 // thing once it is empty.
+// Delete what the builder has driven past, and say what it is doing while it does it.
+//
+// Direction of travel is taken from the WALL, not from a parameter: the slots are laid in
+// order, so the bearing from slot 0 to slot 1 is the way this builder goes round. That
+// makes the test correct whichever way the orbit is configured, with nothing to keep in
+// sync with the controller's counter_clockwise flag.
+void BuilderArmRosBridge::ClearStrandedFeedstock(double time) {
+    if (time < stranded_clear_grace || m_wall_slots.size() < 2)
+        return;
+
+    const auto bearing_of = [](const chrono::ChVector3d& p) {
+        return std::atan2(p.y() - site_center_y, p.x() - site_center_x);
+    };
+    const auto wrap = [](double a) {
+        while (a > chrono::CH_PI)
+            a -= chrono::CH_2PI;
+        while (a < -chrono::CH_PI)
+            a += chrono::CH_2PI;
+        return a;
+    };
+    const double travel = wrap(bearing_of(m_wall_slots[1]) - bearing_of(m_wall_slots[0])) >= 0.0 ? 1.0 : -1.0;
+    const auto base = m_arm.GetIkFramePos();
+    const double base_bearing = bearing_of(base);
+
+    for (auto& rock : m_feedstock) {
+        if (!rock || m_consumed.count(rock.get()))
+            continue;
+        const double past = travel * wrap(base_bearing - bearing_of(rock->GetPos()));
+        if (past < stranded_clear_rad)
+            continue;
+        // Booked before it is stashed, so no later selection can offer a rock that is now
+        // 5 km underground.
+        m_consumed.insert(rock.get());
+        ++m_stranded_count;
+        const double reach = (rock->GetPos() - base).Length();
+        RCLCPP_WARN(m_node->get_logger(),
+                    "t=%.2f clearing %s: %.1f deg behind the arm base (%.2f m away), so it can "
+                    "never be laid on a one-way orbit. %d cleared so far.",
+                    time, rock->GetName().c_str(), past * 180.0 / chrono::CH_PI, reach,
+                    m_stranded_count);
+        rock->SetFixed(true);
+        rock->EnableCollision(false);
+        rock->SetFrameRefToAbs(chrono::ChFrame<>(stranded_stash_position, chrono::QUNIT));
+    }
+
+    if (m_last_status_report < 0.0 || time - m_last_status_report >= builder_status_period) {
+        m_last_status_report = time;
+        size_t spare = 0, in_reach = 0;
+        double nearest = std::numeric_limits<double>::max();
+        for (const auto& rock : m_feedstock) {
+            if (!rock || m_consumed.count(rock.get()))
+                continue;
+            ++spare;
+            const double d = (rock->GetPos() - base).Length();
+            nearest = std::min(nearest, d);
+            if (d >= feedstock_reach_min && d <= feedstock_reach_max)
+                ++in_reach;
+        }
+        const double place_reach =
+            BuildComplete() ? 0.0 : (m_wall_slots[m_placed_count] - base).Length();
+        RCLCPP_INFO(m_node->get_logger(),
+                    "t=%.2f status: slot %d/%zu parked=%d arm_busy=%d | feedstock %zu known, "
+                    "%zu spare, %zu in reach, nearest %.2f m, %d cleared | slot is %.2f m away | "
+                    "base r=%.2f m, fetch offset %+.2f deg",
+                    time, m_placed_count, m_wall_slots.size(), m_hull_parked ? 1 : 0,
+                    m_arm.IsBusy() ? 1 : 0, m_feedstock.size(), spare, in_reach,
+                    spare ? nearest : 0.0, m_stranded_count, place_reach,
+                    std::hypot(base.x() - site_center_x, base.y() - site_center_y),
+                    m_station_fetch_offset * 180.0 / chrono::CH_PI);
+    }
+}
+
 void BuilderArmRosBridge::UpdateFeedstock(double time) {
     // Ask the collector at the publish rate, not at the 2 kHz step rate: the query
     // allocates and copies a vector, and a load cannot land twice in 20 ms of sim.
@@ -277,6 +374,9 @@ void BuilderArmRosBridge::Synchronize(double time, bool apply_commands) {
     // depend on which rock is on offer, and they must agree within a step.
     if (!m_arm.IsBusy())
         UpdateFeedstock(time);
+    // After the reach search, so a rock the arm has just been sent for is already booked
+    // and cannot be stashed out from under it.
+    ClearStrandedFeedstock(time);
 
     std::optional<DirectCommand> direct;
     std::optional<PickPlaceCommand> pick_place;
