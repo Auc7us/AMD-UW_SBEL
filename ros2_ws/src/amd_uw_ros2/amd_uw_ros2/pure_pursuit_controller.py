@@ -223,8 +223,11 @@ class PurePursuitController(Node):
         # BuilderArmRosBridge. Three slots ahead is already refused. Reach, not collision,
         # is what bounds this now that the run-in no longer crosses the builder's lane.
         self.declare_parameter("drop_slots_ahead", 1.0)
-        # Must match wall_slot_pitch_rad in src/RobotLayout.h (0.9 m of course at r=30).
-        self.declare_parameter("slot_pitch_rad", 0.03)
+        # Must match wall_slot_pitch_rad in src/RobotLayout.h: 0.5 m of course at r=30,
+        # so 0.5/30. There is no way to read the C++ constant from here, so it is mirrored
+        # by hand -- change one and you must change the other, or the collector aims its
+        # drop at a slot the builder is not working.
+        self.declare_parameter("slot_pitch_rad", 0.0166667)
         # Which builder feeds this collector. Each rank owns one of each, so 0 means "the
         # one with my own id" -- resolved after robot_id is read, below.
         self.declare_parameter("builder_id", 0)

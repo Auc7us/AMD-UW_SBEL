@@ -91,7 +91,15 @@ inline constexpr double drop_band_half_width = 2.0;
 //
 // Declared up here, ahead of the harvest cycle, because the harvest lane is measured in
 // these slots -- see HarvestDropSlot.
-inline constexpr double wall_slot_pitch_m = 0.9;
+// 0.5 m centre to centre, not 0.9. A rock is 0.244 m across, so this leaves a 0.26 m
+// gap and the course reads as a wall being built rather than a dotted line of markers.
+// 0.9 was a training spacing.
+//
+// Everything downstream is derived, so this is the only number to change: slots per rank
+// (BuilderWallSlotCount), the station's advance per rock, the seed pile layout, and the
+// collector's per-cycle lane offset all scale off wall_slot_pitch_rad. The one place it is
+// NOT derived is slot_pitch_rad in pure_pursuit_controller.py, which mirrors it by hand.
+inline constexpr double wall_slot_pitch_m = 0.5;
 inline constexpr double wall_slot_pitch_rad = wall_slot_pitch_m / work_circle_radius;
 
 // How many rocks the builder starts with, heaped beside its lane, and how many its
