@@ -55,6 +55,7 @@ def launch_setup(context, *args, **kwargs):
             "station_keep_speed_mps",
             "station_keep_min_speed_mps",
             "station_keep_max_steering",
+            "min_builder_gap_m",
         )
     }
     counter_clockwise = ParameterValue(
@@ -84,6 +85,11 @@ def launch_setup(context, *args, **kwargs):
                 parameters=[
                     {
                         "builder_id": builder_id,
+                        # Taken from the launched set, not declared separately: the
+                        # controller needs it only to work out which builder is in front of
+                        # it, and a count that disagreed with the ids actually running
+                        # would have it watching a topic nobody publishes.
+                        "num_builders": len(builder_ids),
                         "counter_clockwise": counter_clockwise,
                         **float_args,
                     }
@@ -208,6 +214,11 @@ def generate_launch_description():
             # Steering cap during the fine approach: a skid-steer with steering but no
             # throttle pivots in place and skids sideways off the lane.
             DeclareLaunchArgument("station_keep_max_steering", default_value="0.35"),
+            # Arc a builder leaves to the machine in front of it once the sector cap is
+            # gone. 9 m at the 33 m orbit is under two hull lengths (5.40 m), and at 16
+            # ranks the natural spacing is 12.96 m, so there is 4 m of slack before it
+            # holds. Set 0 to disable the conveyor hold entirely.
+            DeclareLaunchArgument("min_builder_gap_m", default_value="9.0"),
             DeclareLaunchArgument(
                 "counter_clockwise", default_value="true"
             ),

@@ -78,6 +78,26 @@ class BuilderOrbitController(Node):
         super().__init__("builder_orbit_controller")
 
         self.declare_parameter("builder_id", 1)
+        # CONVEYOR SPACING. How many builders share this orbit, and how much arc this one
+        # must leave to the machine in front of it.
+        #
+        # The sector cap used to make this unnecessary: each builder owned 0.7 of its own
+        # 2*pi/N and was forbidden to leave it, so two of them could not meet. Once a
+        # builder is allowed to walk out of its sector and carry on into the one ahead --
+        # laying the next layer over what its neighbour just finished -- that fence is
+        # gone, and the only thing keeping them apart is not catching up.
+        #
+        # It has to live here, in the controller, and not in the sim. Cross-rank visibility
+        # through SynChrono is not available in the configuration we run: draws_zombies is
+        # `is_sensor_rank && !no_sensor`, every run passes --no_sensor, so no rank ever
+        # builds a zombie body for another rank's builder and the remote agents are
+        # SynQuietAgents that drop their messages. ROS 2 has the visibility for free -- every
+        # builder already publishes /builder_N/vehicle_state on a shared DDS domain.
+        #
+        # 9 m at the 33 m orbit is a little under two hull lengths (5.40 m). At N=16 the
+        # natural spacing is 12.96 m, so a builder may close up by 4 m before it is held.
+        self.declare_parameter("num_builders", 0)          # 0 = infer from builder_id only
+        self.declare_parameter("min_builder_gap_m", 9.0)
         self.declare_parameter("control_rate_hz", 20.0)
         self.declare_parameter("center_x", 0.0)
         self.declare_parameter("center_y", 0.0)
@@ -278,6 +298,12 @@ class BuilderOrbitController(Node):
         self.command_topic = f"/builder_{self.builder_id}/vehicle_cmd"
         self.station_topic = f"/builder_{self.builder_id}/station_angle"
         self.arm_status_topic = f"/builder_{self.builder_id}/arm_status"
+        # The builder AHEAD. Travel is counter-clockwise and rank i sits at ray 2*pi*i/N,
+        # so the next higher id is the one in front; the highest wraps to the lowest.
+        n = int(self.get_parameter("num_builders").value)
+        self.ahead_id = (self.builder_id % n) + 1 if n > 1 else None
+        self.ahead_state: Optional[BuilderState] = None
+        self.holding_for_ahead = False
         self.state: Optional[BuilderState] = None
         self.steering_command = 0.0
         # Integral of heading error, in rad*s. Holds the standing steering trim the hull
@@ -315,6 +341,15 @@ class BuilderOrbitController(Node):
         self.create_subscription(
             Float64MultiArray, self.arm_status_topic, self.on_arm_status, 10
         )
+        if self.ahead_id is not None:
+            self.create_subscription(
+                Float64MultiArray, f"/builder_{self.ahead_id}/vehicle_state",
+                self.on_ahead_state, 10
+            )
+            self.get_logger().info(
+                f"conveyor: following builder {self.ahead_id}, holding "
+                f"{float(self.get_parameter('min_builder_gap_m').value):.1f} m of arc."
+            )
 
         rate_hz = max(
             1.0, float(self.get_parameter("control_rate_hz").value)
@@ -357,6 +392,34 @@ class BuilderOrbitController(Node):
                     f"station moved to {math.degrees(angle):.1f} deg; driving to the new one."
                 )
 
+    def on_ahead_state(self, msg: Float64MultiArray) -> None:
+        if len(msg.data) >= 4:
+            self.ahead_state = BuilderState(float(msg.data[0]), float(msg.data[1]),
+                                            float(msg.data[2]), float(msg.data[3]))
+
+    def gap_to_ahead(self) -> Optional[float]:
+        """Arc from this builder to the one in front, along the direction of travel.
+
+        None when there is nobody in front or nothing has been heard from them yet -- and
+        None means "no constraint", so a silent neighbour never stalls this builder. That
+        is the right failure direction here: the topic going quiet is far more likely than
+        two machines actually converging, and a run that halts because a neighbour crashed
+        is worse than one that keeps building.
+        """
+        if self.ahead_state is None or self.state is None:
+            return None
+        cx = float(self.get_parameter("center_x").value)
+        cy = float(self.get_parameter("center_y").value)
+        radius = max(1e-3, float(self.get_parameter("path_radius_m").value))
+        mine = math.atan2(self.state.y - cy, self.state.x - cx)
+        theirs = math.atan2(self.ahead_state.y - cy, self.ahead_state.x - cx)
+        delta = theirs - mine
+        if not bool(self.get_parameter("counter_clockwise").value):
+            delta = -delta
+        # Forward-only: they are always AHEAD, so wrap into [0, 2*pi) rather than [-pi, pi).
+        delta %= 2 * math.pi
+        return delta * radius
+
     def on_arm_status(self, msg: Float64MultiArray) -> None:
         """Track whether the arm is mid pick-and-place. State 1 == BUSY (LrvArm)."""
         if len(msg.data) < 2:
@@ -392,6 +455,30 @@ class BuilderOrbitController(Node):
         if self.state is None:
             self.publish_command(0.0, 0.0, 1.0)
             return
+
+        # CONVEYOR HOLD. Stand still rather than close on the machine in front.
+        #
+        # Checked before anything else that can command motion, and it stops the hull only
+        # -- the arm is untouched, so a held builder carries on laying whatever is in reach
+        # instead of idling. That is the whole point of the pattern: the wall gets built
+        # from wherever you are standing, and you move up when there is room.
+        gap = self.gap_to_ahead()
+        min_gap = abs(float(self.get_parameter("min_builder_gap_m").value))
+        if gap is not None and gap < min_gap:
+            if not self.holding_for_ahead:
+                self.holding_for_ahead = True
+                self.get_logger().warn(
+                    f"builder {self.ahead_id} is {gap:.2f} m ahead, inside the {min_gap:.1f} m "
+                    f"gap; holding here until it moves on."
+                )
+            self.steering_command = approach(
+                self.steering_command, 0.0,
+                max(0.0, float(self.get_parameter("steering_ramp_per_s").value)) * self.dt)
+            self.publish_command(self.steering_command, 0.0, 1.0)
+            return
+        if self.holding_for_ahead and gap is not None and gap >= min_gap:
+            self.holding_for_ahead = False
+            self.get_logger().info(f"gap to builder {self.ahead_id} reopened to {gap:.2f} m; moving again.")
 
         # Absolute freeze while the arm works. See self.arm_busy.
         if self.arm_busy:
