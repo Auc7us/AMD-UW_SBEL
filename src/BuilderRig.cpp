@@ -455,7 +455,13 @@ void BuilderRig::SetStationAngle(double angle_rad) {
             // it is the difference between a builder that stays on station and one that
             // drives 357 deg to get back to it -- so it belongs in the log as an event
             // that happened, not as the absence of a lap.
-            if (m_station_retreats < 20) {
+            // ONE LINE PER EPISODE, not per step. This runs every sim step, so an
+            // unlatched report spends its whole budget in 20 steps -- 10 ms -- and then
+            // goes silent for the rest of the run, which is worse than not logging at
+            // all: the first retreat is over-reported and every later one is invisible.
+            // Measured doing exactly that on the t=189.48 retreat in the verification run.
+            if (!m_station_retreat_open && m_station_retreats < 20) {
+                m_station_retreat_open = true;
                 ++m_station_retreats;
                 std::cout << "[BuilderRig] station tried to retreat "
                           << -delta * 180.0 / chrono::CH_PI << " deg; holding it at "
@@ -463,6 +469,10 @@ void BuilderRig::SetStationAngle(double angle_rad) {
                           << " deg instead (a retreat costs a full lap)\n";
             }
             angle_rad = m_last_station_angle;
+        } else {
+            // The station has caught up with where the fetch left it; the next retreat is
+            // a new episode and deserves its own line.
+            m_station_retreat_open = false;
         }
     }
     m_last_station_angle = angle_rad;

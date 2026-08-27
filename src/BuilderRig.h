@@ -149,6 +149,9 @@ class BuilderRig {
     double m_last_station_angle = 0.0;
     bool m_station_angle_seen = false;
     int m_station_retreats = 0;
+    // Latched per EPISODE. SetStationAngle runs every step, so a retreat that persists is
+    // one event, not one per step. See the note where it is reported.
+    bool m_station_retreat_open = false;
 };
 
 }  // namespace amd_uw
