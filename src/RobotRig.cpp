@@ -1587,11 +1587,27 @@ void RobotRig::ApplySteeringStops(double time) {
                 if (at == std::string::npos)
                     continue;
                 name.replace(at, tag.size(), "_upright");
+                // Nearest match, not first match. The name is NOT unique: every axle's
+                // upright is called "..._upright_L", and the "#2" that distinguishes them
+                // in a recording is invented by TrajectoryRecorder for its own manifest
+                // (see the `part += "#"` there), not carried on the body. Taking the first
+                // match therefore bound BOTH axles to the FRONT upright -- the rear went
+                // unguarded, and the front got two stops pulling on it. It showed up as two
+                // engagement lines at the same t and the same angle to six decimals, which
+                // no two independent knuckles would ever produce.
+                //
+                // The spindle of this axle is metres from any other axle's upright, so
+                // nearest-to-my-own-spindle is unambiguous and does not depend on the order
+                // bodies happen to sit in the system.
                 std::shared_ptr<chrono::ChBody> upright;
+                double best = std::numeric_limits<double>::max();
                 for (const auto& body : GetSystem()->GetBodies()) {
-                    if (body->GetName() == name) {
+                    if (body->GetName() != name)
+                        continue;
+                    const double d = (body->GetPos() - spindle->GetPos()).Length();
+                    if (d < best) {
+                        best = d;
                         upright = body;
-                        break;
                     }
                 }
                 if (!upright) {
