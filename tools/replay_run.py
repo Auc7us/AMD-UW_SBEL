@@ -49,6 +49,31 @@ RUNNING_GEAR = re.compile(
     re.IGNORECASE,
 )
 
+# The builder hull mesh is squashed to 0.110x in z (BuilderRig::AddSquashedChassisVisual)
+# so it does not bury the arm, which leaves its deck at z=0.204 over the tracks while the
+# top run of the chain and the drive sprocket stand at 0.272 and 0.258. Measured over 40
+# frames of run_20260827_211044 on ranks 1-8, the shoes stand up to 0.166 m proud of the
+# hull surface directly above them -- they visibly saw through the deck. This lifts the
+# hull VISUAL only: the physics, the tracks, the arm and every recorded pose are untouched,
+# so the render disagrees with the sim by exactly this offset and nothing else. 0.20 m
+# clears the worst shoe by 3.4 cm; it also sinks the arm's pedestal block (0.324..0.413)
+# into the deck, so the arm reads as deck-mounted rather than on a post.
+HULL_LIFT_Z = 0.20
+HULL_SHAPE_NAME = "Builder_Chassis_Squashed_Z"
+
+
+def lift_hull(objects, lift):
+    """Raise the builder hull visual by `lift` in the chassis frame, nothing else."""
+    if abs(lift) < 1e-9:
+        return
+    for obj in objects:
+        for shape in obj.get("shapes", []):
+            if shape.get("shape_name") == HULL_SHAPE_NAME:
+                pos = list(shape.get("pos", [0.0, 0.0, 0.0]))
+                pos[2] += lift
+                shape["pos"] = pos
+
+
 # Fallback colours, by group, for a body whose shapes carry none.
 GROUP_COLORS = {
     "collector": "#3b82f6",
@@ -427,13 +452,15 @@ def read_scm(path):
     return delta, plane, nx, ny, rate, frames
 
 
-def load(directory, ranks, t_from, t_to, fps, keep_all, max_frames):
+def load(directory, ranks, t_from, t_to, fps, keep_all, max_frames,
+         hull_lift=HULL_LIFT_Z):
     """(meta, bodies, poses, times). poses is (frames, bodies, 7) = position + quaternion."""
     meta0 = {}
     bodies = []
     per_rank = []
     for rank in ranks:
         rec = Recording(directory, rank)
+        lift_hull(rec.objects, hull_lift)
         if not meta0:
             meta0 = rec.meta
         try:
@@ -1103,6 +1130,10 @@ def main():
                     help="extra directory to search for meshes whose recorded absolute "
                          "path does not exist here (repeatable)")
     ap.add_argument("--focus", help="frame the first body whose group/part contains this")
+    ap.add_argument("--hull-lift", type=float, default=HULL_LIFT_Z,
+                    help="raise the builder hull mesh by this many metres in the render "
+                         "so the track shoes stop cutting through its deck; 0 disables "
+                         f"(default {HULL_LIFT_Z:g})")
     ap.add_argument("--focus-dist", type=float, default=12.0,
                     help="metres of scene to frame around the focused body, so smaller is "
                          "closer (default 12, about one builder plus its arm)")
@@ -1116,7 +1147,8 @@ def main():
         raise SystemExit(f"no rank_*_frames.bin in {args.directory}")
 
     meta, bodies, poses, times, rate = load(args.directory, ranks, args.t_from, args.t_to,
-                                            args.fps, not args.no_running_gear, args.max_frames)
+                                            args.fps, not args.no_running_gear, args.max_frames,
+                                            args.hull_lift)
     print(f"ranks       {ranks}")
     print(f"bodies      {len(bodies)}"
           f"{' (running gear dropped)' if args.no_running_gear else ' incl. running gear'}")

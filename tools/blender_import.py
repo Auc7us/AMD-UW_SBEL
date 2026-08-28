@@ -209,17 +209,38 @@ def resolve_mesh(src_path, group_part, mesh_dir, mesh_map):
     return src_path if os.path.exists(src_path) else None
 
 
+# Same hull lift replay_run.py applies, and for the same reason: the squashed builder
+# hull's deck sits at z=0.204 over the tracks while the top run of the chain reaches 0.272,
+# so the shoes saw through it by up to 0.166 m. Visual only -- poses, tracks and arm are
+# left exactly as recorded.
+HULL_LIFT_Z = 0.20
+HULL_SHAPE_NAME = "Builder_Chassis_Squashed_Z"
+
+
+def lift_hull(objects, lift):
+    """Raise the builder hull visual by `lift` in the chassis frame, nothing else."""
+    if abs(lift) < 1e-9:
+        return
+    for obj in objects:
+        for shape in obj.get("shapes", []):
+            if shape.get("shape_name") == HULL_SHAPE_NAME:
+                pos = list(shape.get("pos", [0.0, 0.0, 0.0]))
+                pos[2] += lift
+                shape["pos"] = pos
+
+
 # ------------------------------------------------------------------------- blender
 
 def build(dataset, rank, out_path=None, groups=None, mesh_dir=None, mesh_map=None,
           fit_aabb=True, start=None, end=None, stride=1, fps=None, props=True,
           scm=True, scm_ranks=None, scm_at=None, scm_decimate=1, scm_animate=False,
-          scm_key_stride=10):
+          scm_key_stride=10, hull_lift=HULL_LIFT_Z):
     import bpy
     from mathutils import Quaternion, Vector
 
     meta = load_meta(dataset, rank)
     objects = load_manifest(dataset, rank)
+    lift_hull(objects, hull_lift)
     rate = float(meta.get("rate_hz") or 60.0)
     fps = int(round(fps or rate))
 
@@ -610,6 +631,9 @@ def main():
     ap.add_argument("--meshes", help="directory of replacement meshes, matched by basename")
     ap.add_argument("--mesh-map", help="JSON file of {pattern: replacement path}")
     ap.add_argument("--no-fit", action="store_true", help="do not fit meshes to the recorded aabb")
+    ap.add_argument("--hull-lift", type=float, default=HULL_LIFT_Z,
+                    help="raise the builder hull mesh by this many metres so the track "
+                         f"shoes stop cutting through its deck; 0 disables (default {HULL_LIFT_Z:g})")
     ap.add_argument("--start", type=float)
     ap.add_argument("--end", type=float)
     ap.add_argument("--stride", type=int, default=1, help="keyframe every Nth sample")
@@ -641,7 +665,8 @@ def main():
           props=not args.no_props, scm=not args.no_scm,
           scm_ranks=[int(r) for r in args.scm_ranks.split(",")] if args.scm_ranks else None,
           scm_at=args.scm_at, scm_decimate=max(1, args.scm_decimate),
-          scm_animate=args.scm_animate, scm_key_stride=max(1, args.scm_key_stride))
+          scm_animate=args.scm_animate, scm_key_stride=max(1, args.scm_key_stride),
+          hull_lift=args.hull_lift)
 
 
 if __name__ == "__main__":
