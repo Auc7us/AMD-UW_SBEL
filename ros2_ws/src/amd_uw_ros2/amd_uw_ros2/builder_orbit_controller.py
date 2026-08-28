@@ -209,7 +209,39 @@ class BuilderOrbitController(Node):
         # must drift before setting off again. The gap between them is hysteresis: a
         # tracked vehicle cannot stop on a point, so without it the builder would
         # creep past, restart, and hunt around its station forever.
-        self.declare_parameter("station_tolerance_rad", 0.05)
+        #
+        # SLOT PITCH, and the two station bands sized from it.
+        #
+        # These used to be absolute: an ANGLE for arrival, METRES for the keep deadband,
+        # both hand-set for a 33 m lane at 0.9 m slot pitch. Scaling the site to a 53 m
+        # lane at 0.5 m pitch left station_tolerance_rad = 0.015 untouched, and 0.015 rad
+        # at r = 53 is 0.795 m of arc -- 1.59x the ENTIRE slot pitch. Every new station was
+        # therefore already inside the arrival band the moment the sim published it: the
+        # builder latched holding_station immediately, never entered the drive branch, and
+        # the forward creep to the next slot -- the only thing that corrects radial error
+        # (see the radial note further down) -- never ran once. Measured on
+        # run_20260827_061917: all eight builders spiralled 6-7 m inside the lane, took
+        # station off-lane, and starved. Twenty rocks laid in 600 s.
+        #
+        # So they are FRACTIONS of the slot pitch now, and the pitch itself is measured off
+        # the station stream rather than duplicated from RobotLayout.h. Change the site
+        # radius or the pitch and these follow, with no second place to forget.
+        #
+        #   arrival  0.55 * pitch -- the ratio the working 33 m / 0.9 m config had
+        #                            (0.495 m of 0.900 m). It MUST stay below 1.0: at 1.0
+        #                            arrival is free and the creep never happens.
+        #   deadband 0.28 * pitch -- likewise (0.250 m of 0.900 m).
+        #
+        # wall_slot_pitch_m is a BOOTSTRAP only, for the first station before any advance
+        # has been seen. Keep it equal to RobotLayout.h's wall_slot_pitch_m; if it drifts,
+        # the measured value silently wins and says so in the log.
+        self.declare_parameter("wall_slot_pitch_m", 0.5)
+        self.declare_parameter("station_tolerance_frac_of_pitch", 0.55)
+        self.declare_parameter("station_keep_deadband_frac_of_pitch", 0.28)
+        # Absolute OVERRIDES for the two bands. 0.0 means "derive from the pitch", which is
+        # what every launch file should use. A positive value pins the band and is reported
+        # at startup, because pinning it is how the failure above happened.
+        self.declare_parameter("station_tolerance_rad", 0.0)
         # Widened from 0.20 rad. With active station keeping (see on_timer) the
         # builder now corrects creep continuously instead of waiting to fall out of
         # this band, so the band's only remaining job is to catch a builder that has
@@ -271,7 +303,7 @@ class BuilderOrbitController(Node):
         self.declare_parameter("station_radius_release_m", 1.3)
         # Active station keeping. Inside the deadband the builder sits on the brake;
         # outside it, it creeps forward along its arc at gain * error, capped.
-        self.declare_parameter("station_keep_deadband_m", 0.25)
+        self.declare_parameter("station_keep_deadband_m", 0.0)   # 0 = derive from pitch
         self.declare_parameter("station_keep_speed_mps", 0.5)
         self.declare_parameter("station_keep_gain", 0.35)
         # FLOOR on the creep speed, and it is not optional. gain * (error - deadband)
@@ -291,7 +323,70 @@ class BuilderOrbitController(Node):
         # steering, and simply ground themselves round and inward. The speed floor above
         # is the primary fix; this bounds the damage if the builder is ever slow here
         # again.
-        self.declare_parameter("station_keep_max_steering", 0.35)
+        # 0.0 = derive, which is what it should be. The cap has to clear the STANDING
+        # TRIM this lane needs, |(1/R - hull_bias)/gain|, or it throttles the correction
+        # exactly when the builder is off-lane and needs it. At R = 53 that trim is 0.243
+        # of full steering, so the old fixed 0.35 left only 0.107 for correction while the
+        # pursuit law was asking for 0.48 -- a third of the authority discarded, and the
+        # hull's uncancelled turn curled it inward. Derived: |ff| + margin, capped by
+        # steering_limit, so it scales with the lane instead of being re-guessed.
+        self.declare_parameter("station_keep_max_steering", 0.0)
+        self.declare_parameter("station_keep_steer_margin", 0.15)
+        #
+        # SPEED GATE ON STEERING. The one that matters -- read this before touching the
+        # steering gains.
+        #
+        # This control law treats steering as a CURVATURE command: hull_bias_curvature_per_m,
+        # steering_curvature_gain_per_m, kappa_wanted = direction/radius. A skid-steer's
+        # steering is not curvature, it is a track-speed DIFFERENTIAL, which is a YAW RATE
+        # command. The two agree only while the hull is translating:
+        #
+        #     curvature   kappa = dtheta/ds   -> ds = 0 gives dtheta = 0
+        #     skid-steer  dtheta/dt != 0 with ds = 0  -> pivot in place, kappa unbounded
+        #
+        # So the 0.243 of standing trim that correctly holds a 53 m lane at 0.9 m/s is, on a
+        # hull making 0.03 m/s, a pure pivot command -- and a pivoting hull's centre swings
+        # on a radius of one hull half-length, which walks it off the lane.
+        #
+        # Measured on run_20260827_155242 rank 3, t=115..200: yaw swept 46 deg, lateral
+        # velocity 3x forward velocity, v/omega = 2.64 m against a 2.70 m half-length, and
+        # the entire 1.84 m radial excursion is 2.7*(sin 47.5 - sin 1.6) = 1.91 m of swing.
+        # It rotated in place and travelled nowhere. Raising the station-keep cap made this
+        # WORSE, because the cap was never the variable.
+        #
+        # The gate scales the steering DEMAND by how fast the hull is actually going, so at
+        # rest it asks for nothing and all the effort goes into translating. Once moving,
+        # full authority returns and the curvature model is valid again.
+        #
+        # The knee separates the two regimes cleanly as measured: the pivot ran at 0.003 to
+        # 0.05 m/s, while a legitimate creep is floored at station_keep_min_speed_mps = 0.25.
+        # 0.15 m/s sits between them, so this costs a real creep nothing.
+        #
+        # What it gives up is worth naming: below the knee the hull drives straight instead of
+        # following the lane's curvature. Over one slot pitch that is L^2/(8R) = 0.53^2/424 =
+        # 0.66 MM of chord error. Steering at creep speed buys 0.66 mm and costs 1.9 m.
+        self.declare_parameter("steering_speed_knee_mps", 0.15)
+        #
+        # GIVE UP AND HOLD. A creep that is not converging must end in the brake, not in
+        # more steering.
+        #
+        # Brake-and-hold was always implemented -- it is the `arc_error <= deadband` branch
+        # below -- but nothing ever decided to USE it when the approach failed. Rank 3 of
+        # run_20260827_155242 sat 0.53 m short of its station and stayed in the creep branch
+        # for 85 s, which is how it came to rotate 46 deg in place.
+        #
+        # Holding short is nearly free, which is the point: from 0.53 m behind the station
+        # the arm's reach to its own slot is hypot(3.095, 0.53) = 3.14 m, against a 2.0-5.2 m
+        # envelope. The builder lays from where it stands, and the arm's own reach test --
+        # not this controller -- decides whether that is good enough. If it is not, the
+        # sim's unservable-slot timeout advances the station and the builder sets off again
+        # with a fresh target, which is a FORWARD move and costs no lap.
+        #
+        # Progress is judged on arc to the station, not on speed: a hull pivoting on the
+        # spot has non-zero speed and makes no progress, which is exactly the case that has
+        # to be caught.
+        self.declare_parameter("station_creep_stall_s", 5.0)
+        self.declare_parameter("station_creep_progress_m", 0.02)
 
         self.builder_id = int(self.get_parameter("builder_id").value)
         self.state_topic = f"/builder_{self.builder_id}/vehicle_state"
@@ -304,6 +399,18 @@ class BuilderOrbitController(Node):
         self.ahead_id = (self.builder_id % n) + 1 if n > 1 else None
         self.ahead_state: Optional[BuilderState] = None
         self.holding_for_ahead = False
+        # Angular slot pitch as MEASURED from consecutive station advances. Running
+        # minimum, not the latest: the sim may skip a slot (the unservable-slot timeout
+        # advances the station by more than one pitch), and a multiple of the pitch would
+        # widen both bands. The minimum positive step it ever takes is the pitch.
+        self.slot_pitch_rad_measured: Optional[float] = None
+        self.reported_measured_pitch = False
+        self.reported_speed_gate = False
+        # Creep progress watch: best arc-to-station seen on this approach, and how long since
+        # it last improved. Reset whenever the station moves.
+        self.creep_best_arc = None
+        self.creep_stalled_s = 0.0
+        self.creep_gave_up = False
         self.state: Optional[BuilderState] = None
         self.steering_command = 0.0
         # Integral of heading error, in rad*s. Holds the standing steering trim the hull
@@ -366,6 +473,32 @@ class BuilderOrbitController(Node):
             f"ki={self.get_parameter('steering_ki').value:.2f}, "
             f"{self.state_topic} -> {self.command_topic}"
         )
+        # Report the DERIVED bands in metres, which is the form the failure was visible in.
+        # An arrival band at or above one slot pitch means the builder never has to drive to
+        # a station, and the creep that corrects radial error never happens -- so say the
+        # ratio out loud at startup rather than leaving it to be worked out after a run.
+        radius = max(1e-3, float(self.get_parameter("path_radius_m").value))
+        pitch_m = self.slot_pitch_rad() * radius
+        tol_m = self.station_tolerance_rad() * radius
+        pinned = []
+        if float(self.get_parameter("station_tolerance_rad").value) > 0.0:
+            pinned.append("station_tolerance_rad")
+        if float(self.get_parameter("station_keep_deadband_m").value) > 0.0:
+            pinned.append("station_keep_deadband_m")
+        if float(self.get_parameter("station_keep_max_steering").value) > 0.0:
+            pinned.append("station_keep_max_steering")
+        self.get_logger().info(
+            f"stations: pitch {pitch_m:.3f} m (bootstrap), arrival {tol_m:.3f} m "
+            f"({tol_m / max(1e-6, pitch_m):.2f} of pitch), keep deadband "
+            f"{self.station_keep_deadband_m():.3f} m"
+            + (f" -- PINNED by {', '.join(pinned)}" if pinned else "")
+        )
+        if tol_m >= pitch_m:
+            self.get_logger().error(
+                f"arrival band {tol_m:.3f} m is not smaller than the {pitch_m:.3f} m slot "
+                f"pitch: every station will read as already reached, the builder will never "
+                f"drive to one, and radial error will never be corrected."
+            )
 
     def on_state(self, msg: Float64MultiArray) -> None:
         if len(msg.data) != 4:
@@ -385,7 +518,12 @@ class BuilderOrbitController(Node):
             return
         angle = float(msg.data[0])
         if self.station_angle is None or abs(wrap_to_pi(angle - self.station_angle)) > 1e-6:
+            if self.station_angle is not None:
+                self.note_station_step(wrap_to_pi(angle - self.station_angle))
             self.station_angle = angle
+            self.creep_best_arc = None
+            self.creep_stalled_s = 0.0
+            self.creep_gave_up = False
             if self.holding_station:
                 self.holding_station = False
                 self.get_logger().info(
@@ -396,6 +534,76 @@ class BuilderOrbitController(Node):
         if len(msg.data) >= 4:
             self.ahead_state = BuilderState(float(msg.data[0]), float(msg.data[1]),
                                             float(msg.data[2]), float(msg.data[3]))
+
+    def note_station_step(self, step: float) -> None:
+        """Learn the slot pitch from how far the station just moved.
+
+        Sanity-bounded: a step must be forward and must not exceed the bootstrap pitch by
+        more than 4x, so a genuine multi-slot skip or a re-seeded station cannot poison
+        the bands. Stations only ever move forward (see on_station_angle in the sim), so a
+        negative step means something is wrong and is ignored rather than trusted.
+        """
+        if not bool(self.get_parameter("counter_clockwise").value):
+            step = -step
+        if step <= 1e-6:
+            return
+        bootstrap = self.bootstrap_pitch_rad()
+        if step > 4.0 * bootstrap:
+            return
+        if self.slot_pitch_rad_measured is None or step < self.slot_pitch_rad_measured:
+            self.slot_pitch_rad_measured = step
+            radius = max(1e-3, float(self.get_parameter("path_radius_m").value))
+            if not self.reported_measured_pitch:
+                self.reported_measured_pitch = True
+                self.get_logger().info(
+                    f"measured slot pitch {step * radius:.3f} m of arc "
+                    f"({math.degrees(step):.4f} deg); arrival band "
+                    f"{self.station_tolerance_rad() * radius:.3f} m, keep deadband "
+                    f"{self.station_keep_deadband_m():.3f} m."
+                )
+
+    def bootstrap_pitch_rad(self) -> float:
+        radius = max(1e-3, float(self.get_parameter("path_radius_m").value))
+        return max(1e-6, abs(float(self.get_parameter("wall_slot_pitch_m").value))) / radius
+
+    def slot_pitch_rad(self) -> float:
+        """Angular slot pitch: measured when we have it, bootstrap parameter until then."""
+        if self.slot_pitch_rad_measured is not None:
+            return self.slot_pitch_rad_measured
+        return self.bootstrap_pitch_rad()
+
+    def station_tolerance_rad(self) -> float:
+        """Arrival band, as an angle. A FRACTION OF THE SLOT PITCH -- see the note on
+        station_tolerance_frac_of_pitch. Never allowed to reach a whole pitch, because at
+        one pitch every station is pre-arrived and the builder stops creeping entirely."""
+        override = float(self.get_parameter("station_tolerance_rad").value)
+        if override > 0.0:
+            return abs(override)
+        frac = abs(float(self.get_parameter("station_tolerance_frac_of_pitch").value))
+        return min(0.9, frac) * self.slot_pitch_rad()
+
+    def station_keep_deadband_m(self) -> float:
+        """Keep deadband, in metres of arc. Also a fraction of the slot pitch."""
+        override = float(self.get_parameter("station_keep_deadband_m").value)
+        if override > 0.0:
+            return abs(override)
+        frac = abs(float(self.get_parameter("station_keep_deadband_frac_of_pitch").value))
+        radius = max(1e-3, float(self.get_parameter("path_radius_m").value))
+        return min(0.9, frac) * self.slot_pitch_rad() * radius
+
+    def station_keep_steer_cap(self, steering_ff: float) -> float:
+        """Steering authority during the fine approach.
+
+        Derived so it always clears this lane's standing trim: a cap below |steering_ff|
+        means the builder cannot even hold the lane's curvature while creeping, let alone
+        correct a radial error. Bounded above by steering_limit, which is the real physical
+        constraint (full steering locks a track and the hull stops translating)."""
+        limit = abs(float(self.get_parameter("steering_limit").value)) or 1.0
+        override = float(self.get_parameter("station_keep_max_steering").value)
+        if override > 0.0:
+            return min(abs(override), limit)
+        margin = abs(float(self.get_parameter("station_keep_steer_margin").value))
+        return min(limit, abs(steering_ff) + margin)
 
     def gap_to_ahead(self) -> Optional[float]:
         """Arc from this builder to the one in front, along the direction of travel.
@@ -542,12 +750,22 @@ class BuilderOrbitController(Node):
             kappa_bias = float(self.get_parameter("hull_bias_curvature_per_m").value)
             steering_ff = clamp((kappa_wanted - kappa_bias) / kappa_gain, -1.0, 1.0)
         limit = abs(float(self.get_parameter("steering_limit").value)) or 1.0
-        raw = steering_ff + kp * head_err + ki * self.steering_integral
+        # See steering_speed_knee_mps. Steering only means curvature while the hull moves.
+        knee = abs(float(self.get_parameter("steering_speed_knee_mps").value))
+        speed_gate = 1.0 if knee <= 1e-6 else clamp(abs(self.state.speed) / knee, 0.0, 1.0)
+        raw = (steering_ff + kp * head_err + ki * self.steering_integral) * speed_gate
         # Anti-windup against the ACTUAL limit, not against 1.0 -- the output saturates at
         # `limit`, so that is where accumulating has to stop. The reversal exception lets a
         # saturated builder still wind the integral back down; without it the integral that
         # saturated it stays frozen at the value that keeps it there.
-        if abs(raw) < limit or (raw > 0.0) != (head_err > 0.0):
+        # Anti-windup against the ACTUAL limit, and against the GATE. While the gate is
+        # closed the hull cannot act on head_err at all, so integrating it is winding up a
+        # term that will snap in the moment the hull starts moving -- which is how a builder
+        # would leave its station in a turn. Decay instead, the same way the on-station
+        # branch does.
+        if speed_gate < 0.999:
+            self.steering_integral *= 0.98
+        elif abs(raw) < limit or (raw > 0.0) != (head_err > 0.0):
             self.steering_integral = clamp(
                 self.steering_integral + head_err * self.dt, -i_limit, i_limit
             )
@@ -602,7 +820,7 @@ class BuilderOrbitController(Node):
             self.get_logger().info(f"back on the lane ({radius_error:+.2f} m).")
 
         if error is not None:
-            tolerance = abs(float(self.get_parameter("station_tolerance_rad").value))
+            tolerance = self.station_tolerance_rad()
             # Arrival is judged on ABSOLUTE angular proximity, not on remaining
             # travel. Remaining travel is forced into [0, 2*pi), so overshooting
             # the station by one control tick makes it read ~2*pi -- "nearly a
@@ -637,11 +855,29 @@ class BuilderOrbitController(Node):
             # steering, at a speed proportional to the error. Inside a small deadband
             # it holds the brake, so there is no hunting.
             arc_error = wrap_to_pi(error) * radius if error is not None else 0.0
-            deadband = max(0.0, float(self.get_parameter("station_keep_deadband_m").value))
-            if arc_error <= deadband:
-                # On the mark, or crept slightly PAST it. Do not chase forward past
-                # the station -- the builder only drives one way round, so overshoot
-                # would cost a full lap. Sit on the brake.
+            deadband = self.station_keep_deadband_m()
+
+            # Watch the approach. See station_creep_stall_s.
+            progress = abs(float(self.get_parameter("station_creep_progress_m").value))
+            stall_limit = abs(float(self.get_parameter("station_creep_stall_s").value))
+            if arc_error > deadband and not self.creep_gave_up:
+                if self.creep_best_arc is None or arc_error < self.creep_best_arc - progress:
+                    self.creep_best_arc = arc_error
+                    self.creep_stalled_s = 0.0
+                else:
+                    self.creep_stalled_s += self.dt
+                    if stall_limit > 0.0 and self.creep_stalled_s >= stall_limit:
+                        self.creep_gave_up = True
+                        self.get_logger().warn(
+                            f"creep stalled {arc_error:.2f} m short of station after "
+                            f"{stall_limit:.0f} s without progress; braking and holding here. "
+                            f"The arm works from this spot or the slot times out."
+                        )
+
+            if arc_error <= deadband or self.creep_gave_up:
+                # On the mark, crept slightly PAST it, or gave up short of it. Do not chase
+                # forward past the station -- the builder only drives one way round, so
+                # overshoot would cost a full lap. Sit on the brake.
                 #
                 # Unwind the integral term here rather than freezing it. Standing on the
                 # brake, heading error is not a tracking error, and the trim that was
@@ -652,6 +888,18 @@ class BuilderOrbitController(Node):
                 self.publish_command(self.steering_command, 0.0, 1.0)
                 return
 
+            # A gate that stays shut while the builder is trying to creep means the hull is
+            # not translating -- the thing that used to become a pivot. Report it once per
+            # episode so it is visible in the log rather than only in the trajectory.
+            if speed_gate < 0.5 and not self.reported_speed_gate:
+                self.reported_speed_gate = True
+                self.get_logger().warn(
+                    f"creeping at {abs(self.state.speed):.3f} m/s, under the "
+                    f"{knee:.2f} m/s knee: steering gated to {speed_gate:.2f} of demand so "
+                    f"the hull drives straight instead of pivoting."
+                )
+            elif speed_gate >= 0.999 and self.reported_speed_gate:
+                self.reported_speed_gate = False
             keep_speed = max(0.0, float(self.get_parameter("station_keep_speed_mps").value))
             gain = max(0.0, float(self.get_parameter("station_keep_gain").value))
             min_speed = max(0.0, float(self.get_parameter("station_keep_min_speed_mps").value))
@@ -663,7 +911,7 @@ class BuilderOrbitController(Node):
             kp = max(0.0, float(self.get_parameter("speed_kp").value))
             max_throttle = clamp(float(self.get_parameter("max_throttle").value), 0.0, 1.0)
             effort = kp * speed_error
-            steer_cap = abs(float(self.get_parameter("station_keep_max_steering").value))
+            steer_cap = self.station_keep_steer_cap(steering_ff)
             self.publish_command(
                 clamp(self.steering_command, -steer_cap, steer_cap),
                 clamp(effort, 0.0, max_throttle),

@@ -50,11 +50,15 @@ def launch_setup(context, *args, **kwargs):
             "max_throttle",
             "station_radius_tol_m",
             "station_radius_release_m",
+            "wall_slot_pitch_m",
+            "station_tolerance_frac_of_pitch",
+            "station_keep_deadband_frac_of_pitch",
             "station_tolerance_rad",
             "station_keep_deadband_m",
             "station_keep_speed_mps",
             "station_keep_min_speed_mps",
             "station_keep_max_steering",
+            "station_keep_steer_margin",
             "min_builder_gap_m",
         )
     }
@@ -129,10 +133,10 @@ def generate_launch_description():
             DeclareLaunchArgument("center_x", default_value="0.0"),
             DeclareLaunchArgument("center_y", default_value="0.0"),
             DeclareLaunchArgument(
-                "work_circle_radius_m", default_value="30.0"
+                "work_circle_radius_m", default_value="50.0"
             ),
             DeclareLaunchArgument(
-                "path_radius_m", default_value="33.0"
+                "path_radius_m", default_value="53.0"
             ),
             # Only the initial 2.5 m drive from spawn to slot 0 uses this; after that the
             # builder creeps ~1 m per rock under station keeping. Dropped from 1.0 because
@@ -203,8 +207,25 @@ def generate_launch_description():
             # the band and brakes rather than stalling just outside it. Overshoot is
             # cheap here -- wall slots are fixed world points, so being a little along
             # the lane costs reach margin, not placement accuracy.
-            DeclareLaunchArgument("station_tolerance_rad", default_value="0.015"),
-            DeclareLaunchArgument("station_keep_deadband_m", default_value="0.25"),
+            # SLOT PITCH, and the two station bands DERIVED from it.
+            #
+            # These were absolute before -- 0.015 rad of arrival and 0.25 m of deadband,
+            # both set for a 33 m lane at 0.9 m pitch. Moving the site to a 53 m lane at
+            # 0.5 m pitch left the angle alone, and 0.015 rad at r=53 is 0.795 m: 1.59x
+            # the whole slot pitch. Arrival became free, the builder never drove to a
+            # station, and the forward creep that is the only radial correction never ran.
+            # Eight builders spiralled 6-7 m inside the lane. So: fractions of the pitch,
+            # and the controller measures the pitch off the station stream anyway.
+            #
+            # wall_slot_pitch_m is only the bootstrap for the first station. Keep it equal
+            # to wall_slot_pitch_m in src/RobotLayout.h.
+            DeclareLaunchArgument("wall_slot_pitch_m", default_value="0.5"),
+            DeclareLaunchArgument("station_tolerance_frac_of_pitch", default_value="0.55"),
+            DeclareLaunchArgument("station_keep_deadband_frac_of_pitch", default_value="0.28"),
+            # Absolute overrides. 0.0 = derive, which is what these should stay at; a
+            # positive value pins the band and the controller logs that it is pinned.
+            DeclareLaunchArgument("station_tolerance_rad", default_value="0.0"),
+            DeclareLaunchArgument("station_keep_deadband_m", default_value="0.0"),
             DeclareLaunchArgument("station_keep_speed_mps", default_value="0.35"),
             # Floor on the creep speed. Without it the commanded speed tapers to a few
             # mm/s just outside the deadband, the M113 does not move at all, and the
@@ -213,7 +234,12 @@ def generate_launch_description():
             DeclareLaunchArgument("station_keep_min_speed_mps", default_value="0.25"),
             # Steering cap during the fine approach: a skid-steer with steering but no
             # throttle pivots in place and skids sideways off the lane.
-            DeclareLaunchArgument("station_keep_max_steering", default_value="0.35"),
+            # 0.0 = derive as |standing trim| + margin, capped by steering_limit. A fixed
+            # 0.35 was below what a 53 m lane needs (trim 0.243, pursuit demand 0.48), so it
+            # discarded a third of the correction authority precisely when the builder was
+            # off-lane.
+            DeclareLaunchArgument("station_keep_max_steering", default_value="0.0"),
+            DeclareLaunchArgument("station_keep_steer_margin", default_value="0.15"),
             # Arc a builder leaves to the machine in front of it once the sector cap is
             # gone. 9 m at the 33 m orbit is under two hull lengths (5.40 m), and at 16
             # ranks the natural spacing is 12.96 m, so there is 4 m of slack before it
