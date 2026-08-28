@@ -15,7 +15,7 @@ ros2 launch amd_uw_ros2 robot_controllers.launch.py robot_ids:=$IDS \
   target_speed_mps:=3.0 switch_radius_m:=2.0 rock_side_offset_m:=2.0 > $L/collectors_$SLURM_JOB_ID.log 2>&1 &
 C1=$!
 ros2 launch amd_uw_ros2 builder_orbit_controllers.launch.py builder_ids:=$IDS \
-  work_circle_radius_m:=30.0 path_radius_m:=33.0 counter_clockwise:=true > $L/builders_$SLURM_JOB_ID.log 2>&1 &
+  work_circle_radius_m:=50.0 path_radius_m:=53.0 counter_clockwise:=true > $L/builders_$SLURM_JOB_ID.log 2>&1 &
 C2=$!
 sleep 25
 echo "controller nodes up: $(ros2 node list 2>/dev/null | wc -l)"

@@ -52,9 +52,28 @@ namespace amd_uw {
 // inside the folded-arm limit.
 inline constexpr double site_center_x = 0.0;
 inline constexpr double site_center_y = 0.0;
-inline constexpr double work_circle_radius = 30.0;
-inline constexpr double builder_path_radius = 33.0;
-inline constexpr double robot_start_radius = 37.0;
+// SCALED UP from 30/33/37. The RADIAL OFFSETS between the rings are unchanged, and
+// deliberately so: they are set by machine dimensions, not by site size.
+//
+//   wall -> builder lane   3.0 m   the arm's own geometry. The arm base rides the lane
+//                                  at hypot(lane, 2.5) and must reach its slot on the
+//                                  wall; scaling this would break the reach the whole
+//                                  build depends on.
+//   lane -> collector ring 4.0 m   clearance between a 2.686 m hull and a 1.49 m rover.
+//                                  Vehicles do not get bigger with the site.
+//   ring -> rover spawn    5.0 m   staging, out of the drop band.
+//
+// What growing the circle buys is ARC per rank, which is what the builders need in order
+// to rotate as they build: at 16 ranks the wall sector goes from 11.78 m to 19.63 m, and
+// the course from 8.25 m to 13.74 m -- from one arm-station to nearly two.
+//
+// NOTE the terrain. The levelled pad is r <= 45 m (make_graded_pad.py --pad-radius) and
+// the site now reaches r = 62 m at the spawn ring, where the measured height spread is
+// 0.50 m rms against 0.23 m inside the pad. Regrade before running this:
+//     python3 tools/make_graded_pad.py --pad-radius 65 --taper-radius 130
+inline constexpr double work_circle_radius = 50.0;
+inline constexpr double builder_path_radius = 53.0;
+inline constexpr double robot_start_radius = 57.0;
 
 // Where the rover is PLACED at t=0, which is deliberately NOT its drop point.
 //
@@ -73,7 +92,7 @@ inline constexpr double robot_start_radius = 37.0;
 // Pushing the BUILDER outward instead cannot work: the rover rig occupies 34.59-38.99 m
 // radially, so the first clear outboard slot is past the drop point and the builder
 // would have to drive through the parked rover to reach its lane.
-inline constexpr double robot_spawn_radius = 42.0;
+inline constexpr double robot_spawn_radius = 62.0;
 
 // Half-width of the radial band around the collector circle that counts as "at the
 // drop point" -- so a 2 * this metre band, concentric with the collector circle.
@@ -436,7 +455,7 @@ inline double BuilderOrbitHeadingRad(int builder_index, int num_builders) {
 // Where the seed heap sits: 3.5 m radially outboard of the arm base, mid-way through
 // the 2.78-4.44 m band the arm proved in service. Close to robot_start_radius (37.0) on
 // purpose -- the heap is standing in for a delivered load, so it should sit where one does.
-inline constexpr double builder_pile_radius = 36.6;
+inline constexpr double builder_pile_radius = 56.6;
 
 // The seed heap serves the first builder_seed_rock_count slots and is centred on the
 // middle of that run, so the builder reaches it from either end. The builder creeps
@@ -485,7 +504,7 @@ inline double BuilderStationAngleRad(int builder_index, int num_builders, int sl
 // at the slot's own angle, because the hull leads by arm_lead precisely so that this
 // cancels. Both the wall slot and the heap are placed relative to THIS point, not to the
 // hull, since it is the origin of the IK frame.
-inline constexpr double builder_arm_base_radius_approx = 33.0946;  // hypot(33, 2.5)
+inline constexpr double builder_arm_base_radius_approx = 53.0589;  // hypot(53, 2.5)
 
 // Centre of the seed heap serving slots [pile*P, pile*P + P), placed at the middle
 // of that run so it is never more than ~2.7 m of lane from the arm base working it.
