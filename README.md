@@ -52,8 +52,9 @@ colcon build --symlink-install --packages-select amd_uw_ros2
 
 ## Run
 
-Rank 0 owns no robot, so **robots = np - 1**. Shown at 8 robots (`-np 9`). All three
-commands must agree on the count.
+Rank 0 owns no robot, so **robots = np - 1**. The walkthrough below is 8 robots (`-np 9`);
+[20 robots (`-np 21`)](#20-robots--np-21) is the same three commands with the count
+changed. All three commands must agree on the count.
 
 Terminal 1 — collectors:
 
@@ -91,21 +92,68 @@ mpirun -np 9 ./build/demo_SYN_construction --no_sensor --scm_delta 0.042 -e 600 
 Watch a rank instead of running headless: drop `--no_sensor` and add `--vsg 1` (one window
 per listed rank).
 
+### 20 robots (`-np 21`)
+
+Same three terminals, same flags; only the count changes, and it must change in all three.
+
+Terminal 1 — collectors:
+
+```bash
+ros2 launch amd_uw_ros2 robot_controllers.launch.py \
+  robot_ids:=1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20 \
+  target_speed_mps:=3.0 switch_radius_m:=2.0 rock_side_offset_m:=2.0
+```
+
+Terminal 2 — builders:
+
+```bash
+ros2 launch amd_uw_ros2 builder_orbit_controllers.launch.py \
+  builder_ids:=1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20 \
+  counter_clockwise:=true
+```
+
+Terminal 3 — the sim (cluster node, ≥ 21 cores):
+
+```bash
+mpirun -np 21 ./build/demo_SYN_construction --no_sensor --scm_delta 0.02 -e 1500 \
+  --perf_log 10 --record_rate 30 --scm_record_rate 1
+```
+
+The node runs the **2 cm grid** (`--scm_delta 0.02`), four times the soil memory of the
+workstation's 0.035: ~11.2 GB per robot rank, ~225 GB across 20. Confirm the node has it
+before queueing. This will not run on the workstation at any rank count — there the same
+walkthrough needs `--map-by hwthread` and a much coarser grid; see
+[Sizing a run](#sizing-a-run) and the core-count note below.
+
+The layout needs no adjustment at this count: `BuilderWallSlotCount` caps each builder at
+0.7 of its own `2*pi/N` sector, so the wall stays collision-free as `N` grows.
+
 ### Sizing a run
 
-`--scm_delta` decides whether it fits. Measured **2.55 GB per robot rank at 0.042**, and
-this box dies above ~21 GB of job RSS:
+`--scm_delta` decides whether a run fits. Measured **2.55 GB per robot rank at 0.042** and
+**3.53 GB at 0.035**; memory scales as `1/delta²`, so per-rank GB is
+`2.55 × (0.042/delta)²`.
 
-| robots | delta 0.042 | fits in 32 GB |
-|---|---|---|
-| 4 | 10.3 GB | yes |
-| 8 | 20.5 GB | yes, at the limit |
-| 15 | 38 GB | no — needs delta ≈ 0.057 |
+| robots | delta 0.020 | delta 0.035 | delta 0.042 | delta 0.050 | delta 0.057 |
+|---|---|---|---|---|---|
+| 4 | 45 GB | 14 GB | 10.3 GB | 7.2 GB | 5.5 GB |
+| 8 | 90 GB | 28 GB | 20.5 GB | 14.4 GB | 11 GB |
+| 15 | 169 GB | 53 GB | 38 GB | 27 GB | 21 GB |
+| 20 | 225 GB | 71 GB | 51 GB | 36 GB | 28 GB |
 
-Memory scales as `1/delta²`. Check `free -g` before launching and run one sim at a time.
+The 0.020 column is the cluster grid; every entry in it is a node-only configuration.
 
-MPI slots are **physical cores**, not threads: `nproc` reports 24 here but `lscpu` shows 16
-cores, so `-np 17` fails with "not enough slots" unless you add `--map-by hwthread`.
+This workstation has 64 GB. The 15-robot run at 0.035 measures 52.9 GB steady with 5.1 GB
+available and 1.4 GB of swap in use — that is the practical ceiling here, and **20 robots
+at 0.035 (71 GB) is over it**. Either drop to delta 0.050 or run 20 robots on a cluster
+node, which is also the only place the 0.020 grid fits. Check `free -g` before launching
+and run one sim at a time.
+
+MPI slots are **physical cores**, not threads. This workstation has 16 cores (`nproc`
+reports 24 because of SMT), so anything above `-np 16` — `-np 21` included — fails with
+"not enough slots" unless you add `--map-by hwthread`, which shares cores and slows the
+run. The cluster nodes are 8 x 16 = 128 cores, so `-np 21` runs there unmodified;
+`batch/inner_run.sh` passes `--oversubscribe` in any case.
 
 ## Flags
 
