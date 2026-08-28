@@ -106,7 +106,7 @@ std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> AddRockFields(
     const chrono::ChVector3d forward(std::cos(heading), std::sin(heading), 0.0);
     const chrono::ChVector3d left(-std::sin(heading), std::cos(heading), 0.0);
 
-    const int rocks_per_rank = RocksPerRank(robot_index);
+    const int rocks_per_rank = RocksPerRank(robot_index, cycle);
     for (int i = 0; i < rocks_per_rank; i++) {
         const double distance = config.first_distance + i * config.distance_step + distance_jitter(rng);
         const chrono::ChVector3d xy = origin + forward * distance + left * lateral_offset(rng);

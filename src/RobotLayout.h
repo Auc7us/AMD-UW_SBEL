@@ -157,13 +157,29 @@ inline void SetRocksPerRankOverride(int count) {
     g_rocks_per_rank_override = count;
 }
 
-inline int RocksPerRank(int rank_index) {
+// Fixed seed for the draw. Change it to reshuffle every rank's whole sequence of loads;
+// keep it and the run is bit-identical, which is what makes a recording reproducible.
+inline constexpr unsigned int harvest_rock_count_seed = 0x20260817u;
+
+// The count now varies PER CYCLE as well as per rank, so a rank does not bring the same
+// load forever: rank 1 might bring 2, then 5, then 3. It is still a pure function --
+// hashed from (rank, cycle, seed), not drawn from a stream -- for the same reason it
+// always was. Rank 0 has to be able to work out what rank 7 will bring on cycle 4
+// without being told, and a std::mt19937 would have to be advanced in the same order in
+// every process to manage that.
+//
+// CYCLE IS PART OF THE HASH, not an index into a sequence, so any cycle can be evaluated
+// directly. HarvestDropSlot needs exactly that: it sums every earlier cycle's load to
+// find where the wall has reached, and it must be able to do so from a standing start.
+inline int RocksPerRank(int rank_index, int cycle) {
     if (g_rocks_per_rank_override > 0)
         return g_rocks_per_rank_override;
     // Integer hash (splitmix32 finalizer), not <random>: this has to give the same
     // answer in every MPI process on every machine, and a std::mt19937 stream would
     // have to be advanced in the same order everywhere to do that.
-    unsigned int x = 0x9E3779B9u * static_cast<unsigned int>((rank_index < 0 ? 0 : rank_index) + 1) + 0x20260817u;
+    unsigned int x = 0x9E3779B9u * static_cast<unsigned int>((rank_index < 0 ? 0 : rank_index) + 1)
+                   + 0x85EBCA6Bu * static_cast<unsigned int>((cycle < 0 ? 0 : cycle) + 1)
+                   + harvest_rock_count_seed;
     x ^= x >> 16;
     x *= 0x7FEB352Du;
     x ^= x >> 15;
@@ -194,8 +210,23 @@ inline int RocksPerRank(int rank_index) {
 // lane six slots per cycle; one that brings two walks two. Using a single site-wide load
 // size here would put the fast ranks' piles well ahead of the wall their builder has
 // actually reached.
+// The most any cycle can bring. Anything SIZED rather than placed has to use this and
+// not a particular cycle's draw -- a pool built for a 2-rock cycle overflows on a 6-rock
+// one, and the overflow is silent.
+inline int MaxRocksPerCycle() {
+    return g_rocks_per_rank_override > 0 ? g_rocks_per_rank_override : max_rocks_per_rank;
+}
+
 inline int HarvestDropSlot(int rank_index, int cycle) {
-    return builder_seed_rock_count + (cycle < 0 ? 0 : cycle) * RocksPerRank(rank_index);
+    // SUM of every earlier load, not cycle * a constant. The whole point of measuring the
+    // step in wall slots is that the pile lands where the builder's wall will actually
+    // have reached, and the wall has reached seed + (every rock delivered so far). With a
+    // per-cycle load size, multiplying by this cycle's draw would put a 6-rock rank's
+    // fourth pile 24 slots out when its wall is only at 14.
+    int slot = builder_seed_rock_count;
+    for (int c = 0; c < (cycle < 0 ? 0 : cycle); ++c)
+        slot += RocksPerRank(rank_index, c);
+    return slot;
 }
 
 // Where that load is actually PUT, as a slot number: the MIDDLE of the run of slots it
@@ -211,7 +242,7 @@ inline int HarvestDropSlot(int rank_index, int cycle) {
 // Centring halves that lever arm: +/-2.5 slots gives 4.70 m, inside the envelope, and it
 // also tightens the old L=2 case from 4.04 m to 3.94 m.
 inline double HarvestLoadCenterSlot(int rank_index, int cycle) {
-    return HarvestDropSlot(rank_index, cycle) + 0.5 * (RocksPerRank(rank_index) - 1);
+    return HarvestDropSlot(rank_index, cycle) + 0.5 * (RocksPerRank(rank_index, cycle) - 1);
 }
 inline double HarvestLaneOffsetRad(int rank_index, int cycle) {
     return HarvestLoadCenterSlot(rank_index, cycle) * wall_slot_pitch_rad;

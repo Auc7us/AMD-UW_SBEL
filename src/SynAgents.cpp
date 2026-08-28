@@ -159,15 +159,16 @@ void SynRockAgent::InitializeZombie(chrono::ChSystem* system) {
     // scene, since both bind their renderables at initialise time. Unused ones wait
     // below the terrain until a message places them.
     const int robot_index = m_agent_key.GetNodeID() - 1;
-    // Harvest rocks (RocksPerRank(robot_index) per cycle) plus the builder's feedstock
+    // Harvest rocks (2-6 per cycle, redrawn each cycle) plus the builder's feedstock
     // heap, which is sent on the same message and so needs zombies of its own at the end
     // of the run.
     //
-    // The count comes from RocksPerRank and NOT from a config this rank was handed. Rank
-    // 0 owns no rock field and gets one RockFieldConfig for the whole site, but each
-    // remote rank now spawns 2-6 rocks per cycle -- so the pool has to be sized from the
-    // SENDING rank's own number, which is exactly what that function is for.
-    const int rocks_per_rank = RocksPerRank(robot_index);
+    // The count comes from RobotLayout and NOT from a config this rank was handed. Rank 0
+    // owns no rock field and gets one RockFieldConfig for the whole site, while each
+    // remote rank spawns 2-6 rocks per cycle, varying cycle to cycle.
+    // MaxRocksPerCycle, not this cycle's draw: the load size now varies per cycle, and a
+    // pool sized on a 2-rock cycle silently loses the tail of a 6-rock one.
+    const int rocks_per_rank = MaxRocksPerCycle();
     const int capacity = std::max(1, rocks_per_rank) * zombie_rock_cycle_capacity +
                          std::max(0, m_builder_rock_capacity);
     for (int i = 0; i < capacity; i++) {

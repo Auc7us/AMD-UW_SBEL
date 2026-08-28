@@ -1105,12 +1105,13 @@ int main(int argc, char* argv[]) {
         std::ostringstream counts;
         int total_rocks = 0;
         for (int i = 0; i < std::max(0, num_ranks - 1); ++i) {
-            const int n = RocksPerRank(i);
+            const int n = RocksPerRank(i, 0);
             total_rocks += n;
             counts << (i ? ", " : "") << "r" << (i + 1) << "=" << n;
         }
-        SynLog() << "Rocks per rank per harvest cycle (" << min_rocks_per_rank << "-" << max_rocks_per_rank
-                 << "): " << counts.str() << " -- " << total_rocks << " per cycle across the site.\n\n";
+        SynLog() << "Rocks per rank, CYCLE 0 (" << min_rocks_per_rank << "-" << max_rocks_per_rank
+                 << ", redrawn every cycle, seed 0x" << std::hex << harvest_rock_count_seed << std::dec
+                 << "): " << counts.str() << " -- " << total_rocks << " on cycle 0 across the site.\n\n";
     }
 
     const double terrain_length = terrain_pixels_x * terrain_resolution_scale;
@@ -1394,8 +1395,9 @@ int main(int argc, char* argv[]) {
         }
         SynLog() << "Rank " << rank << " build plan: " << wall_slot_count << " wall slots at "
                  << wall_slot_pitch_m << " m pitch, " << builder_pile_rocks.size()
-                 << " seed rocks in 1 heap, then " << RocksPerRank(builder_index)
-                 << " per collector load every " << RocksPerRank(builder_index) << " slots; "
+                 << " seed rocks in 1 heap, then " << RocksPerRank(builder_index, 0)
+                 << " on the first collector load (" << min_rocks_per_rank << "-" << max_rocks_per_rank
+                 << ", redrawn each cycle), one slot per rock delivered; "
                  << wall_slot_count * wall_slot_pitch_rad * builder_path_radius << " m of lane to walk.\n";
 
         // Reach audit, at t=0, against the NOMINAL arm base for each slot. Every target in
@@ -1434,9 +1436,11 @@ int main(int argc, char* argv[]) {
                 }
             }
             // Each load lands at HarvestDropSlot(c) and is eaten over the next
-            // RocksPerRank slots, so check both ends of that run.
-            const int rocks_per_load = RocksPerRank(builder_index);
+            // RocksPerRank(c) slots, so check both ends of that run. The draw is per
+            // cycle now, so it has to be read inside the loop -- auditing one cycle's
+            // count against every cycle's drop point measures a run that never happens.
             for (int cycle = 0; HarvestDropSlot(builder_index, cycle) < wall_slot_count; ++cycle) {
+                const int rocks_per_load = RocksPerRank(builder_index, cycle);
                 // HarvestDropPoint, not InitialGroundPositionForRobot: the audit has to
                 // measure where the ROCKS land, and the latter is where the tractor parks
                 // -- 2.4 m of arc further on, so the rig's pour lip lands here.
@@ -1642,7 +1646,9 @@ int main(int argc, char* argv[]) {
     if (recorder) {
         recorder->AddMeta("robot_index", std::to_string(robot->GetRobotIndex()));
         recorder->AddMeta("num_robot_ranks", std::to_string(num_robot_ranks));
-        recorder->AddMeta("rocks_per_rank", std::to_string(RocksPerRank(robot->GetRobotIndex())));
+        recorder->AddMeta("rocks_per_rank", std::to_string(RocksPerRank(robot->GetRobotIndex(), 0)));
+        recorder->AddMeta("rocks_per_rank_max", std::to_string(MaxRocksPerCycle()));
+        recorder->AddMeta("rocks_per_rank_seed", std::to_string(harvest_rock_count_seed));
         recorder->AddMeta("seed_rocks", std::to_string(builder_pile_rocks.size()));
         recorder->AddMeta("wall_slots", std::to_string(BuilderWallSlotCount(num_robot_ranks)));
         recorder->AddMeta("step_size", std::to_string(step_size));
