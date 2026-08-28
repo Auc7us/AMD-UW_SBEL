@@ -309,7 +309,20 @@ inline constexpr double trailer_bed_floor_y = 2.0 * trailer_bed_half_y;
 inline constexpr double trailer_bed_center_y = 0.0;
 // Half-length along the trailer; the rear lip (-x) is the pour line and the tilt axis.
 inline constexpr double trailer_bed_half_x = 0.5 * trailer_bed_floor_x;
-inline constexpr double trailer_bed_wall_height = 0.15;
+// DOUBLED from 0.15. Rocks are aimed at the bed centre with a measured |rock-place| error
+// of 0.42-0.56 m against a 0.6 m half-width, and they arrive from a 0.47 m release height,
+// so a near-miss lands on the bed and then has to be KEPT there while the collector drives
+// a 358 m ring back to its builder. A 0.15 m wall is under one rock radius (~0.23 m rocks
+// at rock_mesh_scale 0.2) and is climbable by a rock that lands rolling.
+//
+// Nothing else needs adjusting for this: TrailerBedBoxes centres each wall at h/2 and
+// TrailerTailgateBox takes the same height, so the gate still closes the rear exactly, and
+// the sensor rank's visual-only copy of the bed is built from these same constants
+// (SynAgents.cpp). The bed's inertia picks up 4.6% (mass is a fixed 30 kg). Clearance for
+// the arm is unaffected -- release is 0.47 m above the floor, so 0.17 m still clears the
+// taller wall -- and the dump is unaffected because the load slides out over the REAR lip,
+// which is the gated end, not over a side wall.
+inline constexpr double trailer_bed_wall_height = 0.30;
 inline constexpr double trailer_bed_thickness = 0.03;
 
 // One box of the tub: full extents, and its centre in the owning body's own frame.
