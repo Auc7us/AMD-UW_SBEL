@@ -176,7 +176,7 @@ source /opt/ros/humble/setup.bash
 cd ~/mountdir/amd-uw
 cmake -S . -B build -DAMD_UW_ENABLE_ROS2=ON
 ninja -C build -j2
-mpirun -np 3 ./build/demo_SYN_polaris_flat
+mpirun -np 3 ./build/demo_SYN_construction
 ```
 
 Rank layout:

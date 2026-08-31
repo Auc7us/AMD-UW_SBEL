@@ -218,9 +218,11 @@ void RobotRig::InitializeOnTerrain(chrono::vehicle::ChTerrain& terrain,
         // A small active domain per rock so SCM actually supports them. Without it,
         // rocks lie outside every active domain, get no soil reaction, and fall
         // through the terrain during settle (spawning "under" the SCM surface).
-        const chrono::ChVector3d rock_domain(1.0, 1.0, 1.0);
+        // Sized in RobotLayout.h: covers the rock plus margin and not a square metre
+        // more, because every extra node is re-probed against a growing hash map on
+        // every step of the run.
         for (auto& rock : m_rocks)
-            scm->AddActiveDomain(rock, chrono::ChVector3d(0.0, 0.0, 0.3), rock_domain);
+            scm->AddActiveDomain(rock, scm_rock_domain_center, scm_rock_domain_dims);
     }
     Settle(terrain, settle_time, step_size);
     if (settle_time > 0) {
@@ -320,10 +322,15 @@ void RobotRig::InitializeVehicle(const chrono::ChCoordsys<>& init_pos) {
 
     for (auto& axle : m_vehicle->GetAxles()) {
         for (auto& wheel : axle->GetWheels()) {
+            // Lugged RIGID MESH tyre, not TMeasy. On deformable terrain a TMeasy wheel
+            // is a force element with no collision geometry, so SCM's rays hit nothing
+            // there: the wheel rides the deformed surface but never cuts a rut and never
+            // earns sinkage resistance. See Polaris_LuggedTire.json for why bolting a
+            // shape onto TMeasy instead would double-count the support.
             auto tire = chrono::vehicle::ReadTireJSON(
-                chrono::vehicle::GetVehicleDataFile("LRV/Polaris_TMeasyTire.json"));
-            // Render the configured tire OBJ while keeping TMeasy force-element
-            // dynamics for tire-terrain interaction.
+                chrono::vehicle::GetVehicleDataFile("LRV/Polaris_LuggedTire.json"));
+            // Render the smooth tyre OBJ; the lugs live in the collision mesh, which is
+            // what works the soil.
             m_vehicle->InitializeTire(tire, wheel, chrono::VisualizationType::MESH);
             tire->SetStepsize(m_tire_step_size);
         }
@@ -371,11 +378,14 @@ void RobotRig::InitializeTrailer() {
 
     for (auto& axle : m_trailer->GetAxles()) {
         for (auto& wheel : axle->GetWheels()) {
-            // Trailer-specific tire: a trailer wheel carries ~107 N against the
-            // tractor's ~480 N, and TMeasy stiffness follows its nominal load, so a
-            // single shared tire cannot suit both without being far too stiff for one.
+            // One tyre now serves both, where TMeasy needed two. The split existed
+            // because TMeasy's vertical stiffness follows its NOMINAL LOAD, and a
+            // trailer wheel carries ~107 N against the tractor's ~480 N -- no single
+            // TMeasy tyre suited both. A rigid mesh tyre has no nominal load: its
+            // stiffness is the contact material's, so the same geometry is correct at
+            // any wheel load, and both tyres are the same 0.4089 x 0.30 anyway.
             auto tire = chrono::vehicle::ReadTireJSON(
-                chrono::vehicle::GetVehicleDataFile("LRV/Polaris_TMeasyTire_Trailer.json"));
+                chrono::vehicle::GetVehicleDataFile("LRV/Polaris_LuggedTire.json"));
             m_trailer->InitializeTire(tire, wheel, chrono::VisualizationType::MESH);
             tire->SetStepsize(m_tire_step_size);
         }
@@ -762,6 +772,16 @@ void RobotRig::StartNextHarvestCycle(double time) {
     for (size_t i = first_new; i < m_rocks.size(); ++i)
         GetSystem()->GetCollisionSystem()->BindItem(m_rocks[i]);
 
+    // On deformable terrain the new rocks also need their own SCM active domains. Being
+    // bound into the collision system only makes them visible to ray casts that are
+    // actually fired, and SCM fires rays only from nodes inside some active domain -- so
+    // without this a later cycle's rocks spawn on the surface and sink straight through it.
+    // The cycle-0 rocks get theirs in InitializeOnTerrain; these are the ones that follow.
+    if (auto* scm = dynamic_cast<chrono::vehicle::SCMTerrain*>(m_terrain)) {
+        for (size_t i = first_new; i < m_rocks.size(); ++i)
+            scm->AddActiveDomain(m_rocks[i], scm_rock_domain_center, scm_rock_domain_dims);
+    }
+
     // DO NOT bind these into the VSG scene from here -- it segfaults. VSG needs new
     // geometry compiled and merged between frames (the LoadOperation/Merge pattern in
     // ChVisualSystemVSG.cpp); BindBody does neither, so it is only safe before
@@ -1026,6 +1046,7 @@ void RobotRig::Synchronize(double time, chrono::vehicle::ChTerrain& terrain) {
     CheckWheelSinkage(time, terrain);
     CheckStuck(time, terrain);
     CheckTrailerWheelAnomalies(time, terrain);
+    ApplySteeringStops(time);
     AdvanceDumpCycle(time);
     m_driver->Synchronize(time);
 #ifdef AMD_UW_ENABLE_ROS2
@@ -1500,6 +1521,176 @@ void RobotRig::CheckWheelSinkage(double time, chrono::vehicle::ChTerrain& terrai
     for (const auto& axle : m_trailer->GetAxles())
         for (const auto& wheel : axle->GetWheels())
             check(wheel, "TRAILER");
+}
+
+void RobotRig::ApplySteeringStops(double time) {
+    // WHAT THIS PREVENTS. Every double-wishbone upright in this vehicle is held against
+    // rotating about its kingpin by ONE ChLinkDistance -- the tie rod, from the steering
+    // link on the steered axle and from the chassis on the unsteered one. A distance
+    // constraint between two points has two solutions, and for this suspension's
+    // hardpoints the second one is a knuckle turned about -108 deg:
+    //
+    //   kingpin axis   UCA_U(-0.008, 0.571, 0.088) -> LCA_U(0.016, 0.574, -0.082)
+    //   tie rod        0.44548 m, steering arm 0.1199 m about the kingpin
+    //   |P_c - P_u| = 0.44548 is satisfied at theta = 0 AND at theta = -108 deg
+    //
+    // So a knuckle that gets pushed through its singular configuration -- where the tie
+    // rod's moment arm about the kingpin passes through zero and the rod has no authority
+    // at all -- lands on the far root and STAYS there. The constraint is satisfied. The
+    // solver is not failing, there is nothing to converge, and no amount of iterations or
+    // step reduction recovers it. Measured on run_20260825_221818: rank 2's right front
+    // went from a steady +18.2 deg to +31.7 deg in one sample at t=118.0 and sat at
+    // -117.1 deg for the remaining 482 s of the run, with the vehicle moving 52% of the
+    // time; rank 1 did the same thing at t=110.0 and ended at -54.6 deg. Both robots.
+    //
+    // Widening the turns cut the trigger down to a single sample but cannot remove this,
+    // because the far root is a legal state. The fix is to make it unreachable: a stiff
+    // one-sided torque that switches on past stop_angle and never lets the knuckle get
+    // near the singularity. Applied as a TORQUE, not a constraint, for the same reason
+    // BuilderRig's park anchor is a force -- it ramps, the solver sees an ordinary
+    // external load, and there is no discontinuity to tear the suspension apart.
+    if (!m_vehicle)
+        return;
+
+    // stop_angle has to clear the largest angle the steering can legitimately command
+    // and stay far below the far root. max_steering_angle_rad is 0.6 (34.4 deg), the
+    // largest steady value logged is 19.4 deg, and the far root is at 108 deg -- so
+    // 0.75 rad (43.0 deg) leaves 8.6 deg of headroom over full lock and 65 deg of
+    // no-man's-land below the root.
+    constexpr double stop_angle = 0.75;        // rad
+    constexpr double stop_k = 1.5e4;           // N.m/rad
+    constexpr double stop_c = 6.0e2;           // N.m.s/rad
+    constexpr double stop_torque_max = 8.0e3;  // N.m
+    // Past this, say so. A knuckle here is already through the singularity and the run
+    // is producing garbage; the previous run spent 8.4 h of wall time in that state
+    // because nothing was watching.
+    constexpr double alarm_angle = 1.20;       // rad, 68.8 deg
+
+    if (!m_steering_stops_ready) {
+        m_steering_stops_ready = true;
+        // The upright is not exposed by ChDoubleWishbone -- m_upright is protected and
+        // there is no accessor -- but the SPINDLE is, and Chrono names the two from the
+        // same stem. So take the spindle from the suspension, which is unambiguous, and
+        // derive its upright's name from the actual spindle name rather than assuming
+        // the "#2" suffix that duplicate names happen to get.
+        for (int axle = 0; axle < static_cast<int>(m_vehicle->GetNumberAxles()); ++axle) {
+            auto suspension = m_vehicle->GetSuspension(axle);
+            if (!suspension)
+                continue;
+            for (auto side : {chrono::vehicle::LEFT, chrono::vehicle::RIGHT}) {
+                auto spindle = suspension->GetSpindle(side);
+                if (!spindle)
+                    continue;
+                const std::string tag = "_spindle";
+                std::string name = spindle->GetName();
+                const auto at = name.find(tag);
+                if (at == std::string::npos)
+                    continue;
+                name.replace(at, tag.size(), "_upright");
+                // Nearest match, not first match. The name is NOT unique: every axle's
+                // upright is called "..._upright_L", and the "#2" that distinguishes them
+                // in a recording is invented by TrajectoryRecorder for its own manifest
+                // (see the `part += "#"` there), not carried on the body. Taking the first
+                // match therefore bound BOTH axles to the FRONT upright -- the rear went
+                // unguarded, and the front got two stops pulling on it. It showed up as two
+                // engagement lines at the same t and the same angle to six decimals, which
+                // no two independent knuckles would ever produce.
+                //
+                // The spindle of this axle is metres from any other axle's upright, so
+                // nearest-to-my-own-spindle is unambiguous and does not depend on the order
+                // bodies happen to sit in the system.
+                std::shared_ptr<chrono::ChBody> upright;
+                double best = std::numeric_limits<double>::max();
+                for (const auto& body : GetSystem()->GetBodies()) {
+                    if (body->GetName() != name)
+                        continue;
+                    const double d = (body->GetPos() - spindle->GetPos()).Length();
+                    if (d < best) {
+                        best = d;
+                        upright = body;
+                    }
+                }
+                if (!upright) {
+                    std::cout << "[RobotRig] no upright named '" << name
+                              << "'; no kingpin stop on that corner\n";
+                    continue;
+                }
+                SteeringStop stop;
+                stop.upright = upright;
+                // Rest orientation in the CHASSIS frame, so static toe and camber cancel
+                // and the measured angle is zero at the pose the vehicle was built in.
+                stop.rest = m_vehicle->GetChassisBody()->GetRot().GetConjugate() * upright->GetRot();
+                stop.accumulator = upright->AddAccumulator();
+                // Axle AND side. The front knuckle is steered and the rear is not, so
+                // "upright L" alone cannot say which of two different faults engaged.
+                stop.label = (axle == 0) ? ((side == chrono::vehicle::LEFT) ? "front-L" : "front-R")
+                                         : ((side == chrono::vehicle::LEFT) ? "rear-L" : "rear-R");
+                m_steering_stops.push_back(stop);
+            }
+        }
+        if (!m_steering_stops.empty())
+            m_steering_stop_reaction = m_vehicle->GetChassisBody()->AddAccumulator();
+        std::cout << "[RobotRig] kingpin stops on " << m_steering_stops.size()
+                  << " uprights at +/-" << stop_angle << " rad\n";
+    }
+
+    const auto chassis = m_vehicle->GetChassisBody();
+    const auto q_chassis = chassis->GetRot();
+    // The kingpin is 8.1 deg off vertical, so the chassis z axis is the axis to measure
+    // and push about: cos(8.1 deg) = 0.99 of the torque lands on the kingpin, and a
+    // barrier does not need better than that.
+    const auto axis_world = q_chassis.Rotate(chrono::ChVector3d(0.0, 0.0, 1.0));
+    // Summed here and applied once, because all four stops react against the same body.
+    double reaction = 0.0;
+
+    for (auto& stop : m_steering_stops) {
+        // Rotation of the upright away from its rest pose, expressed in the chassis
+        // frame. Taking the z component of the rotation VECTOR rather than a Cardan
+        // angle keeps it single-valued and continuous through the range that matters.
+        const auto q_rel = q_chassis.GetConjugate() * stop.upright->GetRot();
+        const auto q_delta = stop.rest.GetConjugate() * q_rel;
+        const double theta = q_delta.GetRotVec().z();
+        const double excess = std::abs(theta) - stop_angle;
+        if (excess <= 0.0) {
+            stop.upright->EmptyAccumulator(stop.accumulator);
+            continue;
+        }
+
+        const auto w_rel = q_chassis.RotateBack(stop.upright->GetAngVelParent() -
+                                               chassis->GetAngVelParent());
+        double torque = -(theta > 0.0 ? 1.0 : -1.0) * stop_k * excess - stop_c * w_rel.z();
+        torque = std::clamp(torque, -stop_torque_max, stop_torque_max);
+
+        stop.upright->EmptyAccumulator(stop.accumulator);
+        stop.upright->AccumulateTorque(stop.accumulator, torque * axis_world, false);
+        // The reaction belongs on the chassis. Without it the stop injects angular
+        // momentum into the vehicle every time it fires -- a torque out of nowhere,
+        // applied precisely when the vehicle is already mishandling.
+        reaction -= torque;
+
+        if (!stop.engaged && m_steering_stop_reports < 20) {
+            stop.engaged = true;
+            ++m_steering_stop_reports;
+            std::cout << "[RobotRig] kingpin stop engaged on upright " << stop.label
+                      << " at t=" << time << " angle=" << theta << " rad ("
+                      << theta * 180.0 / chrono::CH_PI << " deg)\n";
+        }
+        // Latched, like `engaged`. Unlatched, this is true on every step the knuckle
+        // stays out there, so it would spend the whole 20-message budget in 20 steps --
+        // 10 ms of sim -- and then go quiet for the rest of the run.
+        if (std::abs(theta) > alarm_angle && !stop.alarmed) {
+            stop.alarmed = true;
+            std::cout << "[RobotRig] !! upright " << stop.label << " is at " << theta
+                      << " rad (" << theta * 180.0 / chrono::CH_PI << " deg) at t=" << time
+                      << " -- past the kingpin singularity; this corner is broken\n";
+        }
+    }
+
+    if (!m_steering_stops.empty()) {
+        chassis->EmptyAccumulator(m_steering_stop_reaction);
+        if (reaction != 0.0)
+            chassis->AccumulateTorque(m_steering_stop_reaction, reaction * axis_world, false);
+    }
 }
 
 void RobotRig::CheckTrailerWheelAnomalies(double time, chrono::vehicle::ChTerrain& terrain) {

@@ -47,8 +47,19 @@ constexpr double lift_delay = 1.5;
 constexpr double place_tol = 0.15;
 constexpr double place_min_settle = 0.4;
 constexpr double place_timeout = 6.0;
+// How far the pads retreat off the rock before the weld is dropped -- see the OPENING
+// phase. Only the ~2 mm a side of commanded interpenetration has to be undone, so 15 mm is
+// a wide margin and costs 15/finger_slew_rate = 50 ms. The timeout is a backstop for a
+// finger that jams on geometry.
+constexpr double release_backoff = 0.015;
+constexpr double release_backoff_timeout = 0.5;
 constexpr double release_hold_time = 1.0;
 constexpr double stow_hold_time = 2.0;
+// The arm folds up IN PLACE before it swings away, and these bound that first stage: it is
+// finished when every joint but the base yaw is within retract_tol of its stow value, and
+// abandoned after retract_timeout so a stuck joint cannot strand the arm over the bed.
+constexpr double retract_tol = 0.05;
+constexpr double retract_timeout = 4.0;
 constexpr double total_timeout = 45.0;
 // Max rate any joint's COMMANDED angle may change, rad/s. The largest pose change
 // in the sequence is roughly pi rad (rest/stow to a grab pose), so ~2 s to cross it
@@ -89,6 +100,33 @@ constexpr double min_grab_reach_xy = 1.0;
 constexpr double max_grab_reach_xy = 2.6;
 constexpr double min_grab_local_z = -1.2;
 constexpr double joint_slew_rate = 1.5;
+// Max rate at which a joint's commanded RATE may change, rad/s^2.
+//
+// Bounding the commanded angle's rate was only half the job. A slew limiter alone still
+// steps the commanded VELOCITY from 0 to joint_slew_rate in the first step after a new
+// target arrives, and back to 0 in the step it arrives -- and these are constraint
+// motors, so the solver realises that step exactly. A velocity discontinuity is an
+// infinite acceleration, and the torque it takes is bounded only by the inertia behind
+// the joint.
+//
+// For joint 0 that inertia is the whole arm plus its rock swinging about a vertical
+// axis: ~52 kg of arm over a 2.7 m span plus a ~16 kg rock at ~2 m of reach is roughly
+// 140 kg m^2. Stepping it to 1.5 rad/s inside one 5e-4 s step is 3000 rad/s^2, i.e. of
+// order 4e5 N m, delivered as a single impulse and reacted straight through the
+// ChLinkLockLock welding the arm base to the chassis. The rover weighs 1068 kg with its
+// trailer and stands on lunar gravity, so the wheels can resist maybe 1e3 N m before
+// they slide. They slide: a fully braked rover was logged at 0.29 m/s
+// (cmd str/thr/brk = 0/0/1) with every other braked sample reading -0.01 to 0.00, and
+// its placed rocks landed 0.56 m and 0.34 m from target against 0.10-0.38 m for the
+// builder, which is the same arm on a vehicle 10.6x heavier.
+//
+// None of that torque is needed to MOVE the arm. A yaw axis carries no gravity moment,
+// so holding 1.5 rad/s costs nothing; the entire spike is the 0 -> 1.5 transition. At
+// 3.0 rad/s^2 the same joint needs ~420 N m, under the ~1e3 N m the wheels can hold,
+// and reaches full slew in 0.5 s. The largest pose change is ~pi rad, so a trapezoidal
+// profile crosses it in ~2.6 s against ~2.1 s before -- still well inside close_timeout
+// (8 s) and place_timeout (6 s).
+constexpr double joint_accel_rate = 3.0;
 // Same, for the finger prismatic motors, m/s. Opening used to be a single step
 // from finger_close_pos to 0 -- 0.145 m demanded in one 5e-4 s step, a commanded
 // 290 m/s -- fired at the instant the rock is released over the bed. Closing was
@@ -708,15 +746,119 @@ void LrvArm::Update(double time) {
             std::cout << "[LrvArm " + m_log_tag + "] PLACING->RELEASING t=" << time << " elapsed=" << elapsed
                       << " |gripper-place|=" << place_err << " gripper_speed=" << gripper_speed
                       << (elapsed > place_timeout ? " (timeout)" : "") << "\n";
-            OpenGripper();
+            // Start opening, rock still welded. See the OPENING phase for why the weld
+            // outlives the grip by 50 ms.
+            m_grip_close_pos = m_applied_close_pos;
+            m_close_pos = 0.0;
+            CommandFingerPosition(0.0);
+            m_phase = Phase::OPENING;
+            m_phase_time = time;
+        }
+        return;
+    }
+
+    // BACK THE PADS OFF THE ROCK, THEN LET GO. IN THAT ORDER, 50 ms APART.
+    //
+    // The rock is not held by friction, it is WELDED to the end effector, and TryLockRock
+    // turns its collision OFF at the same moment so it cannot fight the fingers or the
+    // terrain while it is carried. The fingers are ChLinkMotorLinearPosition -- position
+    // CONSTRAINTS with no force limit -- and the closure they are given at lock time is
+    // 0.5 * (finger_open_sep - actual_sep) + 0.002, deliberately 2 mm a side past the
+    // separation measured on contact. With the rock's collision off nothing stops them, so
+    // they close those 2 mm and the whole carry is spent with both pads inside the rock.
+    //
+    // Releasing straight out of that state -- RemoveRockLock(), which re-enables collision,
+    // in the same call that commands the fingers open -- hands the contact solver two
+    // bodies already overlapping and asks it to fix that in one step. It fixed it by firing
+    // the rock out of the jaws: a 16 kg rock left a settled, stationary gripper at
+    // +0.96 m/s VERTICALLY and reached 2.0 m/s sideways over the next 0.6 s, and cleared
+    // the trailer. Upward, from a standstill, is the tell -- nothing was above it.
+    //
+    // So the weld outlives the grip, but only just. The pads start opening while the rock
+    // is still welded, and the weld is dropped as soon as they have retreated
+    // release_backoff past the closure they gripped at -- 15 mm against ~2 mm of
+    // interpenetration, which at finger_slew_rate takes 50 ms. The rock is then let go with
+    // its collision restored and NO pad touching it, so it starts falling at once and
+    // nothing pushes it sideways. The pads keep opening away from it as it goes: 0.1 s
+    // later they have receded 30 mm a side while the rock has fallen 8 mm, so it drops
+    // between widening jaws and never scrapes them.
+    //
+    // Waiting for the jaws to reach FULL open before letting go also worked, and was what
+    // this did first -- but it holds the rock motionless in mid-air for 220 ms, which reads
+    // as the rock floating and then falling. 50 ms does not read as anything.
+    //
+    // Deferring the collision restore instead -- weld dropped, jaws held shut, collision
+    // off until the rock has fallen clear -- was rejected on the numbers. place_height is
+    // 0.5 m to the GRIPPER and the rock hangs 0.128 m below gripper centre, so it falls
+    // about 0.25 m to the bed, which at lunar gravity is 0.56 s. Clearing the pads takes
+    // ~0.43 s of that, leaving 0.13 s before touchdown for a rock whose size varies with
+    // which of the three meshes it got. Too thin: run out of margin and the rock lands with
+    // its collision still off and sinks through the bed.
+    if (m_phase == Phase::OPENING) {
+        const double backed_off = m_grip_close_pos - m_applied_close_pos;
+        if (backed_off >= release_backoff || time - m_phase_time > release_backoff_timeout) {
+            std::cout << "[LrvArm " + m_log_tag + "] OPENING->RELEASING t=" << time
+                      << " pad_backoff=" << backed_off << " (needs " << release_backoff << ")"
+                      << (backed_off >= release_backoff ? "" : " (timeout)") << "\n";
+            RemoveRockLock();
             m_phase = Phase::RELEASING;
             m_phase_time = time;
         }
         return;
     }
 
+    // STOW IN TWO STAGES: fold up first, swing second.
+    //
+    // A single CommandJointAngles(stow_theta) from the place pose is a straight line in
+    // JOINT space, and a straight line in joint space is a curved, DIPPING arc in Cartesian
+    // space. Measured off a recording, the gripper left the drop point at bed-frame
+    // (x=-0.056, z=+0.515), sagged to z=+0.226 while sweeping back to x=-0.402, and only
+    // then climbed -- which put it through the tailgate standing at (x=-0.515, z=+0.090).
+    // The gripper bounced off it, and the reaction threw the whole rover 74 mm into the air
+    // (chassis z 3.603 -> 3.677, peak 0.365 m/s) on a vehicle that was fully braked.
+    //
+    // Nothing about that is specific to where the rock was dropped. The old 4x4 place grid
+    // never released on the bed centreline, so the arc happened to miss the tailgate; aiming
+    // at the bed centre moved the arc onto it. The dipping stow was always a hazard, it just
+    // had not hit anything yet.
+    //
+    // ORDER MATTERS, and it is: elbow and wrist first, shoulder and yaw second.
+    //
+    // The shoulder is the joint the whole arm hangs off. Move it while the arm is still
+    // extended over the bed and the gripper swings on the full length of the forearm --
+    // 1.5 m of travel for a fraction of a radian at the shoulder -- which is the flick that
+    // catches the tailgate. Folding the elbow and wrist FIRST brings the gripper in toward
+    // the shoulder while the shoulder itself does not move, so the gripper leaves the bed
+    // on a short arc under its own joints. Only then, with the arm compact, do the shoulder
+    // and the base yaw run.
+    //
+    // Two orders were tried before this one and both failed the same way, by moving a joint
+    // that swings the gripper before the arm was folded:
+    //   * all of shoulder+elbow+wrist to stow at once, base yaw held. Folded and high is
+    //     where it ends up, but getting there pulls the gripper INBOARD 1.5 m and dips it
+    //     to z=+0.264 in the bed frame -- straight through the tailgate. Measured no better
+    //     than no fix at all: min gap 0.120 m against 0.121 m.
+    //   * shoulder alone to lift_theta2, the carry angle. The place pose reaches DOWN into
+    //     the bed, so its shoulder angle is past the carry angle and commanding the carry
+    //     angle lowers the shoulder rather than raising it.
     if (m_phase == Phase::RELEASING) {
         if (time - m_phase_time > release_hold_time) {
+            // ELBOW AND WRIST ONLY. The base yaw and the shoulder both hold exactly where
+            // the place pose left them.
+            CommandJointAngles({m_applied_theta[0], m_applied_theta[1],
+                                stow_theta[2], stow_theta[3]});
+            m_phase = Phase::RETRACTING;
+            m_phase_time = time;
+        }
+        return;
+    }
+
+    if (m_phase == Phase::RETRACTING) {
+        const bool folded = std::abs(m_applied_theta[2] - stow_theta[2]) < retract_tol
+                            && std::abs(m_applied_theta[3] - stow_theta[3]) < retract_tol;
+        if (folded || time - m_phase_time > retract_timeout) {
+            std::cout << "[LrvArm " + m_log_tag + "] RETRACTING->STOWING t=" << time
+                      << (folded ? "" : " (timeout)") << "\n";
             CommandJointAngles(stow_theta);
             m_phase = Phase::STOWING;
             m_phase_time = time;
@@ -730,8 +872,8 @@ void LrvArm::Update(double time) {
 }
 
 bool LrvArm::IsBusy() const {
-    return m_phase == Phase::APPROACH || m_phase == Phase::CLOSING || m_phase == Phase::LIFTING ||
-           m_phase == Phase::PLACING || m_phase == Phase::RELEASING || m_phase == Phase::STOWING;
+    return m_phase == Phase::APPROACH || m_phase == Phase::CLOSING || m_phase == Phase::LIFTING || m_phase == Phase::RETRACTING ||
+           m_phase == Phase::PLACING || m_phase == Phase::OPENING || m_phase == Phase::RELEASING || m_phase == Phase::STOWING;
 }
 
 ArmStatusSnapshot LrvArm::GetStatus() const {
@@ -745,7 +887,9 @@ const char* LrvArm::GetPhaseName() const {
         case Phase::CLOSING: return "CLOSING";
         case Phase::LIFTING: return "LIFTING";
         case Phase::PLACING: return "PLACING";
+        case Phase::OPENING: return "OPENING";
         case Phase::RELEASING: return "RELEASING";
+        case Phase::RETRACTING: return "RETRACTING";
         case Phase::STOWING: return "STOWING";
         case Phase::DONE: return "DONE";
         case Phase::FAILED: return "FAILED";
@@ -881,17 +1025,37 @@ void LrvArm::AdvanceJointCommands(double time) {
     if (dt <= 0.0)
         return;
 
-    const double max_step = joint_slew_rate * dt;
     for (int i = 0; i < 4; ++i) {
         const double diff = m_cmd_theta[i] - m_applied_theta[i];
-        const double step = std::clamp(diff, -max_step, max_step);
+
+        // Trapezoidal velocity profile: ramp up at joint_accel_rate, cruise at
+        // joint_slew_rate, ramp down so the joint ARRIVES at zero rate rather than
+        // stopping dead. sqrt(2*a*|diff|) is the fastest speed from which the joint can
+        // still brake to rest within the distance left, so taking the smaller of the two
+        // starts the deceleration at exactly the right moment and cannot overshoot.
+        const double brake_limited = std::sqrt(2.0 * joint_accel_rate * std::abs(diff));
+        const double rate_target = std::copysign(std::min(joint_slew_rate, brake_limited), diff);
+
+        const double max_rate_step = joint_accel_rate * dt;
+        const double rate_step = std::clamp(rate_target - m_applied_rate[i], -max_rate_step, max_rate_step);
+        m_applied_rate[i] += rate_step;
+
+        double step = m_applied_rate[i] * dt;
+        // Discretisation can still leave the last step longer than what remains. Land on
+        // the target and stop, rather than crossing it and oscillating about it.
+        if (std::abs(step) >= std::abs(diff)) {
+            step = diff;
+            m_applied_rate[i] = 0.0;
+        }
         m_applied_theta[i] += step;
-        // Hand the motor a consistent position AND velocity. ChFunctionConst
-        // always reports zero derivative, which is what makes even a small
-        // position increment inconsistent at the velocity level.
+
+        // Hand the motor a consistent position, velocity AND acceleration. ChFunctionConst
+        // always reports zero derivatives, which is what makes even a small position
+        // increment inconsistent at the velocity level; leaving the second derivative at
+        // zero left it inconsistent at the acceleration level for the same reason.
         m_joint_fn[i]->SetSetpointAndDerivatives(MotorAngleForJoint(i, m_applied_theta[i]),
-                                                 MotorRateForJoint(i, step / dt),
-                                                 0.0);
+                                                 MotorRateForJoint(i, m_applied_rate[i]),
+                                                 MotorRateForJoint(i, rate_step / dt));
     }
 
     const double finger_diff = m_cmd_close_pos - m_applied_close_pos;

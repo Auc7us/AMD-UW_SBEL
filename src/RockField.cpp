@@ -10,7 +10,7 @@
 #include "RobotLayout.h"
 
 #include "chrono/assets/ChVisualShapeTriangleMesh.h"
-#include "chrono/collision/ChCollisionShapeConvexHull.h"
+#include "chrono/collision/ChCollisionShapeTriangleMesh.h"
 #include "chrono/core/ChTypes.h"
 #include "chrono/physics/ChMassProperties.h"
 #include "chrono/utils/ChConstants.h"
@@ -26,6 +26,47 @@ void NormalizeRockMeshOnGround(std::shared_ptr<chrono::ChTriangleMeshConnected> 
     mesh->Transform(chrono::ChVector3d(-center_x, -center_y, -bbox.min.z()), chrono::ChMatrix33<>(1.0));
 }
 
+// rock2 is TALLER than the other two, and height is the dimension that strands vehicles.
+//
+// LoadRockMesh rotates every mesh by QuatFromAngleX(PI/2), so the OBJ's y-extent becomes
+// world height. Source bounding boxes, and the height each yields at the harvest scale
+// of 0.2:
+//
+//   rock1   1.219 x 0.647 x 1.217   ->  0.129 m tall   (reference)
+//   rock2   1.137 x 1.137 x 1.421   ->  0.227 m tall   1.76x rock1
+//   rock3   1.315 x 0.779 x 1.330   ->  0.156 m tall   1.21x rock1
+//
+// The failure this fixes is not a collision between machines. A rover drives ONTO rock2 --
+// round enough to climb, tall enough to lift a wheel pair -- and ends up sitting on it,
+// wedged underneath, in a pose that reads as a jackknife but is not one. It cost rank 10
+// of run_20260830_073816 the whole run, and it appeared in the earlier 1500 s run too. It
+// is specific to rock2: nothing else in the field is tall enough to do it.
+//
+// DO NOT SHRINK THIS FURTHER WITHOUT CHECKING WHEEL CONTACT FORCES. Full height parity
+// with rock1 is 0.569, and it was tried: run_20260830_220549 raised trailer wheel force
+// spikes from a mean of 2.2-2.5 kN, never once above 10 kN across 2600 s of earlier runs,
+// to a mean of 24.8 kN with 42% above 10 kN and a peak of 100 kN -- 900x the settled load
+// on a wheel whose rock had shrunk enough to wedge between tyre and regolith instead of
+// being shouldered aside. Rank 11 diverged out on the harvest lane at t=358.
+//
+// 0.85 is a compromise, not a derived optimum: enough to take the height from 0.227 m to
+// 0.193 m and stop the climb-and-strand, close enough to the proven-safe 1.0 to stay out
+// of the degenerate-contact regime. The leading indicator is the force spike statistic,
+// not the eventual divergence -- check mean and max spike magnitude early in a run.
+//
+// rock3 is deliberately left alone at 1.0: 1.21x is within the natural size spread the
+// field is supposed to have, and it has never stranded anything.
+//
+// This lives here rather than at the call sites because BOTH the visual mesh and the
+// collision hull pass through this one function, and rockN.obj / rockN_hull.obj carry
+// identical bounding boxes -- so it is the only place the two cannot silently drift
+// apart. The substring match covers both spellings.
+double RockVariantScale(const std::string& filename) {
+    if (filename.find("rock2") != std::string::npos)
+        return 0.85;  // 0.227 m -> 0.193 m tall. See the block comment before going lower.
+    return 1.0;
+}
+
 }  // namespace
 
 std::shared_ptr<chrono::ChTriangleMeshConnected> LoadRockMesh(const std::string& filename,
@@ -35,7 +76,8 @@ std::shared_ptr<chrono::ChTriangleMeshConnected> LoadRockMesh(const std::string&
     if (!mesh)
         throw std::runtime_error("Failed to load rock mesh: " + filename);
 
-    mesh->Transform(chrono::ChVector3d(0, 0, 0), chrono::ChMatrix33<>(mesh_scale));
+    mesh->Transform(chrono::ChVector3d(0, 0, 0),
+                    chrono::ChMatrix33<>(mesh_scale * RockVariantScale(filename)));
     mesh->Transform(chrono::ChVector3d(0, 0, 0), chrono::ChMatrix33<>(chrono::QuatFromAngleX(chrono::CH_PI_2)));
     mesh->RepairDuplicateVertices(1e-9);
     NormalizeRockMeshOnGround(mesh);
@@ -68,14 +110,26 @@ std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> AddRockFields(
     auto rock_vis_mat = CreateLunarHapkeMaterial();
     std::array<std::shared_ptr<chrono::ChTriangleMeshConnected>, 3> rock_visual_meshes;
     std::array<std::shared_ptr<chrono::ChTriangleMeshConnected>, 3> rock_collision_meshes;
-    std::array<std::shared_ptr<chrono::ChCollisionShapeConvexHull>, 3> rock_ct_shapes;
+    std::array<std::shared_ptr<chrono::ChCollisionShapeTriangleMesh>, 3> rock_ct_shapes;
     std::array<std::shared_ptr<chrono::ChVisualShapeTriangleMesh>, 3> rock_vis_shapes;
 
     for (size_t i = 0; i < rock_visual_obj_files.size(); i++) {
         rock_visual_meshes[i] = LoadRockMesh(rock_visual_obj_files[i], true, config.mesh_scale);
         rock_collision_meshes[i] = LoadRockMesh(rock_collision_obj_files[i], false, config.mesh_scale);
-        rock_ct_shapes[i] = chrono_types::make_shared<chrono::ChCollisionShapeConvexHull>(
-            rock_mat, rock_collision_meshes[i]->GetCoordsVertices());
+        // TRIANGLE MESH, not a convex hull built from the same file's vertices.
+        //
+        // rockN_hull.obj is already a convex hull, and the mesh is right here -- the old
+        // ChCollisionShapeConvexHull(mat, mesh->GetCoordsVertices()) call threw the index
+        // buffer away and had Bullet re-derive a polytope from the point cloud. That
+        // costs nothing in contact quality (is_convex below keeps Bullet on the convex
+        // algorithm) but it made the rocks invisible to SCM's GPU ray-cast backend, which
+        // tests shape type literally and skips everything that is not TRIANGLEMESH.
+        //
+        // is_static=false: rocks are picked up and dropped. is_convex=true: these files
+        // ARE hulls, so say so and keep the cheap, robust contact path.
+        rock_ct_shapes[i] = chrono_types::make_shared<chrono::ChCollisionShapeTriangleMesh>(
+            rock_mat, rock_collision_meshes[i], /*is_static=*/false, /*is_convex=*/true,
+            /*radius=*/0.005);
 
         rock_vis_shapes[i] = chrono_types::make_shared<chrono::ChVisualShapeTriangleMesh>();
         rock_vis_shapes[i]->SetMesh(rock_visual_meshes[i]);
@@ -94,11 +148,12 @@ std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> AddRockFields(
     const chrono::ChVector3d forward(std::cos(heading), std::sin(heading), 0.0);
     const chrono::ChVector3d left(-std::sin(heading), std::cos(heading), 0.0);
 
-    for (int i = 0; i < config.rocks_per_rank; i++) {
+    const int rocks_per_rank = RocksPerRank(robot_index, cycle);
+    for (int i = 0; i < rocks_per_rank; i++) {
         const double distance = config.first_distance + i * config.distance_step + distance_jitter(rng);
         const chrono::ChVector3d xy = origin + forward * distance + left * lateral_offset(rng);
         const double terrain_z = terrain.GetHeight(chrono::ChVector3d(xy.x(), xy.y(), height_probe_z));
-        const int shape_index = (robot_index * config.rocks_per_rank + i) % static_cast<int>(rock_visual_meshes.size());
+        const int shape_index = (robot_index * rocks_per_rank + i) % static_cast<int>(rock_visual_meshes.size());
 
         double mass;
         chrono::ChVector3d cog;
@@ -109,6 +164,11 @@ std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> AddRockFields(
         chrono::ChInertiaUtils::PrincipalInertia(inertia, principal_inertia, principal_inertia_rot);
 
         auto rock_body = chrono_types::make_shared<chrono::ChBodyAuxRef>();
+        // Named so the trajectory recorder can identify it from a plain system sweep --
+        // rock bodies are created here, spawned again on every harvest cycle, and never
+        // held in any list the recorder is handed.
+        rock_body->SetName("harvest_rock_r" + std::to_string(robot_index) + "_c" + std::to_string(cycle) + "_" +
+                           std::to_string(i));
         rock_body->SetFixed(false);
         rock_body->SetSleepingAllowed(true);
         rock_body->SetSleepTime(0.15f);
@@ -165,14 +225,18 @@ std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> AddBuilderPileRocks(
     auto rock_vis_mat = CreateLunarHapkeMaterial();
     std::array<std::shared_ptr<chrono::ChTriangleMeshConnected>, 3> visual_meshes;
     std::array<std::shared_ptr<chrono::ChTriangleMeshConnected>, 3> collision_meshes;
-    std::array<std::shared_ptr<chrono::ChCollisionShapeConvexHull>, 3> ct_shapes;
+    std::array<std::shared_ptr<chrono::ChCollisionShapeTriangleMesh>, 3> ct_shapes;
     std::array<std::shared_ptr<chrono::ChVisualShapeTriangleMesh>, 3> vis_shapes;
     double rock_radius = 0.0;
     for (size_t i = 0; i < rock_visual_obj_files.size(); i++) {
         visual_meshes[i] = LoadRockMesh(rock_visual_obj_files[i], true, config.mesh_scale);
         collision_meshes[i] = LoadRockMesh(rock_collision_obj_files[i], false, config.mesh_scale);
-        ct_shapes[i] = chrono_types::make_shared<chrono::ChCollisionShapeConvexHull>(
-            rock_mat, collision_meshes[i]->GetCoordsVertices());
+        // Triangle mesh, same reasoning as AddRockFields above: the hull OBJ is already
+        // convex, the mesh is already loaded, and only TRIANGLEMESH is visible to SCM's
+        // GPU ray-cast backend.
+        ct_shapes[i] = chrono_types::make_shared<chrono::ChCollisionShapeTriangleMesh>(
+            rock_mat, collision_meshes[i], /*is_static=*/false, /*is_convex=*/true,
+            /*radius=*/0.005);
         vis_shapes[i] = chrono_types::make_shared<chrono::ChVisualShapeTriangleMesh>();
         vis_shapes[i]->SetMesh(visual_meshes[i]);
         vis_shapes[i]->SetBackfaceCull(true);
@@ -213,6 +277,7 @@ std::vector<std::shared_ptr<chrono::ChBodyAuxRef>> AddBuilderPileRocks(
         chrono::ChInertiaUtils::PrincipalInertia(inertia, principal_inertia, principal_inertia_rot);
 
         auto rock_body = chrono_types::make_shared<chrono::ChBodyAuxRef>();
+        rock_body->SetName("seed_rock_b" + std::to_string(builder_index) + "_" + std::to_string(slot));
         // Fixed until the gripper locks on. See the header note.
         rock_body->SetFixed(true);
         rock_body->SetSleepingAllowed(false);

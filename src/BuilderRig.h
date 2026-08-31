@@ -92,6 +92,15 @@ class BuilderRig {
     // knows nothing about the collector, and this keeps it that way.
     void SetDeliveredRockSource(std::function<std::vector<std::shared_ptr<chrono::ChBodyAuxRef>>()> source);
 
+    // Points on the collector the arm must not swing into. Wired by main for the same
+    // reason as the rock source above: BuilderRig knows nothing about the rover, and this
+    // keeps it that way. Unset on a rank with no collector, which then gates on nothing.
+    void SetCollectorProbe(std::function<std::vector<chrono::ChVector3d>()> probe);
+
+    // True once the arm bridge has decided this hull cannot leave its station. Always
+    // false without ROS 2, where nothing drives the builder in the first place.
+    bool HullStuck() const;
+
     // Sim time before which Synchronize() holds full brake and DISCARDS ROS commands.
     // A single-pin track needs to reach equilibrium on the terrain before anything
     // drives it; station keeping starting mid-settle acts on a track that has not
@@ -145,6 +154,13 @@ class BuilderRig {
     // Diagnostic escape hatch (--no_build). The arm bridge only offers a pick while the
     // builder is parked, so with this off it drives its lane and never builds.
     bool m_hull_park_enabled = true;
+    // A station may only ever move FORWARD along the orbit. See SetStationAngle.
+    double m_last_station_angle = 0.0;
+    bool m_station_angle_seen = false;
+    int m_station_retreats = 0;
+    // Latched per EPISODE. SetStationAngle runs every step, so a retreat that persists is
+    // one event, not one per step. See the note where it is reported.
+    bool m_station_retreat_open = false;
 };
 
 }  // namespace amd_uw

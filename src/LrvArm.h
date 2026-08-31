@@ -100,7 +100,12 @@ class LrvArm {
     void ForgetTargetRock();
 
   private:
-    enum class Phase { IDLE, APPROACH, CLOSING, LIFTING, PLACING, RELEASING, STOWING, DONE, FAILED };
+    // RETRACTING sits between RELEASING and STOWING: it lifts the gripper straight out of
+    // the bed before the arm is allowed to swing away. See the note on the two-stage stow
+    // in LrvArm.cpp. Phase is internal only -- the state reported over ROS is the separate
+    // coarse m_status.state (0 idle / 1 busy / 2 done / 3 failed) -- so adding a value here
+    // cannot shift anything a controller compares against.
+    enum class Phase { IDLE, APPROACH, CLOSING, LIFTING, PLACING, OPENING, RELEASING, RETRACTING, STOWING, DONE, FAILED };
 
     void CommandJointAngles(const std::array<double, 4>& theta);
     void CommandFingerPosition(double close_pos);
@@ -147,11 +152,15 @@ class LrvArm {
     std::array<std::shared_ptr<chrono::ChFunctionSetpoint>, 4> m_joint_fn;
     std::array<double, 4> m_cmd_theta = {-chrono::CH_PI, 0.0, 0.0, 0.0};
     std::array<double, 4> m_applied_theta = {-chrono::CH_PI, 0.0, 0.0, 0.0};
+    // Current commanded joint RATE, carried across steps so it can be ramped rather than
+    // stepped. See joint_accel_rate in LrvArm.cpp.
+    std::array<double, 4> m_applied_rate = {0.0, 0.0, 0.0, 0.0};
     double m_last_cmd_time = -1.0;
 
     // Fingers get the same treatment. The motors are built at +/-0.15 m, so that is
     // where the applied value starts.
     std::array<std::shared_ptr<chrono::ChFunctionSetpoint>, 2> m_finger_fn;
+    double m_grip_close_pos = 0.0;  // closure the pads held the rock at, for the release back-off
     double m_cmd_close_pos = 0.15;
     double m_applied_close_pos = 0.15;
 

@@ -1,4 +1,7 @@
-// Minimal MPI SynChrono demo for the AMD-UW Polaris JSON vehicle.
+// MPI SynChrono lunar construction demo: one rank per site sector, each running a
+// Polaris-based collector that harvests rocks and a tracked builder that lays them
+// into a wall. Deliberately named for the task and not for the vehicle or the
+// terrain model, both of which have changed under it more than once.
 // Rank 0 is the global sensor/visualization rank. Robot physics starts on rank 1.
 
 #include <mpi.h>
@@ -7,6 +10,8 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <ctime>
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <random>
@@ -28,7 +33,12 @@
 #include "chrono/timestepper/ChTimestepper.h"
 
 #include "chrono_vehicle/ChVehicleDataPath.h"
-#include "chrono_vehicle/terrain/RigidTerrain.h"
+#include <unordered_set>
+
+#include "chrono_vehicle/terrain/SCMTerrain.h"
+#include "chrono_vehicle/tracked_vehicle/ChTrackAssembly.h"
+#include "chrono_vehicle/tracked_vehicle/ChTrackShoe.h"
+#include "chrono_vehicle/tracked_vehicle/ChTrackedVehicle.h"
 #include "chrono_vehicle/wheeled_vehicle/ChWheeledVehicleVisualSystemVSG.h"
 
 #include "chrono_sensor/ChSensorManager.h"
@@ -49,9 +59,12 @@
 #include "src/LrvArm.h"
 #include "src/MaterialUtils.h"
 #include "src/RockField.h"
+#include "src/ScmRecorder.h"
 #include "src/RobotLayout.h"
 #include "src/RobotRig.h"
 #include "src/SynAgents.h"
+#include "src/TrackSoilMesh.h"
+#include "src/TrajectoryRecorder.h"
 
 using namespace chrono;
 using namespace chrono::sensor;
@@ -75,15 +88,76 @@ double settle_time = 1.0;
 double motion_log_rate = 0.0;
 // Sim-time period of the rank-local performance probe (0 disables it).
 double perf_log_period = 0.0;
+// Pose-capture rate for --record_dir. 60 Hz because the output is meant to be re-rendered
+// as animation; anything below the target frame rate has to be interpolated, and rocks
+// tipping out of a bed do not interpolate well.
+double record_rate_hz = 60.0;
+// Deformed-ground capture rate. Far below record_rate_hz on purpose: the SCM file carries
+// only nodes whose height CHANGED since the previous sample, so a higher rate refines when
+// a rut appeared, never whether it appeared.
+double scm_record_rate_hz = 10.0;
+// How often the SCM file re-states every deformed node instead of only the changes. Needs
+// no flag in the format: heights are absolute and a consumer accumulates by overwrite, so
+// a full re-statement is idempotent with the diffs around it -- it just lets a consumer
+// seek, or survive a dropped frame, without replaying from t=0.
+//
+// THIS, NOT scm_record_rate_hz, IS WHAT THE FILE SIZE IS MADE OF. A keyframe re-states
+// every node touched since the run began, so each one is bigger than the last, and the
+// file grows with the SQUARE of run length. Measured on rank 12 of a 1500 s 15-robot run:
+// 300 keyframes carried 666.4 M of the 670.5 M node rows -- 99.4% -- while all 1200 delta
+// frames together came to 4.0 M rows, about 48 MB. The last keyframe alone was 50 MB.
+// Turning the sample rate down does nothing; it shrinks the 0.6%.
+//
+// At 5 s that projected to ~520 GiB site-wide for a 6000 s run, against 306 GB of disk.
+// 60 s keeps a recovery point every minute -- ample for a consumer that seeks or drops a
+// sample -- and costs a twelfth of the bytes. A consumer accumulating from t=0, which is
+// what the replay tools do, discards these rows as redundant anyway.
+const double scm_keyframe_period = 60.0;
 
 const double terrain_resolution_scale = 4.0;
 const double terrain_pixels_x = 256.0;
 const double terrain_pixels_y = 256.0;
-const std::string terrain_heightmap_file = "terrain/terrain2.bmp";
+// Graded work pad. terrain2.bmp puts the site rings on a 5% hillside -- the builder orbit
+// swung 3.96 m with a 17% peak along-path grade, more than the single-pin tracks want to
+// climb under load. tools/make_graded_pad.py blends r<=45 m toward a level plane (keeping
+// 15% of the local relief so it still reads as ground), cosine-tapers out to 130 m, and
+// leaves everything past that bit-identical. The orbit now swings 0.57 m at ~2%.
+//
+// 16-bit PNG, not BMP: SCMTerrain spreads gray over [min,max] using the image's full
+// range and Chrono's STB wrapper always loads 16-bit, so 8 bits would quantize this
+// 50 m range into 0.196 m steps -- invisible on a hillside, but it would terrace a flat
+// pad into 20 cm stairs. Set this back to "terrain/terrain2.bmp" for the ungraded site.
+const std::string terrain_heightmap_file = "terrain/terrain2_graded.png";
 const double terrain_height_offset = 0.0;
 const double terrain_min_height = -25.0;
 const double terrain_max_height = 25.0;
 const double terrain_height_probe_clearance = 10.0;
+
+// SCM grid spacing over the whole 1024 x 1024 m patch.
+//
+// Read the cost before changing it. SCM rounds the half-extent up, so 0.10 m is 5120
+// divisions each way: 10241 x 10241 = 104.9 M grid nodes, and SCMLoader stores their
+// undeformed heights in ONE DENSE double matrix -- 839 MB PER RANK, allocated whether
+// or not a node is ever touched. Halving delta quadruples that.
+//
+// The visualization mesh is the part that does not fit at this size: one vertex and two
+// faces per node, carrying position, normal, UV and colour per vertex plus vertex and
+// normal index triples per face, which is ~13.5 GB per rank on top of the heights. It is
+// therefore built only on ranks that actually render (see scm_visualization_mesh below);
+// a headless rank pays the 839 MB and nothing more.
+const double terrain_scm_delta_default = 0.10;
+
+// Bekker-Wong soil parameters for the lunar regolith analogue, carried over from the
+// earlier SCM branch. elastic_K must exceed Bekker_Kphi or SCM's yield test never
+// engages, so the two move together.
+const double scm_bekker_kphi = 2.8e6;     // frictional modulus [Pa/m^n]
+const double scm_bekker_kc = 14e3;        // cohesive modulus [Pa/m^(n-1)]
+const double scm_bekker_n = 1.0;          // sinkage exponent
+const double scm_mohr_cohesion = 1000.0;  // cohesion for shear failure [Pa]
+const double scm_mohr_friction = 35.0;    // friction angle for shear failure [deg]
+const double scm_janosi_shear = 0.02;     // Janosi-Hanamoto shear parameter [m]
+const double scm_elastic_k = 2e8;         // elastic stiffness [Pa/m]
+const double scm_damping_r = 3e4;         // vertical damping [Pa.s/m]
 // NOT const: --rock_first_distance / --rock_distance_step override the line geometry so
 // a harvest cycle can be exercised in a fraction of the sim time. Defaults are unchanged.
 RockFieldConfig rock_field_config;
@@ -136,8 +210,6 @@ const char* const builder_arm_shapes_dir = "m113_builder_arm/m113_builder_arm_sh
 const char* const rover_arm_shapes_dir = "lrv_robotarm/lrv_arm_shapes/";
 const double builder_arm_geometry_scale = 2.0;
 const double rover_arm_geometry_scale = 1.0;
-const double rock_line_extension_width = 16.0;
-const double rock_line_extension_end_margin = 8.0;
 
 ChVector3d track_point(0.0, 0.0, 1.0);
 
@@ -146,28 +218,6 @@ ChQuaternion<> SensorLookAtRotation(const ChVector3d& camera_pos, const ChVector
     ChMatrix33<> rot;
     rot.SetFromAxisX(forward, VECT_Y);
     return rot.GetQuaternion();
-}
-
-double RockLineEndDistance(const RockFieldConfig& config) {
-    return config.first_distance +
-           (config.rocks_per_rank - 1) * config.distance_step;
-}
-
-double DistanceToTerrainEdge(const ChVector3d& origin,
-                             const ChVector3d& forward,
-                             double half_length,
-                             double half_width) {
-    double distance = std::numeric_limits<double>::infinity();
-    if (forward.x() > 0)
-        distance = std::min(distance, (half_length - origin.x()) / forward.x());
-    else if (forward.x() < 0)
-        distance = std::min(distance, (-half_length - origin.x()) / forward.x());
-
-    if (forward.y() > 0)
-        distance = std::min(distance, (half_width - origin.y()) / forward.y());
-    else if (forward.y() < 0)
-        distance = std::min(distance, (-half_width - origin.y()) / forward.y());
-    return distance;
 }
 
 // Seat the builder on a FITTED TERRAIN PLANE rather than a single height probe.
@@ -183,6 +233,10 @@ double DistanceToTerrainEdge(const ChVector3d& origin,
 // Fitting a plane and matching pitch and roll to it cuts the worst-case seating error to
 // 0.019-0.077 m -- 6x to 20x better -- at every radius, which is the point: this is a fix
 // for the seating, not for one lucky lane radius.
+//
+// Those figures are for the ungraded map. On terrain2_graded.png the pad holds the lane to
+// 1.1 deg of tilt and 0.102 m of level-hull error, so the fit is mostly insurance now -- it
+// earns its keep again the moment the heightmap constant points back at terrain2.bmp.
 struct BuilderSeating {
     ChCoordsys<> pose;
     double level_error;  // worst seating error the old single-probe placement would give
@@ -191,7 +245,7 @@ struct BuilderSeating {
     double lift;
 };
 
-BuilderSeating SeatBuilderOnTerrainPlane(RigidTerrain& terrain,
+BuilderSeating SeatBuilderOnTerrainPlane(ChTerrain& terrain,
                                          double center_x,
                                          double center_y,
                                          double yaw,
@@ -279,7 +333,7 @@ BuilderSeating SeatBuilderOnTerrainPlane(RigidTerrain& terrain,
 }
 
 void AddOrbitVisualRing(ChSystem* system,
-                        RigidTerrain& terrain,
+                        ChTerrain& terrain,
                         double center_x,
                         double center_y,
                         double radius,
@@ -323,7 +377,7 @@ void AddOrbitVisualRing(ChSystem* system,
 
 // A 10 x 10 m pad at the site centre, as four 5 x 5 m tiles. Visual only: fixed,
 // collision-free, terrain untouched -- a marker, not a surface to drive on.
-void AddCenterPad(ChSystem* system, RigidTerrain& terrain, double height_probe_z) {
+void AddCenterPad(ChSystem* system, ChTerrain& terrain, double height_probe_z) {
     constexpr double tile = 5.0;         // one tile edge; four of them make 10 x 10
     constexpr double pad_thickness = 0.06;
     constexpr double surface_offset = 0.06;
@@ -385,7 +439,7 @@ void AddCenterPad(ChSystem* system, RigidTerrain& terrain, double height_probe_z
 // see all of them. Placement is seeded per rank rather than randomly, so a robot rank's
 // VSG and the global camera put the same rock in the same place.
 void AddSpawnRockClumps(ChSystem* system,
-                        RigidTerrain& terrain,
+                        ChTerrain& terrain,
                         const std::string& chrono_data_path,
                         int num_robots,
                         double height_probe_z) {
@@ -559,7 +613,7 @@ void AddSpawnRockClumps(ChSystem* system,
 //
 // Visual only, on the same fixed collision-free body rationale as the clumps.
 void AddPlacedWallRocks(ChSystem* system,
-                        RigidTerrain& terrain,
+                        ChTerrain& terrain,
                         const std::string& chrono_data_path,
                         int num_robots,
                         double height_probe_z) {
@@ -625,46 +679,12 @@ void AddPlacedWallRocks(ChSystem* system,
              << " m).\n";
 }
 
-// The final rocks and builder centers lie beyond the finite terrain2 heightmap.
-// Continue each line with a narrow, flat rigid strip whose elevation matches the
-// heightmap immediately inside its edge. The mapped surface itself is untouched.
-void AddRockLineTerrainExtensions(RigidTerrain& terrain,
-                                  const std::shared_ptr<ChContactMaterial>& material,
-                                  int num_robots,
-                                  double height_probe_z,
-                                  double terrain_length,
-                                  double terrain_width,
-                                  const RockFieldConfig& config) {
-    const double rock_line_end_distance = RockLineEndDistance(config);
-    for (int robot_index = 0; robot_index < num_robots; ++robot_index) {
-        const ChVector3d origin = InitialGroundPositionForRobot(robot_index, num_robots);
-        const ChVector3d forward = RockLineForwardForRobot(robot_index, num_robots);
-        const double edge_distance =
-            DistanceToTerrainEdge(origin, forward, 0.5 * terrain_length, 0.5 * terrain_width);
-        if (!std::isfinite(edge_distance) ||
-            rock_line_end_distance <= edge_distance)
-            continue;
-
-        const double strip_start = edge_distance - 1.0;
-        const double strip_end =
-            rock_line_end_distance + rock_line_extension_end_margin;
-        const double strip_length = strip_end - strip_start;
-        const double strip_center_distance = 0.5 * (strip_start + strip_end);
-        const ChVector3d strip_center = origin + forward * strip_center_distance;
-        const ChVector3d edge_probe = origin + forward * (edge_distance - 2.0);
-        const double strip_height =
-            terrain.GetHeight(ChVector3d(edge_probe.x(), edge_probe.y(), height_probe_z));
-        const double heading = InitialHeadingRadForRobot(robot_index, num_robots);
-
-        auto extension = terrain.AddPatch(
-            material,
-            ChCoordsys<>(ChVector3d(strip_center.x(), strip_center.y(), strip_height), QuatFromAngleZ(heading)),
-            strip_length, rock_line_extension_width);
-        extension->SetColor(ChColor(0.55f, 0.55f, 0.52f));
-        terrain.BindPatch(extension);
-        ApplyMaterialToVisualShapes(extension->GetGroundBody(), CreateLunarHapkeMaterial());
-    }
-}
+// No rigid extension strips here, unlike the RigidTerrain build this replaced.
+// SCM's patch extends to infinity in the x-y plane -- outside the initialized area a
+// node takes the height of the nearest initialized one -- so the rock lines run off the
+// heightmap onto flat ground of the right elevation with nothing to stitch. At the
+// current 1024 m patch it was a no-op anyway: the furthest rock on a six-rock line sits
+// ~207 m from the centre, well inside the 512 m half-extent.
 
 // Rank-local performance probe.
 //
@@ -709,6 +729,140 @@ struct PerfAccum {
         sys_update += sys->GetTimerUpdate();
     }
 };
+
+// ONE SCM active domain for a tracked vehicle's running gear, sized from where the shoes
+// actually are instead of from a box drawn round the whole hull.
+//
+// This replaces a hand-set 7.5 x 4.5 x 3.0 m box centred at x = -2.2. That box had the right
+// idea: a domain only selects which grid nodes fire rays, and the rays then hit whatever shape
+// is above them, so ONE box covering the footprint serves all ~130 shoes for a single ray-OBB
+// test instead of 130 separate domains. What it got wrong was its size. 33.75 m^2 is more than
+// twice the running gear's envelope, and at 0.02 m spacing every surplus square metre is 2500
+// grid nodes ray-cast on all 2000 steps of every simulated second, for the whole run. Measured
+// at 0.1 m spacing: 4049 nodes per step with the hull box, against 1478 with this one.
+//
+// WHY ONE ENVELOPE BOX AND NOT TWO NARROW ONES PER TRACK. Two boxes hugging the tracks are
+// cheaper still -- 1267 nodes per step, a 3.2x cut rather than 2.3x -- and they were tried. They
+// also uncover the soil BETWEEN the tracks, and that turns out to matter: rays from those nodes
+// were reaching the hull underside and returning reaction to the chassis. Removing them
+// destabilised the single-pin track, reproducing the exact failure this project already has on
+// record in RobotLayout.h -- an idler carrier rotating about the vertical, which its prismatic
+// joint forbids. It killed rank 2 at t=18.43 and t=22.57 in two 45 s A/B runs whose only
+// difference from a clean legacy run was this box. So the belly stays covered. The saving comes
+// from the 19 m^2 of bare ground OUTBOARD of the tracks, which nothing ever touches: the
+// vehicle's widest shape measures 2.686 m against the old box's 4.5 m.
+//
+// Sized from the shoe bodies rather than from constants so it cannot drift from whatever track
+// assembly is fitted. Shoe positions trace the whole loop -- bottom run, sprocket, idler, top
+// run -- so their x extent is the true ground contact span and their y extent is the two track
+// centre lines; scm_track_domain_margin covers half a shoe's width on top of that, and the
+// y span between the centre lines carries the belly for free. Attitude is not a concern:
+// UpdateActiveDomain projects the eight corners of the ROTATED OOBB and takes their axis-aligned
+// hull, so pitch and roll can only ever widen the covered region, never narrow it.
+//
+// Returns the number of domains registered (1, or 0 if the vehicle has no track shoes).
+int AddTrackActiveDomains(SCMTerrain& terrain, ChTrackedVehicle* vehicle, int rank) {
+    if (!vehicle)
+        return 0;
+    const ChFrame<>& chassis_ref = vehicle->GetChassisBody()->GetFrameRefToAbs();
+    ChVector3d lo(std::numeric_limits<double>::max());
+    ChVector3d hi(std::numeric_limits<double>::lowest());
+    size_t n_shoes = 0;
+    for (int side = 0; side < 2; ++side) {
+        auto track = vehicle->GetTrackAssembly(static_cast<VehicleSide>(side));
+        if (!track)
+            continue;
+        for (size_t i = 0; i < track->GetNumTrackShoes(); ++i) {
+            // Shoe frame expressed in the chassis reference frame -- the frame AddActiveDomain
+            // measures its OOBB centre in.
+            const ChVector3d p =
+                chassis_ref.TransformPointParentToLocal(track->GetTrackShoe(i)->GetShoeBody()->GetPos());
+            for (int k = 0; k < 3; ++k) {
+                lo[k] = std::min(lo[k], p[k]);
+                hi[k] = std::max(hi[k], p[k]);
+            }
+            ++n_shoes;
+        }
+    }
+    if (n_shoes == 0)
+        return 0;
+
+    const double m = scm_track_domain_margin;
+    const ChVector3d center(0.5 * (lo.x() + hi.x()), 0.5 * (lo.y() + hi.y()), 0.5 * (lo.z() + hi.z()));
+    const ChVector3d dims((hi.x() - lo.x()) + 2 * m,                      //
+                          (hi.y() - lo.y()) + 2 * m,                      //
+                          (hi.z() - lo.z()) + 2 * scm_track_domain_z_pad  //
+    );
+    terrain.AddActiveDomain(vehicle->GetChassisBody(), center, dims);
+    SynLog() << "Rank " << rank << " SCM running-gear domain from " << n_shoes << " shoes: " << dims.x() << " x "
+             << dims.y() << " m at (" << center.x() << ", " << center.y() << "), "
+             << static_cast<long>(dims.x() * dims.y() / (0.02 * 0.02)) << " nodes at 2 cm (hull box was 84375)\n";
+    return 1;
+}
+
+// Keep one invariant: a rock carries an SCM active domain IFF it can still move.
+//
+// WHY THIS EXISTS. A domain's job is to make SCM compute soil where a body can move through it.
+// A rock that has been laid in the wall, or frozen at a drop point as feedstock, is
+// SetFixed(true) -- it cannot move, so it needs no soil reaction. Its domain nonetheless keeps
+// selecting every grid node under it for a height lookup on every step for the rest of the run.
+// A construction run only ever lays more wall, so that cost accumulates monotonically, which is
+// exactly the shape of growth this is here to remove. Frozen rocks are dead weight in the
+// per-step budget and nothing else.
+//
+// It caught more than it was written for: the builder's six seed-pile rocks are SetFixed(true)
+// from the moment they are placed, so their six domains were surplus from t=0 in every run this
+// project has ever done. They now come off at t=0.
+//
+// WHY RECONCILE RATHER THAN HOOK SetFixed. A rock's fixed/dynamic state is flipped from five
+// places across four files -- the collector's dump and its settle-and-freeze (RobotRig), the
+// gripper's pick and its place (LrvArm), and the wall bridge (BuilderArmRosBridge) -- each
+// inside its own state machine. Hooking all five means the invariant holds only while all five
+// stay hooked, and the failure mode is silent and severe: a rock that goes dynamic without a
+// domain gets no soil support and falls through the terrain. Stating the invariant once and
+// re-asserting it every step cannot drift, and it self-heals if a new path appears.
+//
+// A rock is assumed to already hold a domain the first time it is seen, because every creation
+// path registers one (RobotRig::InitializeOnTerrain, RobotRig::AddCycleRocks, and the seed pile
+// in main). So this only ever acts on transitions, never on the initial state.
+struct ScmRockDomains {
+    std::unordered_set<const ChBody*> seen;   // rocks this has looked at at least once
+    std::unordered_set<const ChBody*> holds;  // rocks believed to hold a domain right now
+    long added = 0;
+    long removed = 0;
+};
+
+void ReconcileRockDomains(SCMTerrain& terrain,
+                          const std::vector<std::shared_ptr<ChBodyAuxRef>>& rocks,
+                          ScmRockDomains& state,
+                          double time,
+                          int rank) {
+    for (const auto& rock : rocks) {
+        if (!rock)
+            continue;
+        const ChBody* key = rock.get();
+        if (state.seen.insert(key).second)
+            state.holds.insert(key);  // registered by whichever path created it
+        const bool wants = !rock->IsFixed();
+        const bool has = state.holds.count(key) > 0;
+        if (wants == has)
+            continue;
+        if (wants) {
+            terrain.AddActiveDomain(rock, scm_rock_domain_center, scm_rock_domain_dims);
+            state.holds.insert(key);
+            ++state.added;
+        } else {
+            terrain.RemoveActiveDomain(rock);
+            state.holds.erase(key);
+            ++state.removed;
+        }
+        // Rare -- a rock changes state a handful of times per harvest cycle -- and worth having in
+        // the log, because a domain count that does not fall as the wall goes up is the symptom
+        // this is here to prevent.
+        SynLog() << "Rank " << rank << " SCM rock domain " << (wants ? "added" : "removed") << " at t=" << time
+                 << " (" << rock->GetName() << "); " << terrain.GetNumActiveDomains() << " domains now.\n";
+    }
+}
 
 // Wall-clock stopwatch that adds its own lifetime to an accumulator field.
 class ScopedTimer {
@@ -789,6 +943,32 @@ void AddCommandLineOptions(ChCLI& cli) {
     cli.AddOption<bool>("Diagnostics", "no_build",
                         "Builder drives its lane but never picks or places (cost/divergence "
                         "bisection)");
+    // SCM's HIP ray-cast backend.
+    //
+    // It is not a free speedup, it is a DIFFERENT SET OF BODIES. When it succeeds it
+    // replaces the CPU ray-cast loop for that whole step (SCMTerrain.cpp ~1446), and it
+    // only ever intersects ChCollisionShape::TRIANGLEMESH. Everything that has to feel
+    // soil now carries one: the lugged tyres (Polaris_LuggedTire.json), the rocks
+    // (RockField.cpp), and the track shoes' soil-facing pads (TrackSoilMesh.cpp).
+    //
+    // The M113 CHASSIS is still a convex hull, deliberately: the hull only reaches soil
+    // if the vehicle has bellied out, which is its own bug. Under this flag such a
+    // belly-out would sink rather than be supported.
+    cli.AddOption<bool>("Simulation", "scm_raycast_gpu",
+                        "Use SCM's HIP GPU ray-cast backend (needs triangle-mesh collision "
+                        "geometry on every body that must feel soil; the M113 chassis hull is "
+                        "excluded, so a bellied-out hull would sink)");
+    // SCM's contact-force GPU backend is enabled by default in Chrono but only fires on a step
+    // whose hit count reaches scm_gpu::Config::min_hits (8192). Our footprints are far smaller
+    // than that at delta=0.10, so the path never runs. Expose the threshold so a run can measure
+    // whether the GPU wins at our hit counts instead of assuming Chrono's default applies here.
+    cli.AddOption<double>("Simulation", "scm_delta",
+                          "SCM grid spacing in m. Cost of the ray-cast term grows as 1/delta^2 and "
+                          "the height matrix as (patch/delta)^2, so this is the single knob that "
+                          "decides whether a run fits", std::to_string(terrain_scm_delta_default));
+    cli.AddOption<int>("Simulation", "scm_gpu_min_hits",
+                       "Hit-count threshold above which SCM's contact-force GPU backend runs "
+                       "(Chrono default 8192; lower it to let smaller footprints qualify)", "8192");
     cli.AddOption<std::string>("Diagnostics", "solver", "Robot-rank solver: bb, apgd, or default", "bb");
     cli.AddOption<int>("Diagnostics", "solver_iterations", "Max solver iterations for the robot ranks", "100");
     cli.AddOption<std::vector<int>>("VSG", "vsg", "MPI ranks that should open VSG visualization", "-1");
@@ -810,6 +990,34 @@ void AddCommandLineOptions(ChCLI& cli) {
                           "Metres from the drop point to the first rock (default 20)", "20.0");
     cli.AddOption<double>("Diagnostics", "rock_distance_step",
                           "Metres between successive rocks on a rank's line (default 30)", "30.0");
+    cli.AddOption<int>("Diagnostics", "rocks_per_rank",
+                       "Pin every rank's rock line to this many rocks (0 = the default per-rank 2-6)", "0");
+    // GLOBAL rock size. Multiplies every harvest and wall rock; the per-variant
+    // normalisation in RockField.cpp is applied on top and only equalises the three OBJs
+    // against each other. Exposed because rock size against the vehicles' 0.41 m wheel
+    // clearance is the parameter most worth sweeping after a jackknife, and rebuilding
+    // to try 0.18 is a poor way to spend twenty minutes. It was already written into the
+    // recording metadata; only the flag was missing.
+    cli.AddOption<double>("Diagnostics", "rock_mesh_scale",
+                          "Scale applied to every rock mesh (default 0.2)", "0.2");
+
+    // Absolute-pose capture for offline re-rendering. ON BY DEFAULT: a run nobody can
+    // re-render afterwards is a run that has to be repeated, and at this terrain size a
+    // repeat is expensive. Opt OUT with --no_record.
+    cli.AddOption<std::string>("Recording", "record_dir",
+                               "Write every moving body's world pose to this directory "
+                               "(default: <record_root>/run_<timestamp>)", "");
+    cli.AddOption<std::string>("Recording", "record_root",
+                               "Parent directory for timestamp-named runs, used when --record_dir is not given",
+                               "recordings");
+    cli.AddOption<bool>("Recording", "no_record", "Disable pose recording (recording is on by default)");
+    // Deformed ground, alongside the poses. 10 Hz because soil deformation is a slowly
+    // growing footprint, not a fast signal -- and because the file is a diff, so the rate
+    // buys resolution in TIME, not in coverage. 0 disables it.
+    cli.AddOption<double>("Recording", "scm_record_rate",
+                          "SCM deformation capture rate in Hz (0 disables it)",
+                          std::to_string(scm_record_rate_hz));
+    cli.AddOption<double>("Recording", "record_rate", "Pose capture rate in Hz", std::to_string(record_rate_hz));
 }
 
 }  // namespace
@@ -839,10 +1047,48 @@ int main(int argc, char* argv[]) {
     const bool no_build = cli.CheckOption("no_build");
     const bool no_sensor = cli.CheckOption("no_sensor");
     const std::string sensor_frame_dir = cli.GetAsType<std::string>("sensor_frame_dir");
+    const bool scm_raycast_gpu = cli.CheckOption("scm_raycast_gpu");
+    const int scm_gpu_min_hits = cli.GetAsType<int>("scm_gpu_min_hits");
+    const double terrain_scm_delta = cli.GetAsType<double>("scm_delta");
     const std::string solver_name = cli.GetAsType<std::string>("solver");
     const int solver_iterations = cli.GetAsType<int>("solver_iterations");
     rock_field_config.first_distance = cli.GetAsType<double>("rock_first_distance");
     rock_field_config.distance_step = cli.GetAsType<double>("rock_distance_step");
+    // Before the wall-rock meshes are built at wall_rock_scale, which reads this.
+    rock_field_config.mesh_scale = cli.GetAsType<double>("rock_mesh_scale");
+    // Before ANY layout query: RocksPerRank feeds the harvest lane angle, the drop slot
+    // and the zombie pool size, so an override applied later would leave the geometry
+    // already computed from the un-overridden count.
+    SetRocksPerRankOverride(cli.GetAsType<int>("rocks_per_rank"));
+    std::string record_dir = cli.GetAsType<std::string>("record_dir");
+    const std::string record_root = cli.GetAsType<std::string>("record_root");
+    const bool no_record = cli.CheckOption("no_record");
+    record_rate_hz = cli.GetAsType<double>("record_rate");
+    scm_record_rate_hz = cli.GetAsType<double>("scm_record_rate");
+    if (no_record) {
+        record_dir.clear();
+    } else if (record_dir.empty()) {
+        // Rank 0 stamps the run name and BROADCASTS it. Every rank calling localtime()
+        // for itself would scatter one run across as many directories as there are ranks
+        // the moment the clock ticks over a second mid-startup -- and startup here is
+        // seconds of heightmap resampling, so it would tick.
+        char run_dir[1024] = {0};
+        if (rank == 0) {
+            const std::time_t now = std::time(nullptr);
+            std::tm local{};
+            localtime_r(&now, &local);
+            char stamp[32] = {0};
+            std::strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", &local);
+            std::string joined = record_root;
+            if (!joined.empty() && joined.back() != '/')
+                joined += '/';
+            joined += "run_";
+            joined += stamp;
+            std::snprintf(run_dir, sizeof(run_dir), "%s", joined.c_str());
+        }
+        MPI_Bcast(run_dir, static_cast<int>(sizeof(run_dir)), MPI_CHAR, 0, MPI_COMM_WORLD);
+        record_dir = run_dir;
+    }
     syn_manager.SetHeartbeat(heartbeat);
 
     // Use AMD-UW data as the Chrono data root and its vehicle subfolder for vehicle JSON assets.
@@ -863,10 +1109,31 @@ int main(int argc, char* argv[]) {
     if (rank == 0) {
         SynLog() << "Chrono version: " << CHRONO_VERSION << "\n";
         SynLog() << "MPI ranks: " << num_ranks << "\n";
+        if (record_dir.empty()) {
+            SynLog() << "Recording: OFF (--no_record).\n";
+        } else {
+            std::error_code ec;
+            const auto abs_dir = std::filesystem::absolute(record_dir, ec);
+            SynLog() << "Recording: " << (ec ? record_dir : abs_dir.string()) << " at " << record_rate_hz
+                     << " Hz.\n";
+        }
         SynLog() << "Site centre=(" << site_center_x << ", " << site_center_y << "); work circle="
                  << work_circle_radius << " m; builder orbit=" << builder_path_radius
                  << " m; collector ring=" << robot_start_radius << " m.\n";
-        SynLog() << "Vehicle data: " << GetVehicleDataPath() << "\n\n";
+        SynLog() << "Vehicle data: " << GetVehicleDataPath() << "\n";
+        // Printed once, from the one function every rank derives it from, because a
+        // per-rank rock count is the sort of thing that is only ever wrong by disagreeing
+        // between two processes -- and this is where that disagreement would be visible.
+        std::ostringstream counts;
+        int total_rocks = 0;
+        for (int i = 0; i < std::max(0, num_ranks - 1); ++i) {
+            const int n = RocksPerRank(i, 0);
+            total_rocks += n;
+            counts << (i ? ", " : "") << "r" << (i + 1) << "=" << n;
+        }
+        SynLog() << "Rocks per rank, CYCLE 0 (" << min_rocks_per_rank << "-" << max_rocks_per_rank
+                 << ", redrawn every cycle, seed 0x" << std::hex << harvest_rock_count_seed << std::dec
+                 << "): " << counts.str() << " -- " << total_rocks << " on cycle 0 across the site.\n\n";
     }
 
     const double terrain_length = terrain_pixels_x * terrain_resolution_scale;
@@ -878,6 +1145,13 @@ int main(int argc, char* argv[]) {
     const bool draws_zombies = is_sensor_rank && !no_sensor;
     const bool owns_robot = (rank > 0);
     const int num_robot_ranks = std::max(0, num_ranks - 1);
+    // Does anything on this rank put pixels on a screen or in a file: its own VSG window,
+    // or rank 0's OptiX camera. The SCM visualization mesh is built only if so -- at
+    // terrain_scm_delta over the full patch it is ~13.5 GB of vertex and index arrays that
+    // a headless rank would allocate, fill, and never look at. Physics is unaffected: SCM
+    // computes soil forces from the height matrix and the active domains, not from the mesh.
+    const bool scm_visualization_mesh =
+        draws_zombies || (owns_robot && cli.HasValueInVector<int>("vsg", rank));
 
     ChSystemSMC sensor_system;
     sensor_system.SetCollisionSystemType(ChCollisionSystem::Type::BULLET);
@@ -901,42 +1175,165 @@ int main(int argc, char* argv[]) {
     const double lunar_gravity = 1.62;
     system->SetGravitationalAcceleration(ChVector3d(0.0, 0.0, -lunar_gravity));
 
-    // Apollo-site rigid height-map terrain, matching the setup from commit 29723a3.
-    RigidTerrain terrain(system);
-    auto ground_mat = MakeContactMaterial(contact_method, 0.9f, 0.0f);
-    const ChCoordsys<> terrain_csys(ChVector3d(0.0, 0.0, terrain_height_offset), QUNIT);
-    auto ground = terrain.AddPatch(ground_mat, terrain_csys, amd_uw_data_path + terrain_heightmap_file,
-                                   terrain_length, terrain_width, terrain_min_height, terrain_max_height);
-    ground->SetColor(ChColor(0.55f, 0.55f, 0.52f));
-    terrain.Initialize();
-    ApplyMaterialToVisualShapes(ground->GetGroundBody(), CreateLunarHapkeMaterial());
+    // Apollo-site DEFORMABLE height-map terrain: the same 1024 x 1024 m graded heightmap
+    // the rigid build used, now carried by SCM's Bekker-Wong soil model at
+    // terrain_scm_delta grid spacing.
+    //
+    // The SCM reference frame defaults to the global ISO frame, which is what
+    // terrain_height_offset == 0 asks for; RigidTerrain took that offset as a patch
+    // coordsys, SCM would take it via SetReferenceFrame. Left implicit while the offset
+    // is zero rather than writing an identity transform.
+    // Built ONLY on a rank that reads it. A robot rank ray-casts its wheels, shoes and rocks
+    // against the grid; rank 0 needs it when its camera has to draw ground. A rank 0 running
+    // --no_sensor does neither: it renders nothing and owns no vehicle, so every one of the
+    // (2*nx+1)^2 nodes it allocates is written once by Initialize and never read again.
+    // That copy is the single largest allocation on the rank -- 0.39 GiB at 0.1 m spacing,
+    // 9.95 GiB at 0.02 m -- and dropping it is what decides how many ranks fit in RAM,
+    // because every rank builds its own full-patch copy.
+    const bool needs_terrain = owns_robot || draws_zombies;
+    std::unique_ptr<SCMTerrain> terrain;
+    if (needs_terrain)
+        terrain = std::make_unique<SCMTerrain>(system, scm_visualization_mesh);
+    if (needs_terrain) {
+    terrain->SetSoilParameters(scm_bekker_kphi, scm_bekker_kc, scm_bekker_n, scm_mohr_cohesion, scm_mohr_friction,
+                             scm_janosi_shear, scm_elastic_k, scm_damping_r);
+    terrain->Initialize(amd_uw_data_path + terrain_heightmap_file, terrain_length, terrain_width, terrain_min_height,
+                       terrain_max_height, terrain_scm_delta);
+    }
+    if (scm_visualization_mesh) {
+        // Ground that looks like ground, as the rigid patch did. GetMesh() is the one
+        // visual shape SCM owns, so the Hapke material goes straight on it -- there is no
+        // ground body to walk the way RigidTerrain::GetGroundBody gave. SCM also defaults
+        // its mesh to wireframe, which is a debugging look, not a lunar one.
+        //
+        // Deliberately NO SetPlotType: a plot type makes SCM false-colour the mesh per
+        // vertex, which would override this. For soil debugging rather than rendering, add
+        //   terrain.SetPlotType(SCMTerrain::PLOT_SINKAGE, 0.0, 0.10);
+        // before Initialize() and drop the material below.
+        terrain->SetColor(ChColor(0.55f, 0.55f, 0.52f));
+        if (auto mesh = terrain->GetMesh()) {
+            mesh->SetWireframe(false);
+            mesh->AddMaterial(CreateLunarHapkeMaterial());
+        }
+    }
+#ifdef CHRONO_HAS_SCM_GPU
+    // Chrono defaults this ON; we gate it on the flag so a run states which ray-cast path
+    // it used instead of inheriting one. See --scm_raycast_gpu.
+    if (needs_terrain) {
+        terrain->EnableRaycastGpuHip(scm_raycast_gpu);
+        // Config::enabled already defaults to true; min_hits is what actually gates the path.
+        scm_gpu::Config gpu_cfg = terrain->GetScmGpuConfig();
+        gpu_cfg.min_hits = static_cast<std::size_t>(std::max(1, scm_gpu_min_hits));
+        terrain->SetScmGpuConfig(gpu_cfg);
+    }
+#endif
+    if (rank == 0) {
+        SynLog() << "SCM terrain: " << terrain_length << " x " << terrain_width << " m at "
+                 << terrain_scm_delta << " m grid (" << terrain_heightmap_file << "), visualization mesh "
+                 << (scm_visualization_mesh ? "ON" : "OFF") << ".\n";
+        if (!needs_terrain)
+            SynLog() << "SCM terrain: NOT built on rank 0 (headless: --no_sensor). Robot ranks are "
+                        "unaffected; this rank steps no soil.\n";
+#ifdef CHRONO_HAS_SCM_GPU
+        SynLog() << "SCM ray-cast: HIP GPU backend " << (scm_raycast_gpu ? "ENABLED" : "disabled")
+                 << " (--scm_raycast_gpu).\n";
+        SynLog() << "SCM contact force: GPU backend fires above " << scm_gpu_min_hits
+                 << " hits/step (--scm_gpu_min_hits).\n";
+#else
+        SynLog() << "SCM ray-cast: CPU only (this Chrono has no SCM GPU backend).\n";
+#endif
+    }
 
-    // Bind the rigid patch now so the pre-step height probes used to place the
-    // vehicle, trailer, and rocks hit the actual terrain surface.
+    // Bind collision shapes now. SCMTerrain::GetHeight reads the height matrix directly so
+    // the placement probes below do not need it, but SCM ray-casts from its grid nodes
+    // against Bullet every step, and the wheels, shoes and rocks created after this line
+    // are bound by BindAll calls of their own (RobotRig, BuilderRig).
     system->GetCollisionSystem()->BindAll();
 
-    // Probe from above the tallest possible terrain so the downward ray cast hits.
+    // Probe height for the placement helpers. SCM reads its grid rather than casting a
+    // ray, so the z of the query point is ignored -- kept because every helper below,
+    // and RobotRig/RockField, take it as an argument.
     const double height_probe_z = terrain_height_offset + terrain_max_height + terrain_height_probe_clearance;
-    AddOrbitVisualRing(system, terrain, site_center_x, site_center_y, work_circle_radius, height_probe_z,
+    // All of these are fixed, collision-free markers seated by probing terrain heights, so
+    // they exist only to be looked at. A rank with no terrain has neither the probe nor a
+    // viewer; skipping them costs it nothing and keeps every remaining terrain use guarded.
+    if (needs_terrain) {
+    AddOrbitVisualRing(system, *terrain, site_center_x, site_center_y, work_circle_radius, height_probe_z,
                        ChColor(0.95f, 0.75f, 0.10f), "work_circle");
-    AddOrbitVisualRing(system, terrain, site_center_x, site_center_y, builder_path_radius, height_probe_z,
+    AddOrbitVisualRing(system, *terrain, site_center_x, site_center_y, builder_path_radius, height_probe_z,
                        ChColor(0.10f, 0.65f, 0.95f), "builder_path");
-    AddOrbitVisualRing(system, terrain, site_center_x, site_center_y, robot_start_radius, height_probe_z,
+    AddOrbitVisualRing(system, *terrain, site_center_x, site_center_y, robot_start_radius, height_probe_z,
                        ChColor(0.20f, 0.90f, 0.35f), "collector_ring");
-    AddCenterPad(system, terrain, height_probe_z);
+    AddCenterPad(system, *terrain, height_probe_z);
     // AddSpawnRockClumps is deliberately NOT called. It puts ~90 decorative rocks per rank
     // in the builder's working area, and now that the builder works from a single seed heap
     // and then from whatever its collector actually delivers, that dressing reads as
     // feedstock the builder is ignoring. The function is kept -- it is the site-dressing
     // pass to re-enable for a wide establishing shot, where nothing is being picked up.
-    AddPlacedWallRocks(system, terrain, chrono_data_path, num_robot_ranks, height_probe_z);
-    AddRockLineTerrainExtensions(terrain, ground_mat, num_robot_ranks, height_probe_z, terrain_length, terrain_width,
-                                 rock_field_config);
+    AddPlacedWallRocks(system, *terrain, chrono_data_path, num_robot_ranks, height_probe_z);
+    }
+
+    // SCM must own at least one active domain on EVERY rank that steps the system, and
+    // rank 0 steps it (see the sim loop's else branch) while owning no robot to hang a
+    // domain off. Chrono's fallback does not cover this: SCMLoader::SetupInitial(), which
+    // installs the default whole-system domain, is only reached from Initialize() when a
+    // visualization mesh was requested -- so on a headless rank the domain list stays
+    // empty and ComputeInternalForces() indexes m_active_domains[0] behind a
+    // release-disabled assert.
+    //
+    // Rank 0 holds zombies: kinematic copies driven by SynChrono messages, not bodies
+    // with soil under them. So the honest domain here is a degenerate one -- a 1 cm box
+    // on a marker body at the site centre, one ray cast per step -- which says "this
+    // rank's regolith is scenery" rather than paying for soil nobody integrates.
+    if (!owns_robot && needs_terrain) {
+        auto scm_marker = chrono_types::make_shared<ChBody>();
+        scm_marker->SetName("scm_inert_domain_marker");
+        scm_marker->SetFixed(true);
+        scm_marker->EnableCollision(false);
+        scm_marker->SetPos(ChVector3d(site_center_x, site_center_y, height_probe_z));
+        system->AddBody(scm_marker);
+        terrain->AddActiveDomain(scm_marker, VNULL, ChVector3d(0.01, 0.01, 0.01));
+    }
+
     auto rock_mat = MakeContactMaterial(contact_method, 0.9f, 0.0f);
     VsgAppWrapper app;
 
+    // Pose capture, on the physics ranks only. Rank 0 holds zombies -- copies driven by
+    // messages at the SynChrono heartbeat, not simulated bodies -- so recording there
+    // would resample the same data at a coarser rate and with a rank of latency.
+    //
+    // Constructed HERE, and told to exclude what already exists, because everything
+    // built up to this line is scenery that never moves: the terrain patches, the three
+    // orbit rings, the centre pad, the decorative laid rocks. They get described once
+    // and are then out of the per-frame sweep. Everything created after this line --
+    // rover, trailer, arms, rocks, builder, track shoes -- is recorded.
+    std::unique_ptr<TrajectoryRecorder> recorder;
+    if (owns_robot && !record_dir.empty()) {
+        recorder = std::make_unique<TrajectoryRecorder>(record_dir, rank, record_rate_hz, step_size,
+                                                        /*write_static=*/rank == 1);
+        recorder->ExcludeExisting(system);
+    }
+
+    // Deformed ground. Poses alone cannot be rendered honestly here: the wheels ride in
+    // ruts they cut themselves, so a renderer drawing terrain2_graded.png as given floats
+    // every machine over its own tracks.
+    //
+    // The grid geometry is RE-DERIVED with SCMLoader::Initialize's own formulas rather
+    // than read back off the terrain, because m_delta / m_nx / m_ny are private to
+    // SCMLoader and SCMTerrain is its only friend. Exact for this patch: ceil(512/0.1) is
+    // 5120 with no remainder, so scm_delta_actual comes back as terrain_scm_delta.
+    std::unique_ptr<ScmRecorder> scm_recorder;
+    const int scm_nx = static_cast<int>(std::ceil((terrain_length / 2) / terrain_scm_delta));
+    const int scm_ny = static_cast<int>(std::ceil((terrain_width / 2) / terrain_scm_delta));
+    const double scm_delta_actual = terrain_length / (2.0 * scm_nx);
+    if (owns_robot && !record_dir.empty() && scm_record_rate_hz > 0.0) {
+        scm_recorder = std::make_unique<ScmRecorder>(record_dir, rank, scm_record_rate_hz,
+                                                     scm_keyframe_period, terrain.get(), scm_delta_actual,
+                                                     scm_nx, scm_ny);
+    }
+
     if (owns_robot) {
-        robot->InitializeOnTerrain(terrain, rock_mat, chrono_data_path, amd_uw_data_path, height_probe_z,
+        robot->InitializeOnTerrain(*terrain, rock_mat, chrono_data_path, amd_uw_data_path, height_probe_z,
                                    vehicle_start_clearance, seat_clearance, settle_time, step_size, rock_field_config);
     }
 
@@ -994,7 +1391,7 @@ int main(int argc, char* argv[]) {
         const double builder_heading =
             BuilderOrbitHeadingRad(builder_index, num_robot_ranks);
         const BuilderSeating seating =
-            SeatBuilderOnTerrainPlane(terrain, builder_ground.x(), builder_ground.y(), builder_heading,
+            SeatBuilderOnTerrainPlane(*terrain, builder_ground.x(), builder_ground.y(), builder_heading,
                                       builder_ride_height, height_probe_z);
         SynLog() << "Rank " << rank << " builder seating: terrain tilt " << seating.tilt_deg
                  << " deg, worst error level=" << seating.level_error << " m -> plane="
@@ -1007,7 +1404,7 @@ int main(int argc, char* argv[]) {
         BuilderRig::Options plan_options = builder_options;
         const int wall_slot_count = BuilderWallSlotCount(num_robot_ranks);
         builder_pile_rocks =
-            AddBuilderPileRocks(system, terrain, rock_mat, chrono_data_path, amd_uw_data_path, builder_index,
+            AddBuilderPileRocks(system, *terrain, rock_mat, chrono_data_path, amd_uw_data_path, builder_index,
                                 num_robot_ranks, builder_seed_rock_count, height_probe_z, rock_field_config);
         plan_options.seed_rocks = builder_pile_rocks;
         for (int slot = 0; slot < wall_slot_count; ++slot) {
@@ -1015,13 +1412,14 @@ int main(int argc, char* argv[]) {
             // Release height above the terrain at that slot: the rock is let go from rest
             // and drops the last little bit, so it seats itself instead of being pressed
             // into the regolith by the fingers.
-            p.z() = terrain.GetHeight(ChVector3d(p.x(), p.y(), height_probe_z)) + 0.20;
+            p.z() = terrain->GetHeight(ChVector3d(p.x(), p.y(), height_probe_z)) + 0.20;
             plan_options.wall_slots.push_back(p);
         }
         SynLog() << "Rank " << rank << " build plan: " << wall_slot_count << " wall slots at "
                  << wall_slot_pitch_m << " m pitch, " << builder_pile_rocks.size()
-                 << " seed rocks in 1 heap, then " << harvest_rocks_per_load
-                 << " per collector load every " << harvest_rocks_per_load << " slots; "
+                 << " seed rocks in 1 heap, then " << RocksPerRank(builder_index, 0)
+                 << " on the first collector load (" << min_rocks_per_rank << "-" << max_rocks_per_rank
+                 << ", redrawn each cycle), one slot per rock delivered; "
                  << wall_slot_count * wall_slot_pitch_rad * builder_path_radius << " m of lane to walk.\n";
 
         // Reach audit, at t=0, against the NOMINAL arm base for each slot. Every target in
@@ -1060,14 +1458,17 @@ int main(int argc, char* argv[]) {
                 }
             }
             // Each load lands at HarvestDropSlot(c) and is eaten over the next
-            // harvest_rocks_per_load slots, so check both ends of that run.
-            for (int cycle = 0; HarvestDropSlot(cycle) < wall_slot_count; ++cycle) {
+            // RocksPerRank(c) slots, so check both ends of that run. The draw is per
+            // cycle now, so it has to be read inside the loop -- auditing one cycle's
+            // count against every cycle's drop point measures a run that never happens.
+            for (int cycle = 0; HarvestDropSlot(builder_index, cycle) < wall_slot_count; ++cycle) {
+                const int rocks_per_load = RocksPerRank(builder_index, cycle);
                 // HarvestDropPoint, not InitialGroundPositionForRobot: the audit has to
                 // measure where the ROCKS land, and the latter is where the tractor parks
                 // -- 2.4 m of arc further on, so the rig's pour lip lands here.
                 const ChVector3d drop = HarvestDropPoint(builder_index, num_robot_ranks, cycle);
-                for (int k = 0; k < harvest_rocks_per_load; ++k) {
-                    const double d = (drop - arm_base_at_slot(HarvestDropSlot(cycle) + k)).Length();
+                for (int k = 0; k < rocks_per_load; ++k) {
+                    const double d = (drop - arm_base_at_slot(HarvestDropSlot(builder_index, cycle) + k)).Length();
                     drop_min = std::min(drop_min, d);
                     drop_max = std::max(drop_max, d);
                 }
@@ -1090,6 +1491,31 @@ int main(int argc, char* argv[]) {
         builder = std::make_unique<BuilderRig>(builder_index + 1, system, amd_uw_data_path, seating.pose,
                                                plan_options);
         builder_spawn_pos = builder->GetPosition();
+
+        // SCM active domains for the builder and its feedstock. RobotRig::InitializeOnTerrain
+        // registers the collector's wheels and its own rock field; neither the builder nor
+        // the seed heap existed at that point, and a body outside every active domain gets
+        // no soil reaction at all -- it sinks through the terrain during settle.
+        //
+        // ONE domain on the hull rather than ~130 on the shoes: the domain only selects
+        // which grid nodes cast rays, and those rays hit whatever collision shape is above
+        // them, so a box covering the whole footprint covers every shoe in it for one
+        // ray-OBB test instead of 130. The hull footprint is not centred on the chassis
+        // reference (Chassis.obj spans x in [-4.903, 0.498]), hence the offset centre; the
+        // box is generous in x and y so the tracks stay inside it through a pitch or roll.
+        // Give the track shoes triangle-mesh soil contact BEFORE any domain is registered,
+        // so a --scm_raycast_gpu run has mesh geometry to intersect under the tracks. Only
+        // the soil-facing boxes change; the top pad and guide horn the track bears against
+        // internally stay boxes. See src/TrackSoilMesh.h.
+        MeshifyTrackShoeSoilContact(builder->GetVehicle(), system);
+
+        {
+            const int n_track_domains = AddTrackActiveDomains(*terrain, builder->GetVehicle(), rank);
+            for (const auto& rock : builder_pile_rocks)
+                terrain->AddActiveDomain(rock, scm_rock_domain_center, scm_rock_domain_dims);
+            SynLog() << "Rank " << rank << " SCM active domains: " << n_track_domains << " builder track + "
+                     << builder_pile_rocks.size() << " seed rocks.\n";
+        }
         // Nothing may command this builder until its track has found equilibrium on the
         // terrain. The rover gets a careful settle and re-seat (RobotRig::Settle); the
         // builder never had one.
@@ -1103,6 +1529,17 @@ int main(int argc, char* argv[]) {
         if (robot) {
             RobotRig* rig = robot.get();
             builder->SetDeliveredRockSource([rig]() { return rig->GetDeliveredRocks(); });
+            // Where the arm must not swing: the rover's own chassis and its trailer bed.
+            // Both, not just the chassis -- the bed is the part that ends up under the
+            // arm during a pour, and it is the one that got hit.
+            builder->SetCollectorProbe([rig]() {
+                std::vector<ChVector3d> pts;
+                if (auto* veh = rig->GetVehicle())
+                    pts.push_back(veh->GetChassisBody()->GetPos());
+                if (auto bed = rig->GetTrailerBed())
+                    pts.push_back(bed->GetPos());
+                return pts;
+            });
         }
     }
 
@@ -1236,6 +1673,64 @@ int main(int argc, char* argv[]) {
               << (system->GetBodies().size() - bodies_before_zombies) << " zombie bodies = "
               << system->GetBodies().size() << " total\n";
 
+    // Name the machines for the recording. Everything else it finds -- the rocks, and
+    // anything a Chrono model adds that these getters do not reach -- falls back to its
+    // own Chrono name, which is why the rock bodies are named where they are created.
+    if (recorder) {
+        recorder->AddMeta("robot_index", std::to_string(robot->GetRobotIndex()));
+        recorder->AddMeta("num_robot_ranks", std::to_string(num_robot_ranks));
+        recorder->AddMeta("rocks_per_rank", std::to_string(RocksPerRank(robot->GetRobotIndex(), 0)));
+        recorder->AddMeta("rocks_per_rank_max", std::to_string(MaxRocksPerCycle()));
+        recorder->AddMeta("rocks_per_rank_seed", std::to_string(harvest_rock_count_seed));
+        recorder->AddMeta("seed_rocks", std::to_string(builder_pile_rocks.size()));
+        recorder->AddMeta("wall_slots", std::to_string(BuilderWallSlotCount(num_robot_ranks)));
+        recorder->AddMeta("step_size", std::to_string(step_size));
+        // The rock meshes are scaled and re-based at load, so the OBJ named in the
+        // manifest is NOT what was drawn. Each shape carries its drawn bounding box;
+        // this is the factor that produced it.
+        recorder->AddMeta("rock_mesh_scale", std::to_string(rock_field_config.mesh_scale));
+        recorder->AddMeta("gravity_z", std::to_string(-lunar_gravity));
+        recorder->AddMeta("site", "{\"center\":[0,0],\"work_circle\":" + std::to_string(work_circle_radius) +
+                                      ",\"builder_orbit\":" + std::to_string(builder_path_radius) +
+                                      ",\"collector_ring\":" + std::to_string(robot_start_radius) + "}");
+        // "model" matters to a consumer: an SCM surface DEFORMS, so a renderer that draws
+        // the heightmap as given will show wheels floating over ruts they cut themselves.
+        recorder->AddMeta("terrain", "{\"model\":\"scm\",\"heightmap\":\"" + terrain_heightmap_file +
+                                         "\",\"length\":" + std::to_string(terrain_length) + ",\"width\":" +
+                                         std::to_string(terrain_width) + ",\"min_height\":" +
+                                         std::to_string(terrain_min_height) + ",\"max_height\":" +
+                                         std::to_string(terrain_max_height) + ",\"scm_delta\":" +
+                                         std::to_string(terrain_scm_delta) + "}");
+        // Soil model and grid, so the recording is interpretable and reproducible from
+        // itself rather than from whatever main.cpp happened to hold at the time.
+        recorder->AddMeta("scm", "{\"delta\":" + std::to_string(scm_delta_actual) + ",\"nx\":" +
+                                     std::to_string(scm_nx) + ",\"ny\":" + std::to_string(scm_ny) +
+                                     ",\"extent_x\":" + std::to_string(terrain_length) + ",\"extent_y\":" +
+                                     std::to_string(terrain_width) +
+                                     ",\"soil\":{\"Bekker_Kphi\":" + std::to_string(scm_bekker_kphi) +
+                                     ",\"Bekker_Kc\":" + std::to_string(scm_bekker_kc) + ",\"Bekker_n\":" +
+                                     std::to_string(scm_bekker_n) + ",\"Mohr_cohesion\":" +
+                                     std::to_string(scm_mohr_cohesion) + ",\"Mohr_friction_deg\":" +
+                                     std::to_string(scm_mohr_friction) + ",\"Janosi_shear\":" +
+                                     std::to_string(scm_janosi_shear) + ",\"elastic_K\":" +
+                                     std::to_string(scm_elastic_k) + ",\"damping_R\":" +
+                                     std::to_string(scm_damping_r) + "}" +
+                                     ",\"deformation_file\":\"rank_" + std::to_string(rank) +
+                                     "_scm.bin\",\"deformation_rate_hz\":" +
+                                     std::to_string(scm_record_rate_hz) + "}");
+
+        recorder->LabelVehicle(robot->GetVehicle(), "collector");
+        recorder->LabelTrailer(robot->GetTrailer().get(), "collector_trailer");
+        recorder->Label(robot->GetTrailerBed(), "collector_trailer", "dump_bed");
+        recorder->Label(robot->GetTrailerTailgate(), "collector_trailer", "tailgate");
+        recorder->LabelArm(robot->GetArm(), "collector_arm");
+        if (builder) {
+            recorder->LabelTrackedVehicle(builder->GetVehicle(), "builder");
+            recorder->LabelArm(builder->GetArm(), "builder_arm");
+        }
+        recorder->Start(system);
+    }
+
     std::shared_ptr<ChSensorManager> sensor_manager;
     if (is_sensor_rank && !no_sensor) {
         sensor_manager = chrono_types::make_shared<ChSensorManager>(system);
@@ -1274,7 +1769,7 @@ int main(int argc, char* argv[]) {
     if (owns_robot && cli.HasValueInVector<int>("vsg", rank)) {
         SetChronoDataPath(amd_uw_data_path);
         auto vsg_app = chrono_types::make_shared<ChWheeledVehicleVisualSystemVSG>();
-        vsg_app->SetWindowTitle("AMD-UW SynChrono Polaris Apollo Terrain Demo");
+        vsg_app->SetWindowTitle("AMD-UW SynChrono Lunar Construction Demo");
         vsg_app->SetWindowSize(1280, 800);
         vsg_app->SetWindowPosition(100, 100);
         vsg_app->SetChaseCamera(track_point, 8.0, 0.75);
@@ -1286,7 +1781,7 @@ int main(int argc, char* argv[]) {
         vsg_app->EnableShadows();
         vsg_app->AttachVehicle(robot->GetVehicle());
         vsg_app->AttachDriver(robot->GetDriver());
-        vsg_app->AttachTerrain(&terrain);
+        vsg_app->AttachTerrain(terrain.get());
         // The builder is already in this system, so it renders with no extra
         // attachment and the rover chase camera keeps its original target.
         vsg_app->Initialize();
@@ -1306,6 +1801,7 @@ int main(int argc, char* argv[]) {
         return std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - wall_start).count();
     };
     PerfAccum perf_accum;
+    ScmRockDomains rock_domain_state;
     double perf_window_start_wall = 0.0;
     double perf_window_start_sim = 0.0;
     double next_perf_log = perf_log_period;
@@ -1315,6 +1811,13 @@ int main(int argc, char* argv[]) {
         const double time = system->GetChTime();
         if (time >= end_time)
             break;
+
+        // Before anything in this iteration touches the state: the pose written under
+        // stamp t is the state AT t, not the state after the step that starts at t.
+        if (recorder)
+            recorder->CaptureIfDue(system, time);
+        if (scm_recorder)
+            scm_recorder->CaptureIfDue(time);
 
         if (owns_robot && step_number % render_steps == 0) {
             ScopedTimer timer(perf_accum.render);
@@ -1329,7 +1832,7 @@ int main(int argc, char* argv[]) {
         if (owns_robot) {
             {
                 ScopedTimer timer(perf_accum.robot_sync);
-                robot->Synchronize(time, terrain);
+                robot->Synchronize(time, *terrain);
             }
             {
                 ScopedTimer timer(perf_accum.bldr_sync);
@@ -1383,11 +1886,15 @@ int main(int argc, char* argv[]) {
                 }
             }
             const DriverInputs driver_inputs = robot->GetDriverInputs();
+            // Before the terrain is advanced, so a rock that just went dynamic has soil under it
+            // on the very step it starts to move.
+            ReconcileRockDomains(*terrain, robot->GetRocks(), rock_domain_state, time, rank);
+            ReconcileRockDomains(*terrain, builder_pile_rocks, rock_domain_state, time, rank);
             {
                 ScopedTimer timer(perf_accum.robot_sync);
-                terrain.Synchronize(time);
+                terrain->Synchronize(time);
                 app.Synchronize(time, driver_inputs);
-                terrain.Advance(step_size);
+                terrain->Advance(step_size);
             }
             // Every Synchronize is done; now advance subsystems, then step the one
             // shared system exactly once. The builder advances first because
@@ -1402,7 +1909,7 @@ int main(int argc, char* argv[]) {
                 robot->Advance(step_size);
                 app.Advance(step_size);
             }
-            robot->LogMotionIfNeeded(step_number, motion_log_steps, terrain);
+            robot->LogMotionIfNeeded(step_number, motion_log_steps, *terrain);
 
             // A rank whose physics has gone non-finite is not going to recover, and
             // every rank is in MPI lockstep, so letting it run wastes the whole job:
@@ -1418,10 +1925,26 @@ int main(int argc, char* argv[]) {
                 std::cout.flush();
                 MPI_Abort(MPI_COMM_WORLD, 1);
             }
+
+            // A builder that cannot physically leave its station is a failed run, for the
+            // same reason a divergence is: nothing downstream gets better by continuing,
+            // and every other rank is spending wall clock in lockstep with it. Distinct
+            // from a builder SKIPPING slots, which is healthy and expected -- see the
+            // block comment on hull_stuck_timeout in BuilderArmRosBridge.cpp. The bridge
+            // has already printed which slot and for how long.
+            if (builder && builder->HullStuck()) {
+                std::cout << "[main] rank " << rank << " builder cannot leave its station at t="
+                          << time << "; aborting the job. See the [chrono_builder_*_arm] HULL "
+                             "STUCK report above.\n";
+                std::cout.flush();
+                MPI_Abort(MPI_COMM_WORLD, 1);
+            }
         } else {
             ScopedTimer timer(perf_accum.robot_adv);
-            terrain.Synchronize(time);
-            terrain.Advance(step_size);
+            if (terrain) {
+                terrain->Synchronize(time);
+                terrain->Advance(step_size);
+            }
             system->DoStepDynamics(step_size);
         }
 
@@ -1457,6 +1980,22 @@ int main(int argc, char* argv[]) {
                  << " bsync=" << (perf_accum.bldr_sync * n) << " radv=" << (perf_accum.robot_adv * n)
                  << " badv=" << (perf_accum.bldr_adv * n) << " sensor=" << (perf_accum.sensor * n)
                  << " render=" << (perf_accum.render * n) << "\n";
+            // SCM's own counters, because this is where a 2 cm run's time actually goes and
+            // neither number is visible in the section breakdown above. `nodes` is the count of
+            // grid nodes that fired a ray on the last step -- the sum over every active domain of
+            // its projected footprint, so it jumps whenever a domain is added and never falls on
+            // its own. `deformed` is the sparse node map's size, which only grows. `rc` is SCM's
+            // own ray-cast timer for the last step, in ms.
+            //
+            // The pathology to watch for is rc climbing while nodes holds steady: that is not more
+            // work, it is the SAME work getting slower because `deformed` has outgrown the cache
+            // and every one of those `nodes` height lookups turned into a DRAM round trip.
+            if (terrain) {
+                perf << "       scm   nodes=" << terrain->GetNumRayCasts() << " hits=" << terrain->GetNumRayHits()
+                     << " deformed=" << terrain->GetNumDeformedNodes() << " domains=" << terrain->GetNumActiveDomains()
+                     << " rc_ms=" << terrain->GetTimerRayCasting()
+                     << " ad_ms=" << terrain->GetTimerActiveDomains() << "\n";
+            }
             perf << "       chtim step=" << (perf_accum.sys_step * n) << " coll=" << (perf_accum.sys_coll * n)
                  << " [broad=" << (perf_accum.sys_broad * n) << " narrow=" << (perf_accum.sys_narrow * n)
                  << "] setup=" << (perf_accum.sys_setup * n) << " solve=" << (perf_accum.sys_solve * n)
@@ -1499,6 +2038,19 @@ int main(int argc, char* argv[]) {
         }
         step_number++;
     }
+
+    // What actually ran. SCM's HIP backend declines per step -- silently, by design --
+    // whenever the candidate bodies carry no triangle-mesh collision geometry, so the
+    // only honest way to know whether the GPU did any of the ray-casting is this counter.
+    // A run that asked for the GPU and reports 0 steps did every ray cast on the CPU.
+#ifdef CHRONO_HAS_SCM_GPU
+    if (owns_robot) {
+        const int gpu_steps = terrain->GetNumRaycastGpuSteps();
+        SynLog() << "Rank " << rank << " SCM ray-cast: " << gpu_steps << " of " << step_number
+                 << " steps ran on the GPU (" << (step_number > 0 ? 100.0 * gpu_steps / step_number : 0.0)
+                 << "%); contact-force GPU steps " << terrain->GetNumContactForceGpuSteps() << ".\n";
+    }
+#endif
 
     syn_manager.QuitSimulation();
     return 0;

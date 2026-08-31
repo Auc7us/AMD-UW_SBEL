@@ -12,8 +12,12 @@
 
 namespace amd_uw {
 
+// How MANY rocks a rank gets is deliberately not in here. It is per-rank now (2-6), and
+// every process -- including the sensor rank, which owns no rock field but has to size a
+// zombie pool for everyone else's -- has to be able to derive any rank's count without
+// being handed a config for it. RobotLayout::RocksPerRank is that one function; this
+// struct carries only the things that are the same everywhere.
 struct RockFieldConfig {
-    int rocks_per_rank = 2;
     double mesh_scale = 0.2;
     double density = 2500.0;
     double first_distance = 20.0;

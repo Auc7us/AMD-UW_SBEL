@@ -13,7 +13,13 @@ class RobotRig;
 // ROS 2 bridge for one collector's dump bed.
 //
 // /robot_N/trailer_cmd:    [command]  1 = run one dump cycle, anything else = no-op
-// /robot_N/trailer_state:  [state, bed_angle_rad, tailgate_angle_rad]
+// /robot_N/trailer_state:  [state, bed_angle_rad, tailgate_angle_rad,
+//                           axle_valid, axle_x, axle_y,
+//                           gate_valid, gate_x, gate_y]
+//                          axle_* is the trailer's rear axle; gate_* is the rear gate
+//                          edge centre, i.e. the lip the load pours over. The collector
+//                          judges its drop band at the gate, not at the tractor -- see
+//                          drop_reference_point in pure_pursuit_controller.py.
 //
 // The dump cycle itself runs in RobotRig at the simulation step rate, not here.
 // It has to: the bed and tailgate are angle motors, and holding their motion to a

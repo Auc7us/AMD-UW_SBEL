@@ -28,16 +28,25 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 option(AMD_UW_ENABLE_ROS2 "Enable ROS2 command/state bridge" ON)
+# Chrono::Sensor's OptiX ray tracer is CUDA-only, so on an NVIDIA host the demo links the
+# CUDA runtime and the driver stubs alongside libChrono_sensor. Turn this OFF to build
+# against a Chrono::Sensor that was compiled without CUDA -- which is the only thing that
+# links on a ROCm host, where /usr/local/cuda does not exist at all. Rank 0's camera is a
+# runtime concern (--no_sensor); this switch is purely about what gets linked.
+option(AMD_UW_ENABLE_CUDA "Link the CUDA runtime and driver stubs used by a CUDA/OptiX Chrono::Sensor" ON)
 option(AMD_UW_USE_SOLIDWORKS_IMPORTER "Build the LRV arm from the Chrono SolidWorks Python importer" OFF)
 
-add_executable(demo_SYN_polaris_flat
+add_executable(demo_SYN_construction
     main.cpp
     src/BuilderRig.cpp
     src/LrvArm.cpp
     src/MaterialUtils.cpp
     src/RobotRig.cpp
     src/RockField.cpp
-    src/SynAgents.cpp)
+    src/ScmRecorder.cpp
+    src/SynAgents.cpp
+    src/TrackSoilMesh.cpp
+    src/TrajectoryRecorder.cpp)
 
 if(AMD_UW_ENABLE_ROS2)
     find_package(ament_cmake QUIET)
@@ -48,17 +57,17 @@ if(AMD_UW_ENABLE_ROS2)
         message(FATAL_ERROR "AMD_UW_ENABLE_ROS2=ON requires ROS2 rclcpp and std_msgs. Source ROS2 or configure with -DAMD_UW_ENABLE_ROS2=OFF.")
     endif()
 
-    target_sources(demo_SYN_polaris_flat PRIVATE
+    target_sources(demo_SYN_construction PRIVATE
         src/BuilderArmRosBridge.cpp
         src/BuilderVehicleRosBridge.cpp
         src/RosArmBridge.cpp
         src/RosTrailerBridge.cpp
         src/RosControllerDriver.cpp)
-    target_compile_definitions(demo_SYN_polaris_flat PRIVATE AMD_UW_ENABLE_ROS2)
+    target_compile_definitions(demo_SYN_construction PRIVATE AMD_UW_ENABLE_ROS2)
     message(STATUS "ROS2 bridge enabled")
 endif()
 
-target_compile_definitions(demo_SYN_polaris_flat
+target_compile_definitions(demo_SYN_construction
     PRIVATE
         CHRONO_USE_CUDA
         CH_API_COMPILE_SENSOR
@@ -76,7 +85,7 @@ target_compile_definitions(demo_SYN_polaris_flat
         "UW_AMD_VEHICLE_DATA_DIR=\"${UW_AMD_VEHICLE_DATA_DIR}\"")
 
 if(AMD_UW_USE_SOLIDWORKS_IMPORTER)
-    target_compile_definitions(demo_SYN_polaris_flat
+    target_compile_definitions(demo_SYN_construction
         PRIVATE
             AMD_UW_USE_SOLIDWORKS_IMPORTER
             # So the embedded interpreter can `import pychrono` without the caller
@@ -85,7 +94,7 @@ if(AMD_UW_USE_SOLIDWORKS_IMPORTER)
     message(STATUS "LRV arm SolidWorks importer enabled")
 endif()
 
-target_include_directories(demo_SYN_polaris_flat
+target_include_directories(demo_SYN_construction
     PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/src"
         "${CHRONO_ROOT}/src"
@@ -96,7 +105,16 @@ target_include_directories(demo_SYN_polaris_flat
         "${CHRONO_ROOT}/src/chrono_thirdparty/flatbuffers/include"
         "${OPTIX_INCLUDE_DIR}")
 
-target_include_directories(demo_SYN_polaris_flat
+# libgomp for whichever GCC actually compiles this, not a pinned version directory: the
+# container ships 11 and 13, and Chrono itself is built with 13.
+execute_process(COMMAND ${CMAKE_CXX_COMPILER} -print-file-name=libgomp.so
+                OUTPUT_VARIABLE AMD_UW_LIBGOMP OUTPUT_STRIP_TRAILING_WHITESPACE)
+if(NOT EXISTS "${AMD_UW_LIBGOMP}")
+    set(AMD_UW_LIBGOMP gomp)
+endif()
+message(STATUS "libgomp: ${AMD_UW_LIBGOMP}")
+
+target_include_directories(demo_SYN_construction
     SYSTEM PRIVATE
         /usr/include/eigen3
         /usr/local/cuda/include
@@ -106,7 +124,7 @@ target_include_directories(demo_SYN_polaris_flat
         /usr/lib/x86_64-linux-gnu/openmpi/include
         /usr/lib/x86_64-linux-gnu/openmpi/include/openmpi)
 
-target_compile_options(demo_SYN_polaris_flat
+target_compile_options(demo_SYN_construction
     PRIVATE
         -march=native
         -Wint-in-bool-context
@@ -119,13 +137,13 @@ target_compile_options(demo_SYN_polaris_flat
         -Wno-stringop-overflow
         -fopenmp)
 
-target_link_options(demo_SYN_polaris_flat
+target_link_options(demo_SYN_construction
     PRIVATE
         "-Wl,--disable-new-dtags"
         "-Wl,-rpath,${CHRONO_BUILD_DIR}/lib:${CHRONO_PACKAGE_DIR}/vsg/lib:/usr/lib/x86_64-linux-gnu/openmpi/lib::::"
         "-Wl,-rpath-link,${CHRONO_PACKAGE_DIR}/vsg/lib")
 
-target_link_libraries(demo_SYN_polaris_flat
+target_link_libraries(demo_SYN_construction
         # SolidWorks importer only: libChrono_parsers.so statically embeds and
         # globally re-exports its own tinyxml2. FastDDS (the ROS2 rmw) links the
         # system libtinyxml2.so.9 and parses XML profiles at DDS-participant/node
@@ -152,18 +170,18 @@ target_link_libraries(demo_SYN_polaris_flat
         "${CHRONO_BUILD_DIR}/lib/libChrono_vehicle_irrlicht.so"
         "${CHRONO_BUILD_DIR}/lib/libChrono_vehicle.so"
         "${CHRONO_BUILD_DIR}/lib/libChrono_fsisph.so"
-        /usr/local/cuda/lib64/libcudart_static.a
+        "$<$<BOOL:${AMD_UW_ENABLE_CUDA}>:/usr/local/cuda/lib64/libcudart_static.a>"
         dl
         /usr/lib/x86_64-linux-gnu/librt.a
-        /usr/local/cuda/targets/x86_64-linux/lib/stubs/libnvrtc.so
-        /usr/local/cuda/targets/x86_64-linux/lib/stubs/libcuda.so
-        /usr/local/cuda/targets/x86_64-linux/lib/stubs/libcublas.so
-        /usr/local/cuda/targets/x86_64-linux/lib/stubs/libcusparse.so
+        "$<$<BOOL:${AMD_UW_ENABLE_CUDA}>:/usr/local/cuda/targets/x86_64-linux/lib/stubs/libnvrtc.so>"
+        "$<$<BOOL:${AMD_UW_ENABLE_CUDA}>:/usr/local/cuda/targets/x86_64-linux/lib/stubs/libcuda.so>"
+        "$<$<BOOL:${AMD_UW_ENABLE_CUDA}>:/usr/local/cuda/targets/x86_64-linux/lib/stubs/libcublas.so>"
+        "$<$<BOOL:${AMD_UW_ENABLE_CUDA}>:/usr/local/cuda/targets/x86_64-linux/lib/stubs/libcusparse.so>"
         "${CHRONO_BUILD_DIR}/lib/libChrono_fsi.so"
         "${CHRONO_BUILD_DIR}/lib/libChrono_vsg.so"
         "${CHRONO_BUILD_DIR}/lib/libChrono_irrlicht.so"
         "${CHRONO_BUILD_DIR}/lib/libChrono_core.so"
-        /usr/lib/gcc/x86_64-linux-gnu/11/libgomp.so
+        "${AMD_UW_LIBGOMP}"
         /usr/lib/x86_64-linux-gnu/libpthread.a
         pthread
         "${CHRONO_BUILD_DIR}/lib/libyaml-cpp.so.0.8.0"
@@ -176,13 +194,13 @@ target_link_libraries(demo_SYN_polaris_flat
         /usr/lib/x86_64-linux-gnu/openmpi/lib/libmpi.so)
 
 if(AMD_UW_USE_SOLIDWORKS_IMPORTER)
-    target_link_libraries(demo_SYN_polaris_flat "${CHRONO_BUILD_DIR}/lib/libChrono_parsers.so")
+    target_link_libraries(demo_SYN_construction "${CHRONO_BUILD_DIR}/lib/libChrono_parsers.so")
 endif()
 
 if(AMD_UW_ENABLE_ROS2)
     if(ament_cmake_FOUND)
-        ament_target_dependencies(demo_SYN_polaris_flat rclcpp std_msgs)
+        ament_target_dependencies(demo_SYN_construction rclcpp std_msgs)
     else()
-        target_link_libraries(demo_SYN_polaris_flat rclcpp::rclcpp ${std_msgs_TARGETS})
+        target_link_libraries(demo_SYN_construction rclcpp::rclcpp ${std_msgs_TARGETS})
     endif()
 endif()

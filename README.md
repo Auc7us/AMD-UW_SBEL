@@ -1,27 +1,13 @@
 # AMD-UW SynChrono Demo
 
-## Directory Layout
+Running instructions only. The reasoning behind the layout, the tuning and the file
+formats is in [DESIGN.md](DESIGN.md).
 
-`CMakeLists.txt` currently assumes absolute Chrono/container paths. If your checkout is arranged differently, edit the path defaults near the top of `CMakeLists.txt`.
+## Paths
 
-```text
-/home/chrono-user/mountdir/
-|-- amd-uw/                 <- this project repo
-|   |-- CMakeLists.txt
-|   |-- data/
-|   |-- ros2_ws/
-|   `-- src/
-|
-|-- chrono/                 <- CHRONO_ROOT
-|   |-- build/              <- CHRONO_BUILD_DIR
-|   `-- data/
-|
-`-- packages/               <- CHRONO_PACKAGE_DIR
-    `-- optix/              <- OPTIX_INSTALL_DIR
-```
+`CMakeLists.txt` assumes container-absolute paths. Check these first on a new checkout:
 
 ```text
-CMake defaults to check/edit:
 CHRONO_ROOT        = /home/chrono-user/mountdir/chrono
 CHRONO_BUILD_DIR   = ${CHRONO_ROOT}/build
 CHRONO_PACKAGE_DIR = /home/chrono-user/mountdir/packages
@@ -30,22 +16,24 @@ UW_AMD_DATA_DIR    = ${CMAKE_CURRENT_SOURCE_DIR}/data
 
 ## Build
 
-Build the C++ sim with ROS2 support from a ROS2 Humble environment:
-
 ```bash
 source /opt/ros/humble/setup.bash
 cd ~/mountdir/amd-uw
-cmake -S . -B build -G Ninja -DAMD_UW_ENABLE_ROS2=ON   # configure once (or after a fresh container)
-ninja -C build                                          # build the whole project
+cmake -S . -B build -G Ninja -DAMD_UW_ENABLE_ROS2=ON   # once, or after a fresh container
+ninja -C build -j4                                     # -j4: more threads can OOM a 32 GB box
 ```
 
-After editing sources, just rebuild (no reconfigure needed):
+Rebuild after editing sources with `ninja -C build -j4`; no reconfigure needed.
+
+**ROCm host (HPC Fund)** — add `-DAMD_UW_ENABLE_CUDA=OFF` and run with `--no_sensor`:
 
 ```bash
+cmake -S . -B build -G Ninja -DAMD_UW_ENABLE_ROS2=ON -DAMD_UW_ENABLE_CUDA=OFF \
+      -DCHRONO_ROOT=$HOME/mountdir/chrono -DCHRONO_PACKAGE_DIR=$HOME/mountdir/packages
 ninja -C build
 ```
 
-Build the ROS2 Python controllers:
+ROS 2 controllers:
 
 ```bash
 source /opt/ros/humble/setup.bash
@@ -54,369 +42,196 @@ colcon build --symlink-install --packages-select amd_uw_ros2
 source install/setup.bash
 ```
 
-If `ros2 launch` cannot find a newly added launch file after a failed build,
-remove the stale package build/install folders and rebuild:
+`--symlink-install` means Python edits are live with no rebuild. If `ros2 launch` cannot
+find a newly added launch file:
 
 ```bash
-cd ~/mountdir/amd-uw/ros2_ws
 rm -rf build/amd_uw_ros2 install/amd_uw_ros2
 colcon build --symlink-install --packages-select amd_uw_ros2
-source install/setup.bash
 ```
 
-## Run ROS Demo
+## Run
 
-Terminal 1, start the ROS controllers for robot ranks 1 and 2:
+Rank 0 owns no robot, so **robots = np - 1**. The walkthrough below is 8 robots (`-np 9`);
+[20 robots (`-np 21`)](#20-robots--np-21) is the same three commands with the count
+changed. All three commands must agree on the count.
+
+Terminal 1 — collectors:
 
 ```bash
 source /opt/ros/humble/setup.bash
-cd ~/mountdir/amd-uw/ros2_ws
-source install/setup.bash
+cd ~/mountdir/amd-uw/ros2_ws && source install/setup.bash
 ros2 launch amd_uw_ros2 robot_controllers.launch.py \
-  robot_ids:=1,2 \
-  target_speed_mps:=3.0 \
-  switch_radius_m:=2.0 \
-  rock_side_offset_m:=2.0
+  robot_ids:=1,2,3,4,5,6,7,8 \
+  target_speed_mps:=3.0 switch_radius_m:=2.0 rock_side_offset_m:=2.0
 ```
 
-Terminal 2, start the C++ sim:
+Terminal 2 — builders (orbit + arm; the drive half alone holds slot 0 forever):
+
+```bash
+source /opt/ros/humble/setup.bash
+cd ~/mountdir/amd-uw/ros2_ws && source install/setup.bash
+ros2 launch amd_uw_ros2 builder_orbit_controllers.launch.py \
+  builder_ids:=1,2,3,4,5,6,7,8 counter_clockwise:=true
+```
+
+Radii default to the current site (`work_circle_radius_m:=50.0 path_radius_m:=53.0`) and
+the station bands derive themselves from the measured slot pitch — do not pass
+`station_tolerance_rad`, `station_keep_deadband_m` or `station_keep_max_steering`. Each
+controller logs its derived bands at startup; `PINNED` in that line means something is
+overriding them.
+
+Terminal 3 — the sim:
 
 ```bash
 source /opt/ros/humble/setup.bash
 cd ~/mountdir/amd-uw
-mpirun -np 3 ./build/demo_SYN_polaris_flat --vsg 1,2
+mpirun -np 9 ./build/demo_SYN_construction --no_sensor --scm_delta 0.042 -e 600 --perf_log 10
 ```
 
-### Site layout
+Watch a rank instead of running headless: drop `--no_sensor` and add `--vsg 1` (one window
+per listed rank).
 
-Everything is concentric about `(0, 0)`, and each rank owns one ray out from the
-centre, evenly spaced (`2*pi*rank/N`). On that ray:
+### 20 robots (`-np 21`)
 
-```text
-centre ---- work circle (30 m) ---- builder orbit (33 m) ---- collector (37 m) ----> rock line
-              yellow ring                cyan ring                green ring
-```
+Same three terminals, same flags; only the count changes, and it must change in all three.
 
-The two gaps are 3 m inboard and 4 m outboard, both inside the 2.78–4.44 m band the
-2x-scaled builder arm proved in service, so one lane serves both the wall and the drop
-pile. 35/40 put both gaps at 5 m and the builder had to reposition for every pick.
-Rovers are *placed* further out still, at 42 m, so a spawning trailer does not land on
-its own builder; only the placement reads that radius.
-
-So a rank's collector starts directly outside its own builder, on the line joining
-the site centre to it, faces radially outward, and its rock line runs away from
-the site — the collector drives out to fetch and back inward to the builder it
-feeds, and no rock line crosses the build area. Builders sit tangent to their
-orbit, so their radial footprint is only the hull width and there is ~3.5 m of
-clearance between a collector's trailer and its builder at spawn.
-
-All of this lives in `src/RobotLayout.h` as one source of truth. Note this also
-scales past two ranks: the previous layout hard-coded two headings (330 deg and
-60 deg) and silently gave every rank after the second the same heading as rank 2.
-
-The rock line runs 30 m to 660 m out from each collector, so its outer end leaves
-the 1024 m heightmap; those last few rocks rest on the flat extension strips that
-`AddRockLineTerrainExtensions` lays along each ray, not on mapped terrain.
-
-### What the builder does
-
-The builder **builds**, at its own pace. Its course, its station and its rate are its
-own; the only thing it takes from its collector is rock. One wall slot per iteration:
-
-1. The sim publishes `/builder_N/pick_target` with `ready=1` — the hull is parked, slot
-   `k` is unlaid, and a rock is within the arm's envelope.
-2. `builder_arm_controller` solves grab and place IK in the arm base frame and sends one
-   12-element `/builder_N/arm_cmd`.
-3. `LrvArm`'s pick/place machine runs it: approach, close on contact, lock, lift, swing
-   180°, settle, release, stow.
-4. The sim re-fixes the laid rock and advances the station angle by one slot.
-5. `builder_orbit_controller` creeps the ~1 m and parks. `ready` goes high for slot `k+1`.
-
-The geometry is all derived from the slot index `k` in `src/RobotLayout.h`, so the arm,
-the drive station and the feedstock cannot disagree:
-
-| | radius | angle |
-|---|---|---|
-| wall slot `k` | 30.0 | `ray + k·pitch` |
-| station for `k` | 33.0 | `ray + k·pitch + arm_lead` |
-| seed heap | 36.6 | heap-centre slot angle, **no** `arm_lead` |
-| collector load `c` | 37.0 | `ray + HarvestDropSlot(c)·pitch` |
-
-`pitch = 0.9 m / 30 m`, so one slot is 0.9 m of course and 0.99 m of lane. `arm_lead =
-atan(2.5/33)` exists because the arm mounts 2.5 m *back* along a tangentially parked
-hull; adding it to the station puts the *arm base*, not the hull origin, radially
-opposite the slot it serves. That is why the heap must **not** also carry it — doing so
-pushed every heap to 5.62 m from the arm base, past the 5.2 m guard, and no rock was
-reachable. `main.cpp` prints a reach audit at startup so that class of error shows
-up at t=0 rather than after the machine has driven to its first station. Measured at
-4 ranks: seed heap 3.54–4.37 m, collector load 3.91–4.04 m, wall slot 3.09 m, all
-inside the 2.0–5.2 m envelope.
-
-#### Where the rock comes from
-
-There is **one** seed heap of six rocks per builder, and that is all the site places.
-It exists only to give the builder something to lay during its collector's first
-outbound leg, which is minutes of sim long. Everything after it is delivered.
-
-That works because the harvest lane advances in **wall slots**, not in a round number
-of degrees. Load `c` is dropped at slot `HarvestDropSlot(c) = 6 + 2c` — exactly where
-the builder's wall will have reached, having laid the six seed rocks and the two rocks
-of every earlier load. So each pile lands within reach of the station the builder is
-already driving to, and the builder clears each pile off the collector circle before
-the collector comes back to that stretch of it. The step used to be a flat 30°, which
-at 0.03 rad/slot is 17 slots — a two-rock load every 17 slots leaves a wall that is 88%
-gaps and every pile 15 m of arc from the builder meant to eat it.
-
-The arm bridge does not index its feedstock. It takes the **nearest un-consumed rock
-inside the envelope**, from the seed heap and every delivered load pooled together. That
-has to be a search rather than a lookup, because a load is tipped out of a moving
-trailer and lands where it lands; running both sources through one rule also means the
-changeover from heap to delivery needs no handling at all. The hull's station is pulled
-half way toward the rock on offer (clamped to ±2 slots), so a pile that lands a metre or
-two off its nominal slot is still worked rather than stared at.
-
-**Every rock is fixed except the one in the gripper.** Seed rocks are created
-`SetFixed(true)` with collision on; delivered rocks are frozen the same way once they
-come to rest. `LrvArm::TryLockRock` unfixes exactly one when the fingers make contact,
-and the arm bridge re-fixes it once laid — it is part of the wall then, and must not be
-nudged by the next stone landing beside it. Delivered rocks used to be *released* again
-when a builder came within 3 m or pushed hard enough on them; both triggers fire exactly
-when the arm is trying to take hold, so the rock would be unfixed and rolling downhill at
-the worst possible moment. `UpdateRockCollisionActivation` also skips fixed rocks, or the
-distance test would switch collision off on the pile the gripper is about to close on.
-
-Start both halves together (they are a pair; the drive half alone holds slot 0 forever):
+Terminal 1 — collectors:
 
 ```bash
-source /opt/ros/humble/setup.bash
-cd ~/mountdir/amd-uw/ros2_ws
-source install/setup.bash
+ros2 launch amd_uw_ros2 robot_controllers.launch.py \
+  robot_ids:=1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20 \
+  target_speed_mps:=3.0 switch_radius_m:=2.0 rock_side_offset_m:=2.0
+```
+
+Terminal 2 — builders:
+
+```bash
 ros2 launch amd_uw_ros2 builder_orbit_controllers.launch.py \
-  builder_ids:=1,2 \
-  work_circle_radius_m:=30.0 \
-  path_radius_m:=33.0 \
+  builder_ids:=1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20 \
   counter_clockwise:=true
 ```
 
-The orbit controller reads `/builder_N/vehicle_state` (`[x, y, yaw, speed]`) and
-publishes `/builder_N/vehicle_cmd` (`[steering, throttle, braking]`). A builder starts
-braked and holds until its first valid ROS command arrives.
-
-Its hull is held by a **virtual anchor** while parked, and released the moment it is
-asked to move — full brake with zero throttle is the park signal, which is exactly what
-the orbit controller publishes on station, so no extra topic is needed. A braked M113
-does not stay put: measured here, it creeps at 0.22–0.27 m/s on full brake, so `m_parked`
-never went true and the arm was never offered a pick. The anchor is a spring-damper
-*force* on the chassis (5e4 N/m, 4.5e4 N·s/m, plus a yaw pair), horizontal only —
-vertical is the suspension's job.
-
-It is a force and not a constraint for a reason that must not be lost. `SetFixed(true)`
-does hold the hull, and it **destroys the track**: it removes the body from the solve, so
-its velocity goes to zero in one step while ~130 shoes are still solving against the
-velocity it had last step. Bisected at 3 ranks with no controllers: pinning on brake died
-at t=2.115, pinning only below 0.02 m/s died at t=6.085 (the velocity gate was a
-hypothesis, and it was wrong — it only delayed the failure), and `--no_hull_park` ran
-clean past t=21. A force has no velocity discontinuity, so it holds station without
-shocking the chain.
-
-Seating the hull on a *fitted terrain plane* (`SeatBuilderOnTerrainPlane`, worst-case
-error 0.02–0.08 m against 0.24–0.33 m for a single-probe level placement) is still
-needed, and still done — that is about not injecting strain at t=0, and it is orthogonal
-to how the hull is held once parked.
-
-### One system per rank
-
-Each physics rank has exactly **one** `ChSystem`, holding that rank's rover,
-trailer, rocks, terrain, and builder. This is a hard requirement, not a
-preference: Chrono only generates contacts between bodies of the same system, so
-a builder in its own system could never touch the rocks it exists to place.
-
-The consequence is that the whole system runs the solver the single-pin track
-needs — `ChSolverBB` at 100 iterations with `EULER_IMPLICIT_LINEARIZED`, set once
-in `main.cpp` (the default solver lets track shoes drift off the road wheels).
-`BuilderRig` deliberately does not touch gravity, solver, timestepper, or terrain:
-it does not own that world.
-
-Two ordering rules follow, and breaking either is silent:
-
-- Every `Synchronize` runs before any `Advance`, and the system is stepped exactly
-  once per loop iteration. `BuilderRig::Advance` only advances its own subsystems;
-  `robot->Advance` is what issues the `DoStepDynamics`.
-- The builder is constructed *after* the rover's SolidWorks arm import, which
-  leaves the collision system in a state where later bodies never register
-  contacts. `BuilderRig` calls `BindAll()` on the shared system to repair that —
-  without it the tracks sink through the ground and the gripper passes through
-  rocks.
-
-Watch the terrain cost when changing the field map. The rover's mission needs the
-full 1024 m `terrain2.bmp`, which is a ~130k-triangle collision mesh, and the
-M113's ~130 track shoes query it every step; that narrowphase is ~7.6 of the ~17.9
-wall/sim. If it ever needs to come down, the builder only ever occupies the orbit,
-so a second smaller patch plus collision families would let its shoes skip the
-big mesh.
-
-### Cost diagnostics
-
-`--perf_log <seconds>` prints a per-rank breakdown every N sim seconds: the
-*instantaneous* wall/sim for the window (the plain `wall/sim` line is a cumulative
-average, which hides when a cost starts growing — it is why an early slowdown here
-read as unbounded growth when it had actually plateaued), the wall time in each
-loop section, Chrono's per-step timers, and the builder's drive command / speed /
-orbit radius / track-shoe spread.
+Terminal 3 — the sim (cluster node, ≥ 21 cores):
 
 ```bash
-mpirun -np 3 ./build/demo_SYN_polaris_flat --no_sensor -e 10 --perf_log 0.5
+mpirun -np 21 ./build/demo_SYN_construction --no_sensor --scm_delta 0.02 -e 1500 \
+  --perf_log 10 --record_rate 30 --scm_record_rate 1
 ```
 
-`--builder_no_arm` drops the manipulator, to separate arm cost from vehicle cost.
+The node runs the **2 cm grid** (`--scm_delta 0.02`), four times the soil memory of the
+workstation's 0.035: ~11.2 GB per robot rank, ~225 GB across 20. Confirm the node has it
+before queueing. This will not run on the workstation at any rank count — there the same
+walkthrough needs `--map-by hwthread` and a much coarser grid; see
+[Sizing a run](#sizing-a-run) and the core-count note below.
 
-Rank layout:
+The layout needs no adjustment at this count: `BuilderWallSlotCount` caps each builder at
+0.7 of its own `2*pi/N` sector, so the wall stays collision-free as `N` grows.
 
-```text
-rank 0 = global sensor/visualization rank
-rank 1 = robot 1
-rank 2 = robot 2
-```
+### Sizing a run
 
-Terminal 3, optional status/debug commands:
+`--scm_delta` decides whether a run fits. Measured **2.55 GB per robot rank at 0.042** and
+**3.53 GB at 0.035**; memory scales as `1/delta²`, so per-rank GB is
+`2.55 × (0.042/delta)²`.
+
+| robots | delta 0.020 | delta 0.035 | delta 0.042 | delta 0.050 | delta 0.057 |
+|---|---|---|---|---|---|
+| 4 | 45 GB | 14 GB | 10.3 GB | 7.2 GB | 5.5 GB |
+| 8 | 90 GB | 28 GB | 20.5 GB | 14.4 GB | 11 GB |
+| 15 | 169 GB | 53 GB | 38 GB | 27 GB | 21 GB |
+| 20 | 225 GB | 71 GB | 51 GB | 36 GB | 28 GB |
+
+The 0.020 column is the cluster grid; every entry in it is a node-only configuration.
+
+This workstation has 64 GB. The 15-robot run at 0.035 measures 52.9 GB steady with 5.1 GB
+available and 1.4 GB of swap in use — that is the practical ceiling here, and **20 robots
+at 0.035 (71 GB) is over it**. Either drop to delta 0.050 or run 20 robots on a cluster
+node, which is also the only place the 0.020 grid fits. Check `free -g` before launching
+and run one sim at a time.
+
+MPI slots are **physical cores**, not threads. This workstation has 16 cores (`nproc`
+reports 24 because of SMT), so anything above `-np 16` — `-np 21` included — fails with
+"not enough slots" unless you add `--map-by hwthread`, which shares cores and slows the
+run. The cluster nodes are 8 x 16 = 128 cores, so `-np 21` runs there unmodified;
+`batch/inner_run.sh` passes `--oversubscribe` in any case.
+
+## Flags
+
+| flag | default | effect |
+|---|---|---|
+| `-e, --end_time` | — | sim seconds to run |
+| `-s, --step_size` | — | integration step |
+| `--scm_delta` | 0.10 | SCM grid spacing; sets the memory footprint |
+| `--no_sensor` | off | no camera on rank 0; required without CUDA |
+| `--vsg 1,2` | none | MPI ranks that open a window |
+| `--perf_log N` | 0 (off) | per-rank cost breakdown every N sim seconds |
+| `--settle_time` | — | braked pre-roll before SynChrono starts |
+| `--rocks_per_rank N` | hashed 2–6 | pin every rank to N rocks, for reproducible tests |
+| `--builder_no_arm` | off | builder without manipulator (cost bisection) |
+| `--no_builder` / `--no_build` | off | drop the builder / the build behaviour |
+| `--solver`, `--solver_iterations` | BB, 100 | override the solver |
+| `--scm_raycast_gpu`, `--scm_gpu_min_hits` | off | GPU ray casting for SCM |
+| `--record_root DIR` | `recordings/` | parent for `run_<timestamp>/` |
+| `--record_dir DIR` | — | record to exactly this directory |
+| `--record_rate` | 60 Hz | pose sample rate |
+| `--scm_record_rate` | 10 Hz | deformation sample rate |
+| `--no_record` | off | disable recording (it is **on** by default) |
+
+Rank 0 prints the absolute recording path at startup.
+
+## Tools
 
 ```bash
-source /opt/ros/humble/setup.bash
+# validate and inspect a recording
+python3 tools/read_trajectory.py <dir> --check
+python3 tools/read_trajectory.py <dir> --rank 1 --list
+python3 tools/read_trajectory.py <dir> --rank 1 --bbox 0      # rebuild one frame, print extents
+python3 tools/read_trajectory.py <dir> --rank 1 --npz rank1.npz
+
+# 3D playblast with the run's own meshes (needs pyvista; --movie/--shot are off-screen)
+python3 tools/replay_run.py <dir>                             # real time
+python3 tools/replay_run.py <dir> --speed 8
+python3 tools/replay_run.py <dir> --rank 1,2 --from 90 --to 140
+python3 tools/replay_run.py <dir> --no-running-gear           # drop tracks, ~70 fps
+python3 tools/replay_run.py <dir> --movie clip.mp4
+python3 tools/replay_run.py <dir> --shot look.png --at 300
+python3 tools/replay_run.py <dir> --focus "builder/Chassis" --focus-dist 7
+python3 tools/replay_run.py <dir> --max-frames 9000           # hold every frame of a long run
+
+# terrain deformation
+python3 tools/read_scm.py <dir> --check
+python3 tools/read_scm.py <dir> --rank 1 --npz ruts.npz
+
+# regrade the level work pad (overwrites data/terrain/terrain2_graded.png)
+python3 tools/make_graded_pad.py --pad-radius 65 --taper-radius 130
+```
+
+`replay_run.py` keys: `space` play/pause, `←`/`→` step, `[`/`]` speed, `t` top, `c` free
+camera, `f` follow next machine, `r` restart, `q` quit. Camera flies on `ijkl` (like `wasd`),
+`u`/`o` up and down.
+
+Blender import is `tools/blender_import.py` — run it inside Blender, not from a shell.
+
+## Debug topics
+
+```bash
 ros2 topic echo /robot_1/egoState
 ros2 topic echo /robot_1/targetPos
 ros2 topic echo /robot_1/vehicle_cmd
 ros2 topic echo /robot_1/arm_status
-ros2 topic echo /robot_2/arm_status
+ros2 topic echo /builder_1/arm_status
 ```
 
-Manual target completion, if you need to force a robot to move to the next rock:
+Force a collector to the next rock, or drive a dump cycle by hand:
 
 ```bash
 ros2 topic pub --once /robot_1/target_done std_msgs/msg/Bool "{data: true}"
-ros2 topic pub --once /robot_2/target_done std_msgs/msg/Bool "{data: true}"
-```
-
-`targetPos` contains rock centers. The pure-pursuit controller picks the nearest unfinished rock and drives toward a lateral waypoint beside it (`rock_side_offset_m`). As the tractor rear reference point approaches the pickup zone, the controller linearly caps target speed across `pickup_slowdown_offset_m` so it reaches the `switch_radius_m` boundary at `pickup_boundary_speed_mps` instead of entering the circle at cruise speed. The default slowdown band is `10 m` and aims to enter the circle at `2.0 m/s`. It stops and waits when that waypoint is within `switch_radius_m` of the rear reference point and the rock bearing is in the pickup sector (`60..100` or `-100..-60` degrees with the tractor forward axis as `0`). Publish `true` on `/robot_N/target_done` to mark that rock finished and move to the next target after a short zero-steering settle.
-
-When the rover stops at a pickup target, the drive controller publishes
-`/robot_N/pickup_request`; the manipulator controller relays that to the C++ sim
-on `/robot_N/arm_cmd`. The C++ arm publishes `/robot_N/arm_status`, and the
-manipulator controller publishes `/robot_N/target_done=true` after the arm
-reports completion or, by default, after a failed target is skipped.
-
-### End of mission: return home and dump
-
-Once every rock is either collected or skipped, the collector drives back to its drop
-point, stops, tips its bed to drop the load, resets, and stays put. The chain is:
-
-```text
-manipulator_controller  all targets resolved   -> /robot_N/mission_done
-pure_pursuit_controller drives to /robot_N/homePos, stops
-                                               -> /robot_N/at_home
-manipulator_controller                         -> /robot_N/trailer_cmd [1]
-C++ RobotRig            runs the dump cycle    -> /robot_N/trailer_state
-```
-
-`/robot_N/trailer_state` is `[state, bed_angle_rad, tailgate_angle_rad]`, where
-state is `0` idle, `1` opening gate, `2` tilting, `3` dwell, `4` levelling,
-`5` closing gate, `6` done. `/robot_N/homePos` is published by the C++ drive
-bridge so the drop point is not recomputed in Python.
-
-**The last leg is tangential.** The rock line runs radially *outward* from the drop
-point, so a rover left to itself comes home radially — nose-in at the circumference,
-trailer pointing out into open field, load tipped wherever it happened to stop. Instead
-it is given two waypoints: one on the collector circle `approach_arc_m` (12 m) of arc
-*clockwise* of the drop point, then the drop point itself, reached by following the
-circle. By the time it has run that arc its heading is tangential, so the rear-
-discharging trailer pours a line of rock *along* the circumference — which is the shape
-the builder eats from, working one slot at a time along the same circle.
-
-The run-in comes down the circle *over the builder's own seed heap*, which sits at 36.6 m
-on slot 2.5 — 0.4 m off the 37 m path. That is intended, not overlooked: the builder eats
-the six seed rocks in the first ~60 s of sim and its collector does not get home until
-~250 s, so the ground is clear long before anything drives over it. It is the same
-property the whole layout is built on — the builder clears each pile off the collector
-circle before the collector comes back to that stretch of it.
-
-That also let `drop_arc_tolerance_m` come down from 8 m to 3 m. The 8 m existed because
-a rover driving straight at the drop point cannot converge on it — pure pursuit orbits a
-target inside its own turning radius — so arrival had to be accepted from a long way
-out. With the run-in, 8 m of slack would be actively harmful: the rover would enter the
-band at the entry waypoint and park 8 m short of the pile it is meant to be building.
-Arrival is also accepted on a **stop line** — committed to the run-in and past the drop
-point in arc — because "have I passed it" cannot be missed by a rover carrying a little
-too much speed, whereas "am I near it" can be sailed through in one control period.
-
-The cycle runs in C++ at the simulation step rate, and it has to. Both the bed and
-the tailgate are `ChLinkMotorRotationAngle`, so re-setting the commanded angle is
-a *position* discontinuity — an instantaneous velocity that throws the rocks out
-of the tub instead of tipping them out. The cycle therefore slews each angle at a
-bounded rate (bed 12 deg/s to 55 deg, gate 60 deg/s to 95 deg, 3 s dwell at full
-tilt), which cannot be driven from a 10 Hz controller. A controller only asks for
-a cycle; repeat requests during one are ignored.
-
-55° and not 40°: the load has to *slide*, and a rock on the bed slides only when
-tan θ > μ. The bed is μ = 0.9, so the threshold is arctan(0.9) = 42.0°. At 40° the
-load is below it and is not supposed to move at all — the dumps that appeared to work
-were rocks rolling or being nudged by the tilt, which is why three ranks emptied and
-the fourth kept its rock sitting 0.28 m from the bed centre. Gravity cancels out of
-tan θ > μ entirely, so lunar gravity never entered into this and it failed exactly as
-it would on Earth.
-
-The tub is **centred on the trailer and discharges rearward**, over the -x lip, with
-the tilt axis *on* that lip so the pour line stays put instead of walking forward under
-the trailer as the tub rises. It spent a while discharging to the left instead, which
-forced the tub off-centre — the left tire spans y = 0.35–0.65 with its top only 21 mm
-below the bed lip, so a symmetric tub pouring sideways empties onto its own wheel.
-Nothing is behind the tailgate but ground, so rear discharge has no such conflict, and
-the tub sits where `RosArmBridge`'s 4×4 placement grid has always aimed.
-
-The gate opens before the bed tilts and closes after it levels, so the load is
-never pressed against a closed gate and then released all at once.
-
-To drive a cycle by hand:
-
-```bash
 ros2 topic pub --once /robot_1/trailer_cmd std_msgs/msg/Float64MultiArray "{data: [1.0]}"
 ros2 topic echo /robot_1/trailer_state
 ```
 
-At full tilt the sim logs both bed lip heights, e.g. `front_lip_z=6.010
-rear_lip_z=5.355 drop=0.655`. That check exists because getting the motor axis
-sign wrong does not fail loudly — it would press the load against the closed
-front wall and dump nothing at all. A positive drop means the open rear is lower,
-which is correct.
-
-### Stray controllers: check this first
-
-`ros2 launch` spawns its nodes as children and does **not** take them down when
-the launch process itself is killed. Ctrl-C in the terminal is fine, but killing
-the launch PID (or a script doing `kill $!`) leaves a full set of controllers
-running. They are invisible until the next run, when they fight it:
-
-```bash
-# Before every run:
-pgrep -af "pure_pursuit_controller|manipulator_controller"   # expect nothing
-# Clean up:
-pkill -9 -f "pure_pursuit_controller|manipulator_controller"
-# From a script, launch in its own process group and kill the group:
-setsid ros2 launch amd_uw_ros2 robot_controllers.launch.py ... &
-kill -TERM -$!
-```
-
-Two duplicate controllers produce two distinct failures that look like anything
-but duplication:
-
-- **On `vehicle_cmd`**: commands alternate, so braking flickers between 0 and 1,
-  throttle never sticks, and the rover sits at spawn. Reads as a broken vehicle.
-- **On `arm_cmd`**: each manipulator node caches its own `arm_base_pose` and
-  solves its own IK, so one rock produces several different answers. The arm
-  grabs at the wrong place, or calls a rock it is parked beside unreachable. A
-  stale node also still holds rock positions from an *earlier* sim.
-
-Both are now reported by the sim on the first offending step, naming the `pkill`.
-If you see `N publishers on ... -- expected 1`, stop and clear strays; results
-until then are not trustworthy.
+`trailer_state` is `[state, bed_angle_rad, tailgate_angle_rad]`; state `0` idle, `1` opening
+gate, `2` tilting, `3` dwell, `4` levelling, `5` closing gate, `6` done.
 
 Arm status error codes:
 
@@ -428,23 +243,24 @@ Arm status error codes:
 4 = timeout
 ```
 
-## TODO
+## Stray controllers: check this first
 
-1. [x] Add ROS controller integration.
-2. [x] Stop at rock.
-3. [x] Integrate with Harry.
-4. [ ] [WIP] Move to SCM terrain. 
-5. [x] ~~Explore a PyChrono wrapper for SynChrono~~. Scrapped.
-6. [ ] Scale to many vehicles and rocks.
+`ros2 launch` does **not** take its children down when the launch process is killed.
+Ctrl-C in the terminal is fine; killing the launch PID leaves a full set of controllers
+running, invisible until they fight the next run.
 
-## Refactoring Note
+```bash
+# before every run -- expect nothing
+pgrep -af "pure_pursuit_controller|manipulator_controller|builder_orbit_controller|builder_arm_controller"
 
-- [x] Keep the current demo single-file while it remains one compact executable.
-- [x] Split robot rig setup and per-step robot updates into their own module.
-- [x] Split rock field generation into its own module.
-- [x] Split custom SynChrono agents into their own module.
-- [x] Continue refactoring along domain boundaries when scale-up requires it: terrain/world setup, ROS controller drivers, robot arm, and per-robot sensors.
+# clean up
+pkill -9 -f "pure_pursuit_controller|manipulator_controller|builder_orbit_controller|builder_arm_controller"
 
-## Side Quest
+# from a script: own process group, kill the group
+setsid ros2 launch amd_uw_ros2 robot_controllers.launch.py ... &
+kill -TERM -$!
+```
 
-- [ ] Explore texture support in Chrono.
+The sim reports duplicates on the first offending step. If you see
+`N publishers on ... -- expected 1`, stop and clear strays — results until then are not
+trustworthy. See DESIGN.md for what duplication looks like when you don't catch it.

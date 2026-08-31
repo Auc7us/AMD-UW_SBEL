@@ -52,9 +52,43 @@ namespace amd_uw {
 // inside the folded-arm limit.
 inline constexpr double site_center_x = 0.0;
 inline constexpr double site_center_y = 0.0;
-inline constexpr double work_circle_radius = 30.0;
-inline constexpr double builder_path_radius = 33.0;
-inline constexpr double robot_start_radius = 37.0;
+// SCALED UP from 30/33/37. The RADIAL OFFSETS between the rings are unchanged, and
+// deliberately so: they are set by machine dimensions, not by site size.
+//
+//   wall -> builder lane   3.0 m   the arm's own geometry. The arm base rides the lane
+//                                  at hypot(lane, 2.5) and must reach its slot on the
+//                                  wall; scaling this would break the reach the whole
+//                                  build depends on.
+//   lane -> collector ring 4.0 m   clearance between a 2.686 m hull and a 1.49 m rover.
+//                                  Vehicles do not get bigger with the site.
+//   ring -> rover spawn    5.0 m   staging, out of the drop band.
+//
+// What growing the circle buys is ARC per rank, which is what the builders need in order
+// to rotate as they build: at 16 ranks the wall sector goes from 11.78 m to 19.63 m, and
+// the course from 8.25 m to 13.74 m -- from one arm-station to nearly two.
+//
+// NOTE the terrain. The levelled pad is r <= 45 m (make_graded_pad.py --pad-radius) and
+// the site now reaches r = 62 m at the spawn ring, where the measured height spread is
+// 0.50 m rms against 0.23 m inside the pad. Regrade before running this:
+//     python3 tools/make_graded_pad.py --pad-radius 65 --taper-radius 130
+inline constexpr double work_circle_radius = 50.0;
+inline constexpr double builder_path_radius = 53.0;
+
+// The collector ring: where a rover parks, and therefore where its load lands.
+//
+// The gap between this and builder_path_radius is what a builder's arm has to span to
+// reach a delivered pile, and it was set half a metre too wide. Measured over a 1500 s
+// 15-robot run, EVERY delivery the builders had to fetch for landed outside the arm's
+// envelope -- 66 of them, 0.01 to 1.27 m past the limit, median 0.18 m. The radial part
+// of that overshoot is this constant; the rest is arc, which the station fetch cancels.
+//
+// Pulling the ring in 0.5 m puts 58 of those 66 inside the envelope without the fetch
+// having to run at all. It is safe on clearance: over the same run the closest a
+// collector body ever came to a builder body was 2.22-2.38 m on every rank that was not
+// already in a collision, so 0.5 m leaves about 1.8 m of margin. Do not take much more
+// than this without re-measuring -- the margin is what keeps the two machines apart while
+// one is pouring beside the other.
+inline constexpr double robot_start_radius = 56.3;
 
 // Where the rover is PLACED at t=0, which is deliberately NOT its drop point.
 //
@@ -73,7 +107,7 @@ inline constexpr double robot_start_radius = 37.0;
 // Pushing the BUILDER outward instead cannot work: the rover rig occupies 34.59-38.99 m
 // radially, so the first clear outboard slot is past the drop point and the builder
 // would have to drive through the parked rover to reach its lane.
-inline constexpr double robot_spawn_radius = 42.0;
+inline constexpr double robot_spawn_radius = 62.0;
 
 // Half-width of the radial band around the collector circle that counts as "at the
 // drop point" -- so a 2 * this metre band, concentric with the collector circle.
@@ -91,7 +125,15 @@ inline constexpr double drop_band_half_width = 2.0;
 //
 // Declared up here, ahead of the harvest cycle, because the harvest lane is measured in
 // these slots -- see HarvestDropSlot.
-inline constexpr double wall_slot_pitch_m = 0.9;
+// 0.5 m centre to centre, not 0.9. A rock is 0.244 m across, so this leaves a 0.26 m
+// gap and the course reads as a wall being built rather than a dotted line of markers.
+// 0.9 was a training spacing.
+//
+// Everything downstream is derived, so this is the only number to change: slots per rank
+// (BuilderWallSlotCount), the station's advance per rock, the seed pile layout, and the
+// collector's per-cycle lane offset all scale off wall_slot_pitch_rad. The one place it is
+// NOT derived is slot_pitch_rad in pure_pursuit_controller.py, which mirrors it by hand.
+inline constexpr double wall_slot_pitch_m = 0.5;
 inline constexpr double wall_slot_pitch_rad = wall_slot_pitch_m / work_circle_radius;
 
 // How many rocks the builder starts with, heaped beside its lane, and how many its
@@ -101,7 +143,66 @@ inline constexpr double wall_slot_pitch_rad = wall_slot_pitch_m / work_circle_ra
 // first outbound leg, which is minutes of sim long. After that the builder eats what the
 // collector delivers, and nothing else.
 inline constexpr int builder_seed_rock_count = 6;
-inline constexpr int harvest_rocks_per_load = 2;
+
+// Rocks on one rank's rock line, and therefore in one collector load. It was a fixed 2
+// on every rank; it is now 2-6, drawn per rank, so the site is not fifteen copies of the
+// same round trip.
+//
+// This is THE source of truth for that count and every consumer has to come through it,
+// because the number is read in three places that must agree exactly or the run breaks
+// in ways that do not look like a rock count:
+//
+//   * RockField spawns this many bodies on the owning rank;
+//   * SynRockAgent sizes the sensor rank's zombie pool from it -- undersize it and the
+//     tail of a rank's rocks is simply invisible in the global camera;
+//   * HarvestDropSlot advances the collector's lane by one load's worth of WALL SLOTS
+//     per cycle, which is what keeps each delivered pile within the builder's arm reach
+//     of the station it is already driving to.
+//
+// So it is a pure function of the rank index, computed identically in every process,
+// rather than anything carried in RockFieldConfig -- rank 0 has to be able to work out
+// rank 7's count without being told.
+inline constexpr int min_rocks_per_rank = 2;
+inline constexpr int max_rocks_per_rank = 6;
+
+// >0 pins every rank to that count. Set once from --rocks_per_rank, before anything
+// reads the layout; every rank parses the same command line, so they stay in agreement.
+inline int g_rocks_per_rank_override = 0;
+inline void SetRocksPerRankOverride(int count) {
+    g_rocks_per_rank_override = count;
+}
+
+// Fixed seed for the draw. Change it to reshuffle every rank's whole sequence of loads;
+// keep it and the run is bit-identical, which is what makes a recording reproducible.
+inline constexpr unsigned int harvest_rock_count_seed = 0x20260817u;
+
+// The count now varies PER CYCLE as well as per rank, so a rank does not bring the same
+// load forever: rank 1 might bring 2, then 5, then 3. It is still a pure function --
+// hashed from (rank, cycle, seed), not drawn from a stream -- for the same reason it
+// always was. Rank 0 has to be able to work out what rank 7 will bring on cycle 4
+// without being told, and a std::mt19937 would have to be advanced in the same order in
+// every process to manage that.
+//
+// CYCLE IS PART OF THE HASH, not an index into a sequence, so any cycle can be evaluated
+// directly. HarvestDropSlot needs exactly that: it sums every earlier cycle's load to
+// find where the wall has reached, and it must be able to do so from a standing start.
+inline int RocksPerRank(int rank_index, int cycle) {
+    if (g_rocks_per_rank_override > 0)
+        return g_rocks_per_rank_override;
+    // Integer hash (splitmix32 finalizer), not <random>: this has to give the same
+    // answer in every MPI process on every machine, and a std::mt19937 stream would
+    // have to be advanced in the same order everywhere to do that.
+    unsigned int x = 0x9E3779B9u * static_cast<unsigned int>((rank_index < 0 ? 0 : rank_index) + 1)
+                   + 0x85EBCA6Bu * static_cast<unsigned int>((cycle < 0 ? 0 : cycle) + 1)
+                   + harvest_rock_count_seed;
+    x ^= x >> 16;
+    x *= 0x7FEB352Du;
+    x ^= x >> 15;
+    x *= 0x846CA68Bu;
+    x ^= x >> 16;
+    constexpr unsigned int span = max_rocks_per_rank - min_rocks_per_rank + 1;
+    return min_rocks_per_rank + static_cast<int>(x % span);
+}
 
 // Harvest cycles. Each time a collector finishes a load and dumps it, its whole lane --
 // rock line, drop point, and the rocks it will fetch next -- steps counter-clockwise
@@ -118,11 +219,48 @@ inline constexpr int harvest_rocks_per_load = 2;
 // It was a flat 30 deg, which at 0.03 rad/slot is 17 slots -- a load of two rocks every
 // 17 slots leaves a wall that is 88% gaps, and puts every pile 15 m of arc from the
 // builder that is supposed to eat it.
-inline int HarvestDropSlot(int cycle) {
-    return builder_seed_rock_count + (cycle < 0 ? 0 : cycle) * harvest_rocks_per_load;
+//
+// Both take the rank, because a load is now 2-6 rocks depending on whose it is, and the
+// step is one slot per rock DELIVERED. A rank whose collector brings six rocks walks its
+// lane six slots per cycle; one that brings two walks two. Using a single site-wide load
+// size here would put the fast ranks' piles well ahead of the wall their builder has
+// actually reached.
+// The most any cycle can bring. Anything SIZED rather than placed has to use this and
+// not a particular cycle's draw -- a pool built for a 2-rock cycle overflows on a 6-rock
+// one, and the overflow is silent.
+inline int MaxRocksPerCycle() {
+    return g_rocks_per_rank_override > 0 ? g_rocks_per_rank_override : max_rocks_per_rank;
 }
-inline double HarvestLaneOffsetRad(int cycle) {
-    return HarvestDropSlot(cycle) * wall_slot_pitch_rad;
+
+inline int HarvestDropSlot(int rank_index, int cycle) {
+    // SUM of every earlier load, not cycle * a constant. The whole point of measuring the
+    // step in wall slots is that the pile lands where the builder's wall will actually
+    // have reached, and the wall has reached seed + (every rock delivered so far). With a
+    // per-cycle load size, multiplying by this cycle's draw would put a 6-rock rank's
+    // fourth pile 24 slots out when its wall is only at 14.
+    int slot = builder_seed_rock_count;
+    for (int c = 0; c < (cycle < 0 ? 0 : cycle); ++c)
+        slot += RocksPerRank(rank_index, c);
+    return slot;
+}
+
+// Where that load is actually PUT, as a slot number: the MIDDLE of the run of slots it
+// will be eaten over, not its first slot.
+//
+// This is the same rule BuilderPileCenter already uses for the seed heap, and for the
+// same reason -- the builder has to reach the pile from either end of the run. It only
+// became load-bearing when a load stopped being two rocks. A load is tipped out in one
+// place and the builder then creeps one slot per rock laid, so with L rocks the far end
+// of the run is (L-1) slots of lane away from the pile. Measured at L=6: the arm base
+// ended up 6.54 m from the drop point against a 5.2 m envelope, and the reach audit said
+// so at t=0 -- the builder would have parked at its slot and refused the pile beside it.
+// Centring halves that lever arm: +/-2.5 slots gives 4.70 m, inside the envelope, and it
+// also tightens the old L=2 case from 4.04 m to 3.94 m.
+inline double HarvestLoadCenterSlot(int rank_index, int cycle) {
+    return HarvestDropSlot(rank_index, cycle) + 0.5 * (RocksPerRank(rank_index, cycle) - 1);
+}
+inline double HarvestLaneOffsetRad(int rank_index, int cycle) {
+    return HarvestLoadCenterSlot(rank_index, cycle) * wall_slot_pitch_rad;
 }
 
 // Distance from the tractor's chassis origin BACK to the trailer's rear pour lip, along
@@ -217,7 +355,20 @@ inline constexpr double trailer_bed_floor_y = 2.0 * trailer_bed_half_y;
 inline constexpr double trailer_bed_center_y = 0.0;
 // Half-length along the trailer; the rear lip (-x) is the pour line and the tilt axis.
 inline constexpr double trailer_bed_half_x = 0.5 * trailer_bed_floor_x;
-inline constexpr double trailer_bed_wall_height = 0.15;
+// DOUBLED from 0.15. Rocks are aimed at the bed centre with a measured |rock-place| error
+// of 0.42-0.56 m against a 0.6 m half-width, and they arrive from a 0.47 m release height,
+// so a near-miss lands on the bed and then has to be KEPT there while the collector drives
+// a 358 m ring back to its builder. A 0.15 m wall is under one rock radius (~0.23 m rocks
+// at rock_mesh_scale 0.2) and is climbable by a rock that lands rolling.
+//
+// Nothing else needs adjusting for this: TrailerBedBoxes centres each wall at h/2 and
+// TrailerTailgateBox takes the same height, so the gate still closes the rear exactly, and
+// the sensor rank's visual-only copy of the bed is built from these same constants
+// (SynAgents.cpp). The bed's inertia picks up 4.6% (mass is a fixed 30 kg). Clearance for
+// the arm is unaffected -- release is 0.47 m above the floor, so 0.17 m still clears the
+// taller wall -- and the dump is unaffected because the load slides out over the REAR lip,
+// which is the gated end, not over a side wall.
+inline constexpr double trailer_bed_wall_height = 0.30;
 inline constexpr double trailer_bed_thickness = 0.03;
 
 // One box of the tub: full extents, and its centre in the owning body's own frame.
@@ -264,7 +415,7 @@ inline double RankRayAngleRad(int rank_index, int num_ranks) {
 // Angle of the COLLECTOR's lane on a given harvest cycle: the base ray, advanced by the
 // wall slots the builder will have laid by the time that load lands. See HarvestDropSlot.
 inline double HarvestLaneAngleRad(int rank_index, int num_ranks, int cycle) {
-    return RankRayAngleRad(rank_index, num_ranks) + HarvestLaneOffsetRad(cycle);
+    return RankRayAngleRad(rank_index, num_ranks) + HarvestLaneOffsetRad(rank_index, cycle);
 }
 
 inline chrono::ChVector3d PointOnSiteRay(int rank_index, int num_ranks, double radius) {
@@ -360,10 +511,12 @@ inline double BuilderOrbitHeadingRad(int builder_index, int num_builders) {
 // wall_slot_pitch_m / wall_slot_pitch_rad are declared with the harvest cycle above,
 // because the harvest lane is measured in these slots.
 
-// Where the seed heap sits: 3.5 m radially outboard of the arm base, mid-way through
-// the 2.78-4.44 m band the arm proved in service. Close to robot_start_radius (37.0) on
-// purpose -- the heap is standing in for a delivered load, so it should sit where one does.
-inline constexpr double builder_pile_radius = 36.6;
+// Where the seed heap sits: mid-way through the radial band the arm proved in service,
+// just inboard of the collector ring. It tracks robot_start_radius on purpose -- the heap
+// is standing in for a delivered load, so it has to sit where a real one does. Move one
+// and move the other, or the seed rocks become reachable when deliveries are not and the
+// builder lays its first few slots before discovering the geometry is wrong.
+inline constexpr double builder_pile_radius = 55.9;
 
 // The seed heap serves the first builder_seed_rock_count slots and is centred on the
 // middle of that run, so the builder reaches it from either end. The builder creeps
@@ -379,19 +532,28 @@ inline double BuilderArmLeadRad() {
     return std::atan2(builder_arm_mount_back_m, builder_path_radius);
 }
 
-// Total slots this builder may lay. No longer tied to how many heaps were laid out --
-// the feedstock is a stream now, not a fixed larder -- so this is purely the sector cap:
-// with N builders each owns 2*pi/N of lane, and 0.7 of it leaves room for the machine
-// itself (2.686 m wide) at either end. A rank's course must never run into the next
-// rank's sector.
+// Total slots this builder may lay. Deliberately NOT capped to the builder's own sector.
+//
+// There used to be a 0.7-of-sector cap here, so a rank's course could never run into the
+// next rank's, and two builders could not meet however badly either behaved. That is
+// safety by geometry, and it bought the guarantee at the price of the whole point of the
+// machine: with N builders each confined to 0.7 * 2*pi/N, the wall is 30% gaps by
+// construction and no run of any length ever closes it.
+//
+// The conveyor is the intended behaviour instead: builder n walks off the end of its own
+// sector, into the edge of builder n+1's, and carries on laying over what n+1 already
+// finished. Separation is then a CONTROL problem, not a geometric one, and it is handled
+// by min_builder_gap_m in builder_orbit_controller.py -- which is the only thing keeping
+// two builders apart and must be treated as such (it has to hold when a neighbour goes
+// silent, not wave the follower through).
+//
+// 200 slots is 100 m of lane, ~4.8 sectors at N=15. Not a full lap (628 slots at this
+// pitch and radius); it is simply more wall than any run of a plausible length finishes,
+// which is what "no cap" means in practice.
 inline int BuilderWallSlotCount(int num_builders) {
-    // Enough wall for a very long run; the cap below is what actually binds for N > 1.
     constexpr int desired = 200;
-    if (num_builders <= 1)
-        return desired;
-    const double sector_rad = chrono::CH_2PI / static_cast<double>(num_builders);
-    const int cap = static_cast<int>(0.7 * sector_rad / wall_slot_pitch_rad);
-    return std::max(builder_seed_rock_count, std::min(desired, cap));
+    (void)num_builders;
+    return desired;
 }
 
 // Ground position of wall slot k, z left at 0 for the caller to probe against terrain.
@@ -412,7 +574,7 @@ inline double BuilderStationAngleRad(int builder_index, int num_builders, int sl
 // at the slot's own angle, because the hull leads by arm_lead precisely so that this
 // cancels. Both the wall slot and the heap are placed relative to THIS point, not to the
 // hull, since it is the origin of the IK frame.
-inline constexpr double builder_arm_base_radius_approx = 33.0946;  // hypot(33, 2.5)
+inline constexpr double builder_arm_base_radius_approx = 53.0589;  // hypot(53, 2.5)
 
 // Centre of the seed heap serving slots [pile*P, pile*P + P), placed at the middle
 // of that run so it is never more than ~2.7 m of lane from the arm base working it.
@@ -429,5 +591,56 @@ inline chrono::ChVector3d BuilderPileCenter(int builder_index, int num_builders,
     return chrono::ChVector3d(site_center_x + builder_pile_radius * std::cos(angle),
                               site_center_y + builder_pile_radius * std::sin(angle), 0.0);
 }
+
+// ---------------------------------------------------------------------------
+// SCM active-domain sizing
+// ---------------------------------------------------------------------------
+//
+// An active domain does one job: it selects which grid nodes fire a ray this step.
+// Soil is only computed where a domain covers it, so a domain must cover its body's
+// contact footprint -- but every square metre it covers BEYOND that footprint is paid
+// for on every step of the run, forever, and at 2 cm spacing a square metre is 2500
+// nodes.
+//
+// The cost is not the ray. It is that each node's ray origin needs its current height,
+// and SCMLoader::GetHeight() resolves that through m_grid_map.find() -- one random hash
+// probe per node per step. m_grid_map holds every node ever deformed, so it GROWS: a
+// 13.7 h two-rover run at 2 cm went 52.8k -> 891k entries (5 MB -> 85 MB), and once it
+// outgrew L3 every probe became two DRAM round trips. Measured on that run: wall/sim
+// climbed 70 -> 120 cumulative, which for linear growth means the instantaneous rate
+// roughly tripled. 194k nodes/step x ~150 ns of added probe latency is ~29 ms/step,
+// and at a 5e-4 s step that is ~58 wall-seconds per simulated second of pure overhead.
+//
+// So domains are sized to the footprint plus a stated margin, and nothing more. The
+// margin only has to absorb geometry, not attitude: UpdateActiveDomain projects the
+// eight corners of the ROTATED OOBB and takes their axis-aligned hull, so pitch and
+// roll can only ever EXPAND the covered region. A box sized in the body frame cannot
+// uncover its own contact patch.
+
+// Rocks measure at most 0.263 x 0.284 x 0.227 m (read off a run's object manifest), so
+// 0.6 m square leaves >= 0.16 m of margin on the widest one.
+//
+// Was 1.0 x 1.0 x 1.0 centred (0, 0, 0.3). Unrotated that is 2500 nodes against 900;
+// under free rotation the projected hull is bounded by the box diagonal, so 7500 against
+// 2700. Twelve rock domains were 90k of the 194k nodes cast per step on one rank -- the
+// single largest term, larger than the eight wheels and the whole builder combined.
+//
+// The z extent is what reaches the soil, so it is kept only just deep enough: the box
+// spans 0.2 m below the rock reference frame, exactly as the 1 m cube did.
+inline const chrono::ChVector3d scm_rock_domain_dims(0.6, 0.6, 0.6);
+inline const chrono::ChVector3d scm_rock_domain_center(0.0, 0.0, 0.1);
+
+// Margin added around the measured track-shoe footprint when building a tracked vehicle's
+// running-gear domain. Shoe positions give only the track centre lines, so this must exceed
+// half an M113 single-pin shoe's width (~0.19 m); 0.35 m clears that with 0.16 m to spare
+// outboard and adds 0.7 m of run-out fore and aft. Measured result: 5.167 x 2.859 m, which
+// is 36933 nodes at 2 cm spacing against 84375 for the 7.5 x 4.5 m box it replaces, and
+// still wider than the vehicle's widest shape (2.686 m) so nothing is uncovered.
+inline constexpr double scm_track_domain_margin = 0.35;
+
+// How far a track domain reaches below and above the shoe loop. The domain only has to
+// contain the ray segments fired from the soil under it, and those span the surface by
+// SCM's own test offsets; 1 m each way is far more than either needs.
+inline constexpr double scm_track_domain_z_pad = 1.0;
 
 }  // namespace amd_uw
