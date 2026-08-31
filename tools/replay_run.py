@@ -682,7 +682,9 @@ def load(directory, ranks, t_from, t_to, fps, keep_all, max_frames,
     if fps <= 0.0:
         fps = rate or 60.0
     want = int((t1 - t0) * max(0.1, fps)) + 1
-    n = max(2, min(max_frames, want))
+    # No cap by default: poses stream from disk, so retaining every timeline instant only
+    # costs the eight-byte timestamp in `targets`, not a frame-by-body pose array.
+    n = max(2, want if max_frames is None else min(max_frames, want))
     if want > n:
         # Poses no longer sit in memory, so --max-frames is now only a cap on TIMELINE
         # RESOLUTION: how many distinct instants playback can land on. Raising it costs
@@ -1228,11 +1230,10 @@ def main():
     ap.add_argument("--speed", type=float, default=1.0, help="sim seconds per wall second")
     ap.add_argument("--from", dest="t_from", type=float)
     ap.add_argument("--to", dest="t_to", type=float)
-    ap.add_argument("--max-frames", type=int, default=3000,
-                    help="cap on frames held in memory, NOT a frame rate (default 3000). "
-                         "Every body's pose for every frame is resident, so a long "
-                         "run over the cap is resampled onto fewer frames and plays "
-                         "coarser than it was recorded; raise it to play every frame")
+    ap.add_argument("--max-frames", type=int, default=None,
+                    help="optional cap on timeline resolution (default: no cap, play every "
+                         "frame). Poses stream from disk, so this does not control pose "
+                         "memory; use it only to deliberately resample a long run")
     ap.add_argument("--no-running-gear", action="store_true",
                     help="drop track shoes, wheels, sprockets, idlers and suspension "
                          "(1905 of 3472 bodies in a 15-rank run) for frame rate")
