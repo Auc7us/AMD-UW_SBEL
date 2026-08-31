@@ -62,20 +62,96 @@ constexpr int max_grab_attempts = 3;
 // FETCH. How far past feedstock_reach_max a rock may lie and still be worth moving the
 // station for, and how far the station may be moved to get it.
 //
-// Deliveries do not land in the envelope. Measured on run_20260825_221818, every one of
-// the eight rocks the collectors delivered ended up outside it -- nearest 5.53 m against
-// a 5.0 m limit -- and the geometry says why: the drop point sits on the 37 m collector
-// ring while the arm base rides the 33 m builder orbit, so a load lands 4.5-5.1 m further
-// out AND 2.9-3.7 m along. The radial part is inside reach on its own; it is the arc that
-// pushes the total over. So take the arc out by sliding the station along to meet the
-// rock, which costs a short creep and touches no site geometry.
+// Deliveries do not land in the envelope, and it is the GEOMETRY that says why rather
+// than any particular set of radii: the drop point sits on the collector ring while the
+// arm base rides the builder orbit, so a load lands some way further OUT and some way
+// ALONG. The radial part is inside reach on its own; the arc is what pushes the total
+// over. So cancel the arc by sliding the station along to meet the rock, which costs a
+// short creep and touches no site geometry.
 //
-// 0.10 rad is 3.3 m of arc at this radius, enough to cancel the whole observed offset. It
-// is also safe for the wall: the slot the builder is here to fill sits about 2.74 m from
-// the arm base, and 3.3 m of arc puts it at sqrt(2.74^2 + 3.3^2) = 4.3 m, still inside the
-// 5.2 m the arm can actually solve for.
-constexpr double fetch_reach_margin = 2.5;      // m past feedstock_reach_max
-constexpr double station_fetch_max_rad = 0.10;  // rad
+// Two consequences, both of which have bitten:
+//
+// A SLIDE CAN ONLY CANCEL ARC. When a rock sits almost straight out from the arm base --
+// same bearing, just further from the site centre -- the best available slide is zero,
+// and sliding is simply not the fix. See the zero-slide guard where this is used: an
+// attempt that moves nothing must not be charged against the slot, or the builder spends
+// its single try accomplishing nothing and then waits forever. That is exactly what
+// stranded one builder for 875 s with ten rocks lying 0.09 m outside the envelope.
+//
+// THE LIMIT IS METRES OF ARC, NOT RADIANS. It used to be a radian constant tuned when the
+// orbit was smaller, and rescaling the site silently widened it -- the same angle went
+// from about 3.3 m of arc to about 5.3 m, far enough to swing the builder's own wall slot
+// out of reach behind it. Arc length stays honest when the radius changes; radians do not.
+constexpr double fetch_reach_margin = 2.5;         // m past feedstock_reach_max
+constexpr double station_fetch_max_arc_m = 3.3;    // m of arc along the builder orbit
+// Below this the slide is not worth taking and, more importantly, must not be counted as
+// the slot's one attempt.
+constexpr double station_fetch_min_arc_m = 0.05;
+
+// STARVED SLOT. How long a parked builder may hold a slot with nothing in reach before it
+// gives up on that slot and moves to the next.
+//
+// Slot skips are acceptable by design -- the wall is filled by whoever reaches it, and a
+// course with gaps is finished by a later pass -- whereas a builder frozen on one slot
+// fills nothing for the rest of the run. This is the backstop for everything the fetch
+// cannot fix. Two builders of run_20260829_060122 held their slots for 1065 s and 875 s
+// with feedstock 0.17 m and 0.09 m outside the envelope and no move available that would
+// have closed it. Long enough that a normal collector round trip never trips it.
+constexpr double starved_slot_timeout = 240.0;  // s
+
+// WHY A SLOT IS SKIPPED MATTERS, NOT JUST HOW LONG IT HAS WAITED.
+//
+// A bare timer cannot tell "the collector is out on a long haul and will be back" from
+// "the collector is never coming back", and those want opposite answers: the first should
+// wait however long it takes, the second should give up on the slot and keep building
+// with whatever is already in reach. starved_slot_timeout on its own gets the first case
+// wrong, skipping good slots simply because a harvest run was slow.
+//
+// So elapsed time is necessary but not sufficient. Past starved_slot_timeout, a slot is
+// released only when something says the wait is futile:
+//
+//   1. the collector has not MOVED in collector_stall_timeout -- crashed, stranded, or
+//      wedged, as rank 10 of run_20260830_073816 was for the last 300 s of its life;
+//   2. a delivery actually landed while this slot was starved and STILL nothing came into
+//      the 2.0-5.0 m window -- the collector is working fine and its drops are simply not
+//      reachable, which is builder 2 of that run, parked beside a rock at 1.67 m;
+//   3. starved_slot_backstop, the catch-all for a cause not enumerated here.
+//
+// A collector that is visibly driving and has not delivered yet matches none of these,
+// and the builder waits, which is the point.
+constexpr double collector_stall_timeout = 120.0;  // s without moving = not coming back
+constexpr double collector_stall_move_m = 1.0;     // m; under this is "has not moved"
+constexpr double starved_slot_backstop = 900.0;    // s
+
+// HULL THAT CANNOT LEAVE ITS SLOT = FAILED RUN.
+//
+// Skipping slots is normal and healthy; a builder that cannot physically drive is not.
+// The distinction is whether the hull is being TOLD to move: parked at a station waiting
+// on feedstock is the expected state and must never trip this, however long it lasts, so
+// the clock only runs while m_hull_parked is false -- that is, while the orbit controller
+// is actively driving this builder to its next station.
+//
+// Measured on the arm base rather than the hull: the bridge is not handed a hull pose, and
+// the arm is rigidly mounted, so its base moves with the machine. The same rigid mount is
+// what makes RosArmBridge's DRIFT check meaningful.
+constexpr double hull_stuck_timeout = 300.0;  // s commanded to drive, having not moved
+constexpr double hull_stuck_move_m = 0.5;     // m
+
+// COLLECTOR KEEP-OUT. Do not START a pick while this rank's collector is beside the arm.
+//
+// The arm swings a 2x-scaled boom through the space a rover parks in to pour, and it has
+// no idea the rover is there: on run_20260829_060122 a builder closed on a rock during
+// its own collector's drop and put the machine on its roof nine seconds later. Gating the
+// START is enough -- a cycle already in progress finishes, because aborting mid-grab
+// drops a carried rock, and between cycles the arm rests at LrvArm's stow pose, which is
+// folded in over its own hull rather than extended over the pour.
+//
+// The timeout matters as much as the radius. A collector that has STOPPED beside its
+// builder must not gate it for the rest of the run; that would re-create, from the other
+// side, the same deadlock starved_slot_timeout exists to break.
+constexpr double collector_keepout_m = 4.0;
+constexpr double collector_keepout_max_s = 45.0;
+constexpr double collector_gate_report_period = 15.0;
 
 // STRANDED FEEDSTOCK. How far past a rock the builder must be before that rock is deleted,
 // and where it goes.
@@ -594,7 +670,43 @@ void BuilderArmRosBridge::PublishBuildTopics(double time) {
     // ready=0 means "do not solve": the hull is still driving to station, the arm is
     // already working, the course is finished, or nothing is in reach. The x/y/z are
     // still sent so a stalled builder can be diagnosed from the topic instead of the log.
-    const int slot = ReadySlot();
+    int slot = ReadySlot();
+
+    // COLLECTOR KEEP-OUT. Hold the arm while this rank's rover is beside it -- see the
+    // constants block. Only the START is gated: a cycle already running finishes, and
+    // between cycles the arm is folded at LrvArm's stow pose rather than reaching out
+    // over the pour, so holding here leaves it somewhere safe by construction.
+    if (m_collector_probe) {
+        const auto gate_base = m_arm.GetIkFramePos();
+        double nearest = std::numeric_limits<double>::max();
+        for (const auto& pt : m_collector_probe())
+            nearest = std::min(nearest, (pt - gate_base).Length());
+        if (nearest <= collector_keepout_m) {
+            if (m_arm_gate_since < 0.0)
+                m_arm_gate_since = time;
+            const double held = time - m_arm_gate_since;
+            const bool release = held >= collector_keepout_max_s;
+            if (!release)
+                slot = -1;
+            if (time - m_last_gate_report >= collector_gate_report_period) {
+                m_last_gate_report = time;
+                if (release)
+                    RCLCPP_WARN(m_node->get_logger(),
+                                "t=%.2f collector has been %.2f m from the arm base for %.0f s; "
+                                "releasing the keep-out rather than let a machine that has "
+                                "stopped freeze this builder for the rest of the run.",
+                                time, nearest, held);
+                else
+                    RCLCPP_INFO(m_node->get_logger(),
+                                "t=%.2f holding the arm: collector %.2f m from the arm base "
+                                "(keep-out %.1f m), held %.0f s.",
+                                time, nearest, collector_keepout_m, held);
+            }
+        } else {
+            m_arm_gate_since = -1.0;
+        }
+    }
+
     const int slot_for_geometry = std::min(std::max(m_placed_count, 0),
                                            static_cast<int>(m_wall_slots.size()) - 1);
     std_msgs::msg::Float64MultiArray pick;
@@ -631,12 +743,72 @@ void BuilderArmRosBridge::PublishBuildTopics(double time) {
         m_unservable_since = -1.0;
     }
 
+    // Starvation belongs to the SLOT, not to the hull's instantaneous parked flag. A
+    // builder waiting on feedstock jitters in and out of parked -- builder 10 of
+    // run_20260830_073816 flipped a dozen times over the 270 s it sat on slot 11 -- and
+    // clearing the clock on each flip meant starved_slot_timeout below could never
+    // mature, in precisely the case it was written for. So the clock is reset by the two
+    // things that actually mean this slot is no longer starved: the slot advancing, or
+    // the arm getting hold of a rock. Not by the hull twitching.
+    if (m_starved_slot != m_placed_count) {
+        m_starved_slot = m_placed_count;
+        m_starved_since = -1.0;
+    }
+    if (m_arm.IsBusy() || m_selected)
+        m_starved_since = -1.0;
+
+    // Is this hull moving when it is being driven? Only while NOT parked: a builder
+    // holding station for feedstock is doing its job, not failing.
+    {
+        const auto here = m_arm.GetIkFramePos();
+        if (!m_hull_seen) {
+            m_hull_seen = true;
+            m_hull_last_pos = here;
+            m_hull_last_move = time;
+        } else if ((here - m_hull_last_pos).Length() >= hull_stuck_move_m) {
+            m_hull_last_pos = here;
+            m_hull_last_move = time;
+        }
+        if (m_hull_parked) {
+            m_hull_last_move = time;  // parked on purpose; the clock does not run
+        } else if (!m_hull_stuck && time - m_hull_last_move >= hull_stuck_timeout) {
+            m_hull_stuck = true;
+            RCLCPP_ERROR(m_node->get_logger(),
+                         "t=%.2f HULL STUCK: driven towards slot %d for %.0f s without moving "
+                         "%.2f m. This builder cannot leave its station, so the run has failed. "
+                         "(A builder merely WAITING on its collector never reaches here.)",
+                         time, m_placed_count, time - m_hull_last_move, hull_stuck_move_m);
+        }
+    }
+
+    // Is this rank's collector moving? Distinguishes a long haul from a dead machine.
+    if (m_collector_probe) {
+        const auto pts = m_collector_probe();
+        if (!pts.empty()) {
+            if (!m_collector_seen) {
+                m_collector_seen = true;
+                m_collector_last_pos = pts.front();
+                m_collector_last_move = time;
+            } else if ((pts.front() - m_collector_last_pos).Length() >= collector_stall_move_m) {
+                m_collector_last_pos = pts.front();
+                m_collector_last_move = time;
+            }
+        }
+    }
+
     // Parked, still owing the wall a rock, and nothing in reach: the builder is waiting
     // on its collector. Normal between loads, fatal if it never ends, so it is reported
     // rather than left to be inferred from a wall that stopped growing.
     if (m_hull_parked && !m_arm.IsBusy() && !m_selected && !BuildComplete()) {
-        if (m_starved_since < 0.0)
+        if (m_starved_since < 0.0) {
             m_starved_since = time;
+            // Baseline for "a load arrived and still did not help". Counted at the
+            // instant the wait starts, so a later rise means a real delivery landed.
+            m_spare_at_starve = 0;
+            for (const auto& rock : m_feedstock)
+                if (rock && !m_consumed.count(rock.get()))
+                    ++m_spare_at_starve;
+        }
         if (time - m_last_starved_report >= starved_report_period) {
             m_last_starved_report = time;
             size_t spare = 0;
@@ -693,19 +865,75 @@ void BuilderArmRosBridge::PublishBuildTopics(double time) {
                     delta -= chrono::CH_2PI;
                 while (delta < -chrono::CH_PI)
                     delta += chrono::CH_2PI;
-                m_station_fetch_offset =
-                    std::clamp(delta, -station_fetch_max_rad, station_fetch_max_rad);
-                m_fetch_offset_slot = m_placed_count;
-                RCLCPP_INFO(m_node->get_logger(),
-                            "t=%.2f fetching: rock at %.2f m is %.2f m past the %.1f m limit; "
-                            "sliding the station %+.1f deg (%.2f m of arc) to reach it.",
-                            time, best_d, best_d - feedstock_reach_max, feedstock_reach_max,
-                            m_station_fetch_offset * 180.0 / chrono::CH_PI,
-                            m_station_fetch_offset * arm_base.Length());
+                // Clamp in ARC, not angle, so the limit keeps its meaning if the site is
+                // ever rescaled again.
+                const double base_radius = std::hypot(arm_base.x() - site_center_x,
+                                                      arm_base.y() - site_center_y);
+                const double want = std::clamp(delta,
+                                               -station_fetch_max_arc_m / std::max(1.0, base_radius),
+                                               station_fetch_max_arc_m / std::max(1.0, base_radius));
+                const double arc = std::abs(want) * base_radius;
+                if (arc < station_fetch_min_arc_m) {
+                    // Purely radial miss. Sliding along the orbit cannot close it, so this
+                    // does NOT count as the slot's attempt -- leaving m_fetch_offset_slot
+                    // alone lets a later delivery that IS offset along the arc still be
+                    // fetched. If none ever is, starved_slot_timeout releases the slot.
+                    // Rate-limited: this branch is re-evaluated every step, and the rock
+                    // is not moving, so the verdict is the same until a delivery changes
+                    // it. Unthrottled it produced 955 identical lines in 62 s of sim.
+                    if (time - m_last_zero_slide_report >= starved_report_period) {
+                        m_last_zero_slide_report = time;
+                        RCLCPP_INFO(m_node->get_logger(),
+                                    "t=%.2f rock at %.2f m is %.2f m past the %.1f m limit but lies "
+                                    "almost straight out (%.3f m of arc to gain); sliding cannot "
+                                    "reach it, so the slot keeps its fetch.",
+                                    time, best_d, best_d - feedstock_reach_max, feedstock_reach_max, arc);
+                    }
+                } else {
+                    m_station_fetch_offset = want;
+                    m_fetch_offset_slot = m_placed_count;
+                    RCLCPP_INFO(m_node->get_logger(),
+                                "t=%.2f fetching: rock at %.2f m is %.2f m past the %.1f m limit; "
+                                "sliding the station %+.1f deg (%.2f m of arc) to reach it.",
+                                time, best_d, best_d - feedstock_reach_max, feedstock_reach_max,
+                                m_station_fetch_offset * 180.0 / chrono::CH_PI, arc);
+                }
             }
         }
-    } else {
-        m_starved_since = -1.0;
+
+        // Nothing has come into reach for a long time and no slide is going to change
+        // that: abandon the slot and move on. See starved_slot_timeout.
+        if (m_starved_since >= 0.0 && time - m_starved_since >= starved_slot_timeout
+            && !BuildComplete()) {
+            // How many unconsumed rocks this builder knows about right now. A rise since
+            // starvation began means a delivery landed and still did not reach us.
+            size_t spare_now = 0;
+            for (const auto& rock : m_feedstock)
+                if (rock && !m_consumed.count(rock.get()))
+                    ++spare_now;
+
+            const bool collector_stalled =
+                m_collector_seen && time - m_collector_last_move >= collector_stall_timeout;
+            const bool delivery_missed = spare_now > m_spare_at_starve;
+            const bool backstop = time - m_starved_since >= starved_slot_backstop;
+
+            if (collector_stalled || delivery_missed || backstop) {
+                RCLCPP_WARN(m_node->get_logger(),
+                            "t=%.2f slot %d has had nothing within %.1f-%.1f m of the arm base "
+                            "for %.0f s and %s; abandoning it and moving to slot %d. The wall "
+                            "keeps the gap.",
+                            time, m_placed_count, feedstock_reach_min, feedstock_reach_max,
+                            time - m_starved_since,
+                            collector_stalled ? "its collector has stopped moving"
+                            : delivery_missed ? "a load arrived and still landed out of reach"
+                                              : "the backstop expired",
+                            m_placed_count + 1);
+                m_placed_count += 1;
+                m_starved_since = -1.0;
+                m_fetch_offset_slot = -1;
+                m_station_fetch_offset = 0.0;
+            }
+        }
     }
 
     std_msgs::msg::Float64MultiArray place;

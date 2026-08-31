@@ -73,7 +73,22 @@ inline constexpr double site_center_y = 0.0;
 //     python3 tools/make_graded_pad.py --pad-radius 65 --taper-radius 130
 inline constexpr double work_circle_radius = 50.0;
 inline constexpr double builder_path_radius = 53.0;
-inline constexpr double robot_start_radius = 57.0;
+
+// The collector ring: where a rover parks, and therefore where its load lands.
+//
+// The gap between this and builder_path_radius is what a builder's arm has to span to
+// reach a delivered pile, and it was set half a metre too wide. Measured over a 1500 s
+// 15-robot run, EVERY delivery the builders had to fetch for landed outside the arm's
+// envelope -- 66 of them, 0.01 to 1.27 m past the limit, median 0.18 m. The radial part
+// of that overshoot is this constant; the rest is arc, which the station fetch cancels.
+//
+// Pulling the ring in 0.5 m puts 58 of those 66 inside the envelope without the fetch
+// having to run at all. It is safe on clearance: over the same run the closest a
+// collector body ever came to a builder body was 2.22-2.38 m on every rank that was not
+// already in a collision, so 0.5 m leaves about 1.8 m of margin. Do not take much more
+// than this without re-measuring -- the margin is what keeps the two machines apart while
+// one is pouring beside the other.
+inline constexpr double robot_start_radius = 56.3;
 
 // Where the rover is PLACED at t=0, which is deliberately NOT its drop point.
 //
@@ -496,10 +511,12 @@ inline double BuilderOrbitHeadingRad(int builder_index, int num_builders) {
 // wall_slot_pitch_m / wall_slot_pitch_rad are declared with the harvest cycle above,
 // because the harvest lane is measured in these slots.
 
-// Where the seed heap sits: 3.5 m radially outboard of the arm base, mid-way through
-// the 2.78-4.44 m band the arm proved in service. Close to robot_start_radius (37.0) on
-// purpose -- the heap is standing in for a delivered load, so it should sit where one does.
-inline constexpr double builder_pile_radius = 56.6;
+// Where the seed heap sits: mid-way through the radial band the arm proved in service,
+// just inboard of the collector ring. It tracks robot_start_radius on purpose -- the heap
+// is standing in for a delivered load, so it has to sit where a real one does. Move one
+// and move the other, or the seed rocks become reachable when deliveries are not and the
+// builder lays its first few slots before discovering the geometry is wrong.
+inline constexpr double builder_pile_radius = 55.9;
 
 // The seed heap serves the first builder_seed_rock_count slots and is centred on the
 // middle of that run, so the builder reaches it from either end. The builder creeps
@@ -515,19 +532,28 @@ inline double BuilderArmLeadRad() {
     return std::atan2(builder_arm_mount_back_m, builder_path_radius);
 }
 
-// Total slots this builder may lay. No longer tied to how many heaps were laid out --
-// the feedstock is a stream now, not a fixed larder -- so this is purely the sector cap:
-// with N builders each owns 2*pi/N of lane, and 0.7 of it leaves room for the machine
-// itself (2.686 m wide) at either end. A rank's course must never run into the next
-// rank's sector.
+// Total slots this builder may lay. Deliberately NOT capped to the builder's own sector.
+//
+// There used to be a 0.7-of-sector cap here, so a rank's course could never run into the
+// next rank's, and two builders could not meet however badly either behaved. That is
+// safety by geometry, and it bought the guarantee at the price of the whole point of the
+// machine: with N builders each confined to 0.7 * 2*pi/N, the wall is 30% gaps by
+// construction and no run of any length ever closes it.
+//
+// The conveyor is the intended behaviour instead: builder n walks off the end of its own
+// sector, into the edge of builder n+1's, and carries on laying over what n+1 already
+// finished. Separation is then a CONTROL problem, not a geometric one, and it is handled
+// by min_builder_gap_m in builder_orbit_controller.py -- which is the only thing keeping
+// two builders apart and must be treated as such (it has to hold when a neighbour goes
+// silent, not wave the follower through).
+//
+// 200 slots is 100 m of lane, ~4.8 sectors at N=15. Not a full lap (628 slots at this
+// pitch and radius); it is simply more wall than any run of a plausible length finishes,
+// which is what "no cap" means in practice.
 inline int BuilderWallSlotCount(int num_builders) {
-    // Enough wall for a very long run; the cap below is what actually binds for N > 1.
     constexpr int desired = 200;
-    if (num_builders <= 1)
-        return desired;
-    const double sector_rad = chrono::CH_2PI / static_cast<double>(num_builders);
-    const int cap = static_cast<int>(0.7 * sector_rad / wall_slot_pitch_rad);
-    return std::max(builder_seed_rock_count, std::min(desired, cap));
+    (void)num_builders;
+    return desired;
 }
 
 // Ground position of wall slot k, z left at 0 for the caller to probe against terrain.

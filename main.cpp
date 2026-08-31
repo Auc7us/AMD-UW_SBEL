@@ -100,7 +100,19 @@ double scm_record_rate_hz = 10.0;
 // no flag in the format: heights are absolute and a consumer accumulates by overwrite, so
 // a full re-statement is idempotent with the diffs around it -- it just lets a consumer
 // seek, or survive a dropped frame, without replaying from t=0.
-const double scm_keyframe_period = 5.0;
+//
+// THIS, NOT scm_record_rate_hz, IS WHAT THE FILE SIZE IS MADE OF. A keyframe re-states
+// every node touched since the run began, so each one is bigger than the last, and the
+// file grows with the SQUARE of run length. Measured on rank 12 of a 1500 s 15-robot run:
+// 300 keyframes carried 666.4 M of the 670.5 M node rows -- 99.4% -- while all 1200 delta
+// frames together came to 4.0 M rows, about 48 MB. The last keyframe alone was 50 MB.
+// Turning the sample rate down does nothing; it shrinks the 0.6%.
+//
+// At 5 s that projected to ~520 GiB site-wide for a 6000 s run, against 306 GB of disk.
+// 60 s keeps a recovery point every minute -- ample for a consumer that seeks or drops a
+// sample -- and costs a twelfth of the bytes. A consumer accumulating from t=0, which is
+// what the replay tools do, discards these rows as redundant anyway.
+const double scm_keyframe_period = 60.0;
 
 const double terrain_resolution_scale = 4.0;
 const double terrain_pixels_x = 256.0;
@@ -980,6 +992,14 @@ void AddCommandLineOptions(ChCLI& cli) {
                           "Metres between successive rocks on a rank's line (default 30)", "30.0");
     cli.AddOption<int>("Diagnostics", "rocks_per_rank",
                        "Pin every rank's rock line to this many rocks (0 = the default per-rank 2-6)", "0");
+    // GLOBAL rock size. Multiplies every harvest and wall rock; the per-variant
+    // normalisation in RockField.cpp is applied on top and only equalises the three OBJs
+    // against each other. Exposed because rock size against the vehicles' 0.41 m wheel
+    // clearance is the parameter most worth sweeping after a jackknife, and rebuilding
+    // to try 0.18 is a poor way to spend twenty minutes. It was already written into the
+    // recording metadata; only the flag was missing.
+    cli.AddOption<double>("Diagnostics", "rock_mesh_scale",
+                          "Scale applied to every rock mesh (default 0.2)", "0.2");
 
     // Absolute-pose capture for offline re-rendering. ON BY DEFAULT: a run nobody can
     // re-render afterwards is a run that has to be repeated, and at this terrain size a
@@ -1034,6 +1054,8 @@ int main(int argc, char* argv[]) {
     const int solver_iterations = cli.GetAsType<int>("solver_iterations");
     rock_field_config.first_distance = cli.GetAsType<double>("rock_first_distance");
     rock_field_config.distance_step = cli.GetAsType<double>("rock_distance_step");
+    // Before the wall-rock meshes are built at wall_rock_scale, which reads this.
+    rock_field_config.mesh_scale = cli.GetAsType<double>("rock_mesh_scale");
     // Before ANY layout query: RocksPerRank feeds the harvest lane angle, the drop slot
     // and the zombie pool size, so an override applied later would leave the geometry
     // already computed from the un-overridden count.
@@ -1507,6 +1529,17 @@ int main(int argc, char* argv[]) {
         if (robot) {
             RobotRig* rig = robot.get();
             builder->SetDeliveredRockSource([rig]() { return rig->GetDeliveredRocks(); });
+            // Where the arm must not swing: the rover's own chassis and its trailer bed.
+            // Both, not just the chassis -- the bed is the part that ends up under the
+            // arm during a pour, and it is the one that got hit.
+            builder->SetCollectorProbe([rig]() {
+                std::vector<ChVector3d> pts;
+                if (auto* veh = rig->GetVehicle())
+                    pts.push_back(veh->GetChassisBody()->GetPos());
+                if (auto bed = rig->GetTrailerBed())
+                    pts.push_back(bed->GetPos());
+                return pts;
+            });
         }
     }
 
@@ -1889,6 +1922,20 @@ int main(int argc, char* argv[]) {
                 std::cout << "[main] rank " << rank << " has diverged at t=" << time
                           << "; aborting the job. See the [RobotRig] DIVERGING/DIVERGED report above for the "
                              "body and the link reactions that caused it.\n";
+                std::cout.flush();
+                MPI_Abort(MPI_COMM_WORLD, 1);
+            }
+
+            // A builder that cannot physically leave its station is a failed run, for the
+            // same reason a divergence is: nothing downstream gets better by continuing,
+            // and every other rank is spending wall clock in lockstep with it. Distinct
+            // from a builder SKIPPING slots, which is healthy and expected -- see the
+            // block comment on hull_stuck_timeout in BuilderArmRosBridge.cpp. The bridge
+            // has already printed which slot and for how long.
+            if (builder && builder->HullStuck()) {
+                std::cout << "[main] rank " << rank << " builder cannot leave its station at t="
+                          << time << "; aborting the job. See the [chrono_builder_*_arm] HULL "
+                             "STUCK report above.\n";
                 std::cout.flush();
                 MPI_Abort(MPI_COMM_WORLD, 1);
             }

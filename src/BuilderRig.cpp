@@ -419,6 +419,23 @@ void BuilderRig::SetDeliveredRockSource(
 #endif
 }
 
+void BuilderRig::SetCollectorProbe(std::function<std::vector<chrono::ChVector3d>()> probe) {
+#ifdef AMD_UW_ENABLE_ROS2
+    if (m_arm_ros_bridge)
+        m_arm_ros_bridge->SetCollectorProbe(std::move(probe));
+#else
+    (void)probe;
+#endif
+}
+
+bool BuilderRig::HullStuck() const {
+#ifdef AMD_UW_ENABLE_ROS2
+    return m_arm_ros_bridge && m_arm_ros_bridge->HullStuck();
+#else
+    return false;
+#endif
+}
+
 void BuilderRig::SetStationAngle(double angle_rad) {
 #ifdef AMD_UW_ENABLE_ROS2
     // The arm bridge gets to slide the station along its lane when it is starved and a

@@ -26,6 +26,47 @@ void NormalizeRockMeshOnGround(std::shared_ptr<chrono::ChTriangleMeshConnected> 
     mesh->Transform(chrono::ChVector3d(-center_x, -center_y, -bbox.min.z()), chrono::ChMatrix33<>(1.0));
 }
 
+// rock2 is TALLER than the other two, and height is the dimension that strands vehicles.
+//
+// LoadRockMesh rotates every mesh by QuatFromAngleX(PI/2), so the OBJ's y-extent becomes
+// world height. Source bounding boxes, and the height each yields at the harvest scale
+// of 0.2:
+//
+//   rock1   1.219 x 0.647 x 1.217   ->  0.129 m tall   (reference)
+//   rock2   1.137 x 1.137 x 1.421   ->  0.227 m tall   1.76x rock1
+//   rock3   1.315 x 0.779 x 1.330   ->  0.156 m tall   1.21x rock1
+//
+// The failure this fixes is not a collision between machines. A rover drives ONTO rock2 --
+// round enough to climb, tall enough to lift a wheel pair -- and ends up sitting on it,
+// wedged underneath, in a pose that reads as a jackknife but is not one. It cost rank 10
+// of run_20260830_073816 the whole run, and it appeared in the earlier 1500 s run too. It
+// is specific to rock2: nothing else in the field is tall enough to do it.
+//
+// DO NOT SHRINK THIS FURTHER WITHOUT CHECKING WHEEL CONTACT FORCES. Full height parity
+// with rock1 is 0.569, and it was tried: run_20260830_220549 raised trailer wheel force
+// spikes from a mean of 2.2-2.5 kN, never once above 10 kN across 2600 s of earlier runs,
+// to a mean of 24.8 kN with 42% above 10 kN and a peak of 100 kN -- 900x the settled load
+// on a wheel whose rock had shrunk enough to wedge between tyre and regolith instead of
+// being shouldered aside. Rank 11 diverged out on the harvest lane at t=358.
+//
+// 0.85 is a compromise, not a derived optimum: enough to take the height from 0.227 m to
+// 0.193 m and stop the climb-and-strand, close enough to the proven-safe 1.0 to stay out
+// of the degenerate-contact regime. The leading indicator is the force spike statistic,
+// not the eventual divergence -- check mean and max spike magnitude early in a run.
+//
+// rock3 is deliberately left alone at 1.0: 1.21x is within the natural size spread the
+// field is supposed to have, and it has never stranded anything.
+//
+// This lives here rather than at the call sites because BOTH the visual mesh and the
+// collision hull pass through this one function, and rockN.obj / rockN_hull.obj carry
+// identical bounding boxes -- so it is the only place the two cannot silently drift
+// apart. The substring match covers both spellings.
+double RockVariantScale(const std::string& filename) {
+    if (filename.find("rock2") != std::string::npos)
+        return 0.85;  // 0.227 m -> 0.193 m tall. See the block comment before going lower.
+    return 1.0;
+}
+
 }  // namespace
 
 std::shared_ptr<chrono::ChTriangleMeshConnected> LoadRockMesh(const std::string& filename,
@@ -35,7 +76,8 @@ std::shared_ptr<chrono::ChTriangleMeshConnected> LoadRockMesh(const std::string&
     if (!mesh)
         throw std::runtime_error("Failed to load rock mesh: " + filename);
 
-    mesh->Transform(chrono::ChVector3d(0, 0, 0), chrono::ChMatrix33<>(mesh_scale));
+    mesh->Transform(chrono::ChVector3d(0, 0, 0),
+                    chrono::ChMatrix33<>(mesh_scale * RockVariantScale(filename)));
     mesh->Transform(chrono::ChVector3d(0, 0, 0), chrono::ChMatrix33<>(chrono::QuatFromAngleX(chrono::CH_PI_2)));
     mesh->RepairDuplicateVertices(1e-9);
     NormalizeRockMeshOnGround(mesh);

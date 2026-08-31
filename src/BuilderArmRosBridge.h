@@ -70,6 +70,13 @@ class BuilderArmRosBridge {
     using DeliveredRockSource = std::function<std::vector<std::shared_ptr<chrono::ChBodyAuxRef>>()>;
     void SetDeliveredRockSource(DeliveredRockSource source) { m_delivered_source = std::move(source); }
 
+    // Points on this rank's collector that the arm must not swing into: its chassis and
+    // its trailer bed. Supplied as a probe rather than a pointer because the bridge has
+    // no business owning the rover, and because a rank without a collector simply leaves
+    // it unset and gates on nothing.
+    using CollectorProbe = std::function<std::vector<chrono::ChVector3d>()>;
+    void SetCollectorProbe(CollectorProbe probe) { m_collector_probe = std::move(probe); }
+
     // apply_commands=false spins the executor and publishes state but DISCARDS any
     // command, so the arm holds its pose. Used during the builder's settle window: a
     // 2x-scaled arm slewing a 4.7 rad swing while the hull is still finding equilibrium
@@ -93,6 +100,11 @@ class BuilderArmRosBridge {
     // starved with a near miss on the ground. See the starved branch of PublishBuildTopics.
     double GetStationFetchOffset() const { return m_station_fetch_offset; }
     bool BuildComplete() const { return m_placed_count >= static_cast<int>(m_wall_slots.size()); }
+
+    // True once this builder has been driven for hull_stuck_timeout without moving: it
+    // cannot leave its slot, and the run is over. Skipping slots is NOT this -- see the
+    // block comment on hull_stuck_timeout for the distinction.
+    bool HullStuck() const { return m_hull_stuck; }
 
   private:
     struct DirectCommand {
@@ -158,9 +170,34 @@ class BuilderArmRosBridge {
     bool m_reported_complete = false;
     // Diagnostics for a builder that is parked with nothing in reach.
     double m_starved_since = -1.0;
+    // Which slot m_starved_since belongs to. Starvation is a property of the SLOT, not
+    // of the hull's instantaneous parked flag -- see the reset in Advance().
+    int m_starved_slot = -1;
+    // Collector movement, so a slot is released because the wait is futile rather than
+    // merely long. See collector_stall_timeout.
+    chrono::ChVector3d m_collector_last_pos;
+    double m_collector_last_move = -1.0;
+    bool m_collector_seen = false;
+    // Reachable-rock count when this slot's starvation began, to notice a delivery that
+    // landed and still did not help. See starved_slot_backstop's block comment, case 2.
+    size_t m_spare_at_starve = 0;
+    // Hull movement while it is being driven. See hull_stuck_timeout.
+    chrono::ChVector3d m_hull_last_pos;
+    double m_hull_last_move = -1.0;
+    bool m_hull_seen = false;
+    bool m_hull_stuck = false;
+    // Last time the zero-slide guard reported. Without it the guard re-decides and
+    // re-logs every step: one builder emitted 955 identical lines in 62 s of sim.
+    double m_last_zero_slide_report = -1.0e9;
     // When the builder first found itself parked unable to reach its own wall slot.
     // See unservable_slot_timeout.
     double m_unservable_since = -1.0;
+
+    // Collector keep-out: when the gate first closed, so a collector that has STOPPED
+    // beside the builder cannot hold the gate shut for the rest of the run.
+    CollectorProbe m_collector_probe;
+    double m_arm_gate_since = -1.0;
+    double m_last_gate_report = -1.0;
     double m_last_starved_report = -1.0e9;
 
     rclcpp::Node::SharedPtr m_node;
