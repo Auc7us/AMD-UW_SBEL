@@ -6,6 +6,9 @@ scrubbable, orbitable, and optionally written straight to a movie. No Blender, n
 step, no scene to maintain -- the recording's object manifest names every mesh file and
 its local frame, so the scene builds itself from the run.
 
+This is the standalone high-throughput version: dynamic bodies use GPU instancing, SCM
+ranks decode concurrently, and deformation meshes upload in dirty chunks.
+
     replay_run.py <dir>                       interactive window, real time
     replay_run.py <dir> --speed 4             4x
     replay_run.py <dir> --rank 1,2 --to 240   one sector, first 4 minutes
@@ -36,7 +39,8 @@ import time
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from read_trajectory import Recording, discover_ranks, index_frames, read_frame  # noqa: E402
+from read_trajectory import (Recording, discover_ranks, index_frames,  # noqa: E402
+                             FRAME_HEADER, FRAME_MAGIC)
 
 # Running gear: track shoes and their lugs, road wheels, sprockets, idlers, suspension
 # arms, wheel spindles. Drawn by DEFAULT -- the tracks are most of what a tracked machine
@@ -418,38 +422,229 @@ SCM_FILE_MAGIC = b"AMDUWSCM"
 SCM_FRAME_MAGIC = 0x4D435353
 
 
-def read_scm(path):
-    """Deformed SCM grid nodes: (delta, plane, nx, ny, [(time, i[], j[], z[])]).
+NODE_DT = np.dtype([("i", "<i4"), ("j", "<i4"), ("z", "<f4")])
+assert NODE_DT.itemsize == SCM_NODE.size
 
-    One frame per sample, carrying only the nodes modified since the last one, with
-    ABSOLUTE heights -- so a consumer accumulates, and a dropped frame leaves the ground
-    slightly stale rather than permanently wrong. Node (i,j) sits at (i*delta, j*delta) in
-    the patch plane frame, which is what makes the indices meaningful.
+
+def scm_index(path, chunk=16_000_000):
+    """Header, per-frame offsets, and the node SET this rank ever deformed -- one pass,
+    holding neither the file nor its rows.
+
+    The original read_scm read the whole file, upcast every (i4, i4, f4) row to
+    (i8, i8, f8), and handed scm_sources a list it then np.unique'd across a concatenation
+    of every frame's i and j. On rank 12 of a 1500 s 15-robot run -- 8.0 GB of node
+    records, 670 M rows -- that peaks near 43 GB for that ONE rank of fifteen, which is
+    why a full-site replay could not load on a 64 GB box.
+
+    Uniques are folded in bounded chunks instead, so the transient never exceeds `chunk`
+    keys (128 MB at the default) and only the offsets and the node set outlive the pass.
     """
-    buf = open(path, "rb").read()
-    if len(buf) < SCM_HEADER.size:
-        raise ValueError(f"{path}: shorter than its header")
-    fields = SCM_HEADER.unpack_from(buf, 0)
-    magic, _version, _rank, rate, delta = fields[0], fields[1], fields[2], fields[3], fields[4]
-    plane, nx, ny = fields[5:12], fields[12], fields[13]
-    if magic != SCM_FILE_MAGIC:
-        raise ValueError(f"{path}: bad magic {magic!r}")
-    off = SCM_HEADER.size
-    frames = []
-    while off + SCM_FRAME.size <= len(buf):
-        fmagic, time, count = SCM_FRAME.unpack_from(buf, off)
-        if fmagic != SCM_FRAME_MAGIC:
-            raise ValueError(f"{path}: lost frame sync at offset {off}")
-        off += SCM_FRAME.size
-        need = SCM_NODE.size * count
-        if off + need > len(buf):
-            break  # truncated final sample
-        chunk = np.frombuffer(buf, dtype=np.dtype([("i", "<i4"), ("j", "<i4"), ("z", "<f4")]),
-                              count=count, offset=off)
-        frames.append((time, chunk["i"].astype(np.int64), chunk["j"].astype(np.int64),
-                       chunk["z"].astype(np.float64)))
-        off += need
-    return delta, plane, nx, ny, rate, frames
+    with open(path, "rb") as f:
+        head = f.read(SCM_HEADER.size)
+        if len(head) < SCM_HEADER.size:
+            raise ValueError(f"{path}: shorter than its header")
+        fields = SCM_HEADER.unpack(head)
+        magic, rate, delta = fields[0], fields[3], fields[4]
+        plane, nx, ny = fields[5:12], fields[12], fields[13]
+        if magic != SCM_FILE_MAGIC:
+            raise ValueError(f"{path}: bad magic {magic!r}")
+        offsets, times, counts = [], [], []
+        running = np.empty(0, dtype=np.int64)
+        pending, buffered = [], 0
+        while True:
+            fh = f.read(SCM_FRAME.size)
+            if len(fh) < SCM_FRAME.size:
+                break
+            fmagic, t, count = SCM_FRAME.unpack(fh)
+            if fmagic != SCM_FRAME_MAGIC:
+                raise ValueError(f"{path}: lost frame sync at offset "
+                                 f"{f.tell() - SCM_FRAME.size}")
+            need = NODE_DT.itemsize * count
+            here = f.tell()
+            data = f.read(need)
+            if len(data) < need:
+                break  # truncated final sample, as read_scm did
+            offsets.append(here)
+            times.append(t)
+            counts.append(count)
+            if count:
+                a = np.frombuffer(data, dtype=NODE_DT, count=count)
+                pending.append(pack_nodes(a["i"], a["j"]))
+                buffered += count
+                if buffered >= chunk:
+                    running = np.unique(np.concatenate([running] + pending))
+                    pending, buffered = [], 0
+        if pending:
+            running = np.unique(np.concatenate([running] + pending))
+    return (delta, plane, nx, ny, rate,
+            np.array(offsets, dtype=np.int64), np.array(times, dtype=np.float64),
+            np.array(counts, dtype=np.int64), running)
+
+
+class ScmStream:
+    """Forward-only reader over one rank_*_scm.bin, compressing as it is read.
+
+    This carries what compress_frames used to precompute for the whole run. The recorder
+    republishes every touched node in a keyframe every 5 s -- its recovery mechanism, and
+    56.6% of all rows on a measured 16-rank run, not one of which changes a height. A row
+    is worth drawing iff it differs from the last height written to that node, which is
+    one comparison per row and keeps nothing but `last`.
+
+    Rewinding is reset(). apply_scm already replays from t=0 on a backward seek, so the
+    semantics are unchanged; it now re-reads from disk instead of re-walking a list.
+    """
+
+    def __init__(self, path, offsets, times, counts, ukey):
+        self.path = path
+        self.offsets, self.times, self.counts, self.ukey = offsets, times, counts, ukey
+        self.f = open(path, "rb")
+        self.cursor = 0
+        self.last = np.full(len(ukey), np.nan, dtype=np.float32)
+
+    def close(self):
+        try:
+            self.f.close()
+        except OSError:
+            pass
+
+    def reset(self):
+        self.cursor = 0
+        self.last[:] = np.nan
+
+    def __len__(self):
+        return len(self.offsets)
+
+    def has_next(self):
+        return self.cursor < len(self.offsets)
+
+    def peek_time(self):
+        return float(self.times[self.cursor])
+
+    def next(self):
+        k = self.cursor
+        self.cursor += 1
+        t, count = float(self.times[k]), int(self.counts[k])
+        if not count:
+            return t, np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float32)
+        self.f.seek(int(self.offsets[k]))
+        raw = self.f.read(NODE_DT.itemsize * count)
+        if len(raw) < NODE_DT.itemsize * count:
+            return t, np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float32)
+        a = np.frombuffer(raw, dtype=NODE_DT, count=count)
+        nid = np.searchsorted(self.ukey, pack_nodes(a["i"], a["j"]))
+        z = a["z"]
+        changed = self.last[nid] != z
+        self.last[nid] = z
+        return t, nid[changed], z[changed]
+
+
+# One body record on disk is RECORD = "<I7f" -- packed, 32 bytes. Reading a frame as a
+# structured array instead of a Python loop is most of why this file exists:
+# read_trajectory.read_frame unpacks one body at a time into a dict, which is 224
+# iterations per frame per rank, or 151 million of them on a 15-rank 45 000-frame run.
+FRAME_REC = np.dtype([("idx", "<u4"), ("pose", "<f4", 7)])
+assert FRAME_REC.itemsize == 32
+
+
+def read_frame_np(f, offset):
+    """(time, structured array of (idx, pose)) for the frame at `offset`, or None.
+
+    Same bytes as read_trajectory.read_frame, one np.frombuffer instead of a Python loop.
+    A truncated tail returns None rather than raising, matching the original.
+    """
+    f.seek(offset)
+    fh = f.read(FRAME_HEADER.size)
+    if len(fh) < FRAME_HEADER.size:
+        return None
+    fmagic, t, count = FRAME_HEADER.unpack(fh)
+    if fmagic != FRAME_MAGIC:
+        return None
+    buf = f.read(FRAME_REC.itemsize * count)
+    if len(buf) < FRAME_REC.itemsize * count:
+        return None
+    return t, np.frombuffer(buf, dtype=FRAME_REC, count=count)
+
+
+class PoseStream:
+    """poses[slot] -> (bodies, 7), read from disk on demand rather than preloaded.
+
+    The original materialised (frames, bodies, 7) float32: 4.1 GB for 45 000 frames of a
+    15-rank run. Playback only ever draws the slot it is on, and index_frames already
+    hands us a byte offset per frame, so the array never has to exist. A small ring of
+    recent slots keeps stepping and scrubbing off re-reading the same frame.
+
+    Bodies are matched through `scatter`, a dense recorded-index -> row lookup built once
+    per rank, so applying a frame is a vectorised scatter rather than a dict probe per
+    body. Indexing is (slot) or (slot, body) -- both call sites in main() still work.
+    """
+
+    def __init__(self, per_rank, targets, n_bodies, cache=24):
+        self.targets, self.n_bodies, self.cache_size = targets, n_bodies, max(2, cache)
+        self.reads = 0
+        self._cache, self._order = {}, []
+        self.parts = []
+        for _rank, rec, index, _rate, keep, slot0 in per_rank:
+            want = np.array([o["index"] for o in keep], dtype=np.int64)
+            scatter = np.full((int(want.max()) + 1) if len(want) else 1, -1, dtype=np.int32)
+            if len(want):
+                scatter[want] = np.arange(len(keep), dtype=np.int32)
+            self.parts.append({
+                "f": open(rec.frames_path, "rb"),
+                "offsets": np.array([o for o, _t in index], dtype=np.int64),
+                "stamps": np.array([t for _o, t in index], dtype=np.float64),
+                "scatter": scatter, "slot0": slot0,
+            })
+
+    def close(self):
+        for part in self.parts:
+            try:
+                part["f"].close()
+            except OSError:
+                pass
+
+    def _build(self, slot):
+        want = float(self.targets[slot])
+        row = np.full((self.n_bodies, 7), np.nan, dtype=np.float32)
+        for part in self.parts:
+            stamps = part["stamps"]
+            # Ranks are matched by TIME, not frame number: a rank that starts a step late
+            # would otherwise draw its machines out of step with everyone else's.
+            i = int(np.searchsorted(stamps, want))
+            if i >= len(stamps):
+                i = len(stamps) - 1
+            elif i > 0 and (want - stamps[i - 1]) < (stamps[i] - want):
+                i -= 1
+            got = read_frame_np(part["f"], int(part["offsets"][i]))
+            self.reads += 1
+            if got is None:
+                continue
+            _t, arr = got
+            idx = arr["idx"].astype(np.int64)
+            keep_mask = idx < len(part["scatter"])
+            if not keep_mask.all():
+                idx, arr = idx[keep_mask], arr[keep_mask]
+            col = part["scatter"][idx]
+            live = col >= 0
+            if live.any():
+                row[part["slot0"] + col[live]] = arr["pose"][live]
+        return row
+
+    def __len__(self):
+        return len(self.targets)
+
+    def __getitem__(self, key):
+        if isinstance(key, tuple):
+            rest = key[1:]
+            return self[key[0]][rest if len(rest) > 1 else rest[0]]
+        slot = int(key)
+        row = self._cache.get(slot)
+        if row is None:
+            row = self._build(slot)
+            self._cache[slot] = row
+            self._order.append(slot)
+            if len(self._order) > self.cache_size:
+                self._cache.pop(self._order.pop(0), None)
+        return row
 
 
 def load(directory, ranks, t_from, t_to, fps, keep_all, max_frames,
@@ -487,39 +682,21 @@ def load(directory, ranks, t_from, t_to, fps, keep_all, max_frames,
     if fps <= 0.0:
         fps = rate or 60.0
     want = int((t1 - t0) * max(0.1, fps)) + 1
-    n = max(2, min(max_frames, want))
+    # No cap by default: poses stream from disk, so retaining every timeline instant only
+    # costs the eight-byte timestamp in `targets`, not a frame-by-body pose array.
+    n = max(2, want if max_frames is None else min(max_frames, want))
     if want > n:
-        # --max-frames caps how many frames are HELD IN MEMORY, it is not a frame rate:
-        # every body's pose for every frame is resident, so a 15-rank run costs about
-        # 22 kB per frame. Over the cap the timeline is resampled, which is why the rate
-        # printed next is not the rate the run was recorded at.
+        # Poses no longer sit in memory, so --max-frames is now only a cap on TIMELINE
+        # RESOLUTION: how many distinct instants playback can land on. Raising it costs
+        # eight bytes a frame instead of 22 kB, so pass the full count freely.
         print(f"  ! {want} frames at {fps:g}/sim-s over {t1 - t0:.1f} s of run, but "
-              f"--max-frames is {max_frames} (a cap on frames held in memory, not a frame "
-              f"rate); resampled to {n}, i.e. {n / max(1e-9, t1 - t0):.2f}/sim-s. Pass "
+              f"--max-frames is {max_frames} (a cap on timeline resolution; poses stream "
+              f"from disk); resampled to {n}, i.e. {n / max(1e-9, t1 - t0):.2f}/sim-s. Pass "
               f"--max-frames {want} for every recorded frame, or narrow it with --from/--to.",
               file=sys.stderr)
     targets = np.linspace(t0, t1, n)
 
-    poses = np.full((n, len(bodies), 7), np.nan, dtype=np.float32)
-    for _rank, rec, index, _rate, keep, slot0 in per_rank:
-        stamps = [t for _o, t in index]
-        with open(rec.frames_path, "rb") as f:
-            for slot, want in enumerate(targets):
-                # Ranks are matched by TIME, not frame number: a rank that starts a step
-                # late would otherwise draw its machines out of step with everyone else's.
-                i = bisect.bisect_left(stamps, want)
-                if i >= len(stamps):
-                    i = len(stamps) - 1
-                elif i > 0 and (want - stamps[i - 1]) < (stamps[i] - want):
-                    i -= 1
-                got = read_frame(f, index[i][0])
-                if got is None:
-                    continue
-                _t, frame = got
-                for k, obj in enumerate(keep):
-                    p = frame.get(obj["index"])
-                    if p is not None:
-                        poses[slot, slot0 + k, :] = p
+    poses = PoseStream(per_rank, targets, len(bodies))
     return meta0, bodies, poses, targets, rate
 
 
@@ -587,11 +764,12 @@ def unpack_nodes(key):
 
 
 def scm_sources(directory, ranks):
-    """Read every rank_<r>_scm.bin once: its frames, and the node SET it ever deformed.
+    """Per rank: the node SET it ever deformed, and a lazy stream over its frames.
 
-    The recorder republishes a node in every keyframe after it first moves, so the frames
-    hold the same node many times over -- 5.1 M rows describing 254 k distinct nodes, on a
-    16-rank run. Deduplicating once, here, is what every later stage tiles and counts from.
+    One bounded pass per file (scm_index), then playback pulls frames as it needs them.
+    The node set is what every later stage tiles and counts from, so it is still resolved
+    up front -- it is small (4.2 M nodes on the worst rank measured, 33 MB) where the rows
+    that produce it are not (670 M).
     """
     out = []
     for rank in ranks:
@@ -599,65 +777,27 @@ def scm_sources(directory, ranks):
         if not os.path.exists(path):
             continue
         try:
-            delta, plane, _nx, _ny, rate, frames = read_scm(path)
+            delta, plane, _nx, _ny, rate, offs, times, counts, ukey = scm_index(path)
         except (OSError, ValueError) as exc:
             print(f"  ! {os.path.basename(path)}: {exc}", file=sys.stderr)
             continue
-        if not frames:
+        if not len(offs) or not len(ukey):
             continue
         if not (abs(plane[0]) < 1e-9 and abs(plane[1]) < 1e-9 and abs(plane[2]) < 1e-9
                 and abs(plane[3] - 1.0) < 1e-9):
             print(f"  ! {os.path.basename(path)}: patch plane is not the identity; rut "
                   f"heights are drawn as world z anyway", file=sys.stderr)
-        ukey, inv = np.unique(pack_nodes(np.concatenate([f[1] for f in frames]),
-                                         np.concatenate([f[2] for f in frames])),
-                              return_inverse=True)
         ui, uj = unpack_nodes(ukey)
         out.append({"rank": rank, "delta": delta, "rate": rate,
-                    "frames": compress_frames(frames, inv.astype(np.int32), len(ukey)),
+                    "stream": ScmStream(path, offs, times, counts, ukey),
                     "ui": ui, "uj": uj, "nodes": int(len(ui))})
     return out
 
 
-
-def compress_frames(frames, ids, n_nodes):
-    """Rewrite the frames as (time, node ids, height), keeping only rows that CHANGE a
-    node's height, and addressing nodes by their index in the rank's own node set.
-
-    Two things are being paid for here, once, so that playback does not pay them per row.
-
-    The recorder writes a keyframe every 5 s carrying every node touched since the run
-    began -- its recovery mechanism, so a consumer joining mid-file or dropping a sample is
-    only stale, never permanently wrong. A consumer accumulating from t=0 has already been
-    told all of it: measured on a 16-rank run, 22 keyframes per rank hold 56.6% of all 5.1
-    M rows and not one of them changes a height. Dropping them is exact, not approximate --
-    a row survives iff it differs from the last height written to that node.
-
-    And a node's place in the rut meshes never moves, so resolving it belongs here, against
-    the 254 k node SET, rather than in apply_scm against the 5.1 M rows -- a 20x difference
-    in how often the same answer is computed. This returns the ids; build_rut_layers turns
-    them into mesh points once each.
-
-    One behaviour does change, and only when --rut-fine asks for an overlay COARSER than
-    the recording's node pitch, which is not the default. Several nodes then share a fine
-    point, and apply_scm resolves that within a frame by letting the deepest win. Between
-    frames the most recent write wins, so a shallow node can now take a point back off a
-    deeper neighbour and keep it -- where before, the next keyframe re-asserted the whole
-    set and the sort restored the deeper one within 5 s. At the default overlay pitch each
-    point has exactly one node and nothing is shared, so nothing here applies.
-    """
-    edges = np.concatenate(([0], np.cumsum([len(f[1]) for f in frames])))
-    last = np.full(n_nodes, np.nan)
-    out = []
-    for k, f in enumerate(frames):
-        s, e = edges[k], edges[k + 1]
-        fi, z = ids[s:e], f[3]
-        if len(fi):
-            changed = last[fi] != z
-            last[fi] = z
-            fi, z = fi[changed], z[changed]
-        out.append((f[0], fi, z))
-    return out
+# compress_frames() lived here. Its two jobs -- dropping keyframe rows that change no
+# height, and resolving a node to its index in the rank's own set -- are now done per
+# frame inside ScmStream.next(), so neither the rows nor the compressed result is ever
+# held for the whole run. See ScmStream for the measurements that justified it.
 
 
 def deformed_cells(sources, gx, gy):
@@ -886,7 +1026,7 @@ def build_rut_layers(pl, sources, cells, gx, gy, sample_base, ground, clim,
     for src in sources:
         fp = fine_point(src["ui"], src["uj"])
         cp, hit = coarse_point(src["ui"], src["uj"])
-        patches.append({"rank": src["rank"], "frames": src["frames"], "cursor": 0,
+        patches.append({"rank": src["rank"], "stream": src["stream"],
                         "time": -1.0, "rate": src["rate"], "nodes": src["nodes"],
                         "fp": fp, "fb": fbase[fp], "cp": cp, "cb": cbase[cp], "hit": hit})
     return patches, layers
@@ -913,12 +1053,13 @@ def apply_scm(patches, layers, t):
             mesh.points[:, 2] = base
             mesh["sinkage"][:] = 0.0
         for p in patches:
-            p["cursor"], p["time"] = 0, -1.0
+            p["stream"].reset()
+            p["time"] = -1.0
     moved = False
     for p in patches:
-        while p["cursor"] < len(p["frames"]) and p["frames"][p["cursor"]][0] <= t:
-            _ft, nid, zz = p["frames"][p["cursor"]]
-            p["cursor"] += 1
+        stream = p["stream"]
+        while stream.has_next() and stream.peek_time() <= t:
+            _ft, nid, zz = stream.next()
             if not len(nid):
                 continue
             # Deepest last: several nodes share a point wherever a layer is coarser than
@@ -1089,11 +1230,10 @@ def main():
     ap.add_argument("--speed", type=float, default=1.0, help="sim seconds per wall second")
     ap.add_argument("--from", dest="t_from", type=float)
     ap.add_argument("--to", dest="t_to", type=float)
-    ap.add_argument("--max-frames", type=int, default=3000,
-                    help="cap on frames held in memory, NOT a frame rate (default 3000). "
-                         "Every body's pose for every frame is resident, so a long "
-                         "run over the cap is resampled onto fewer frames and plays "
-                         "coarser than it was recorded; raise it to play every frame")
+    ap.add_argument("--max-frames", type=int, default=None,
+                    help="optional cap on timeline resolution (default: no cap, play every "
+                         "frame). Poses stream from disk, so this does not control pose "
+                         "memory; use it only to deliberately resample a long run")
     ap.add_argument("--no-running-gear", action="store_true",
                     help="drop track shoes, wheels, sprockets, idlers and suspension "
                          "(1905 of 3472 bodies in a 15-rank run) for frame rate")
@@ -1442,5 +1582,425 @@ def main():
     pl.show()
 
 
+
+# High-throughput rendering backend.  Kept in this file so replay_run.py is standalone.
+import collections
+import concurrent.futures
+
+base = sys.modules[__name__]
+_ORIGINAL_MAIN = main
+
+_ORIGINAL_BUILD_SCENE = base.build_scene
+_ORIGINAL_BUILD_RUT_LAYERS = base.build_rut_layers
+
+# The recording names Polaris_tire.obj because Polaris_LuggedTire.json deliberately uses
+# the smooth stock tyre for visualization even though SCM collides against the lugged
+# mesh.  That visual is both misleading and expensive (7,988 triangles).  The project's
+# metre-scaled lugged visual is 2,644 triangles and uses the same +Y spin axis.
+_DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+_LUGGED_TIRE_VISUAL = os.path.join(
+    _DATA_DIR, "vehicle", "LRV", "meshes", "LRVtire_red_m.obj")
+
+
+def _render_shape(shape):
+    """Apply experimental visual substitutions without changing recorded physics."""
+    if (shape.get("type") == "trimesh"
+            and os.path.basename(shape.get("file", "")) == "Polaris_tire.obj"):
+        shape = dict(shape)
+        shape["file"] = _LUGGED_TIRE_VISUAL
+        # main.cpp hands this same metre-scaled asset directly to the VSG/Synchrono
+        # visualization path.  Drop the stock Polaris_tire AABB so fit_to_aabb() does not
+        # squash the VSG mesh back into the narrower smooth-tyre dimensions.
+        shape.pop("aabb_min", None)
+        shape.pop("aabb_max", None)
+    return shape
+
+
+def _colour(obj):
+    return next((tuple(s["color"]) for s in obj.get("shapes", []) if s.get("color")),
+                None) or base.group_color(obj)
+
+
+def _prototype_key(obj, boxes_only):
+    """Hashable description of geometry, excluding body pose and per-instance colour."""
+    shapes = tuple(base.shape_signature(_render_shape(s), boxes_only)
+                   for s in obj.get("shapes", []))
+    # A body without recorded shapes falls back to body_bounds(), so its bounds are part
+    # of the prototype.  Shaped bodies are fully described by shape_signature().
+    fallback = None
+    if not shapes:
+        lo, hi = base.body_bounds(obj)
+        fallback = tuple(round(float(x), 6) for x in (*lo, *hi))
+    return shapes, fallback
+
+
+def _merged_geometry(obj, cache, boxes_only):
+    import pyvista as pv
+
+    pieces = [base.shape_geometry(_render_shape(s), cache, boxes_only)
+              for s in obj.get("shapes", [])]
+    pieces = [p for p in pieces if p is not None and p.n_points]
+    if not pieces:
+        lo, hi = base.body_bounds(obj)
+        pieces = [pv.Box(bounds=(lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]))]
+    mesh = pieces[0] if len(pieces) == 1 else pieces[0].merge(pieces[1:])
+    # add_mesh(..., smooth_shading=True) in the original builds point normals.  Do it
+    # once per prototype here rather than once per body.
+    try:
+        return mesh.compute_normals(cell_normals=False, point_normals=True,
+                                    split_vertices=False, inplace=False)
+    except (TypeError, ValueError):
+        return mesh
+
+
+def build_instanced_bodies(pl, bodies, cache, boxes_only):
+    """Return one multi-source glyph mapper containing every dynamic body.
+
+    vtkGlyph3DMapper accepts a table of prototype meshes and a per-point source index.
+    Keeping all recorded bodies in one point cloud reduces both Python update calls and
+    renderer traversal.  VTK/OpenGL still group the instances by source internally.
+    """
+    import pyvista as pv
+    import vtk
+
+    prototypes = collections.OrderedDict()
+    source_index = np.empty(len(bodies), dtype=np.int32)
+    for body_index, obj in enumerate(bodies):
+        key = _prototype_key(obj, boxes_only)
+        entry = prototypes.get(key)
+        if entry is None:
+            entry = {"object": obj, "source_id": len(prototypes)}
+            prototypes[key] = entry
+        source_index[body_index] = entry["source_id"]
+
+    count = len(bodies)
+    cloud = pv.PolyData(np.zeros((count, 3), dtype=np.float32))
+    cloud["orientation"] = np.tile(
+        np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32), (count, 1))
+    # vtkGlyph3DMapper's mask path requires vtkBitArray and is awkward to mutate from
+    # numpy.  A zero scale is an equivalent, GPU-side visibility mask.
+    cloud["instance_scale"] = np.zeros(count, dtype=np.float32)
+    cloud["source_index"] = source_index
+    cloud["instance_color"] = np.asarray(
+        [(*pv.Color(_colour(obj)).int_rgb, 255) for obj in bodies], dtype=np.uint8)
+
+    mapper = vtk.vtkGlyph3DMapper()
+    mapper.SetInputData(cloud)
+    sources = []
+    for entry in prototypes.values():
+        source = _merged_geometry(entry["object"], cache, boxes_only)
+        sources.append(source)
+        mapper.SetSourceData(entry["source_id"], source)
+    mapper.SetSourceIndexArray("source_index")
+    mapper.SourceIndexingOn()
+    mapper.SetOrientationArray("orientation")
+    mapper.SetOrientationModeToQuaternion()
+    mapper.OrientOn()
+    mapper.SetScaleArray("instance_scale")
+    mapper.SetScaleModeToScaleByMagnitude()
+    mapper.SetScaleFactor(1.0)
+    mapper.ScalingOn()
+    mapper.SetScalarModeToUsePointFieldData()
+    mapper.SelectColorArray("instance_color")
+    mapper.SetColorModeToDirectScalars()
+    mapper.ScalarVisibilityOn()
+
+    actor = vtk.vtkActor()
+    actor.SetMapper(mapper)
+    actor.GetProperty().SetInterpolationToPhong()
+    actor.GetProperty().SetSpecular(0.25)
+    pl.renderer.AddActor(actor)
+
+    return {
+        "cloud": cloud,
+        "points": cloud.points,
+        "orientations": cloud["orientation"],
+        "scales": cloud["instance_scale"],
+        "sources": sources,
+        "mapper": mapper,
+        "actor": actor,
+        "prototype_count": len(prototypes),
+    }
+
+
+def build_scene(pl, bodies, cache, boxes_only, meta, terrain_decimate, scenery,
+                terrain_radius, directory):
+    """Instanced dynamic bodies plus the original, static terrain/scenery path."""
+    instances = build_instanced_bodies(pl, bodies, cache, boxes_only)
+    _unused, terrain, ground = _ORIGINAL_BUILD_SCENE(
+        pl, [], cache, boxes_only, meta, terrain_decimate, scenery, terrain_radius,
+        directory)
+    print(f"instances   {len(bodies)} bodies, {instances['prototype_count']} prototypes, "
+          "1 dynamic actor")
+    replaced = sum(
+        os.path.basename(shape.get("file", "")) == "Polaris_tire.obj"
+        for obj in bodies for shape in obj.get("shapes", []))
+    if replaced:
+        print(f"tire visual {replaced} stock tires replaced by LRVtire_red_m.obj")
+    return instances, terrain, ground
+
+
+def frame_matrices(_instances):
+    """Compatibility hook for base.main(); instances do not use per-actor matrices."""
+    return None
+
+
+def apply_frame(instances, poses, slot, _unused=None):
+    """Upload one compact position/quaternion/scale array for all dynamic bodies."""
+    row = poses[slot]
+    live = np.isfinite(row[:, 0])
+
+    q = row[:, 3:7].copy()
+    norm = np.sqrt((q * q).sum(axis=1))
+    bad = ~np.isfinite(norm) | (norm < 1e-12)
+    norm[bad] = 1.0
+    q /= norm[:, None]
+    q[bad] = (1.0, 0.0, 0.0, 0.0)
+
+    # Avoid placing NaNs in mapper bounds even for zero-scaled, not-yet-live rocks.
+    points = instances["points"]
+    points[:] = 0.0
+    points[live] = row[live, :3]
+    instances["orientations"][:] = q
+    instances["scales"][:] = live
+
+    cloud = instances["cloud"]
+    cloud.GetPoints().GetData().Modified()
+    cloud.GetPointData().GetArray("orientation").Modified()
+    cloud.GetPointData().GetArray("instance_scale").Modified()
+
+
+def _remove_dataset_actor(pl, dataset):
+    """Remove the actor which the original rut builder attached for `dataset`."""
+    removed = 0
+    for actor in list(pl.renderer.actors.values()):
+        mapper = actor.GetMapper() if hasattr(actor, "GetMapper") else None
+        if mapper is None:
+            continue
+        try:
+            # PyVista's DataSetMapper retains the exact Python dataset wrapper; GetInput()
+            # creates another wrapper for the same VTK object and identity/equality both
+            # fail even though the underlying pointer is shared.
+            same = mapper.dataset is dataset
+        except (AttributeError, TypeError):
+            same = False
+        if same:
+            pl.remove_actor(actor, reset_camera=False, render=False)
+            removed += 1
+    return removed
+
+
+def _chunk_mesh(pl, mesh, cmap, clim, target_faces):
+    """Split a large dynamic quad mesh into independently uploadable render chunks."""
+    import pyvista as pv
+
+    faces = np.asarray(mesh.regular_faces)
+    chunks = []
+    for first in range(0, len(faces), target_faces):
+        global_faces = faces[first:first + target_faces]
+        global_ids, inverse = np.unique(global_faces, return_inverse=True)
+        local_faces = inverse.reshape(global_faces.shape)
+        local = pv.PolyData(
+            np.asarray(mesh.points[global_ids], dtype=np.float32).copy(),
+            np.column_stack((np.full(len(local_faces), 4, dtype=np.int64),
+                             local_faces)).ravel())
+        local.verts = np.empty(0, dtype=np.int64)
+        local["sinkage"] = np.asarray(mesh["sinkage"][global_ids],
+                                       dtype=np.float32).copy()
+        actor = pl.add_mesh(local, scalars="sinkage", cmap=cmap, clim=clim,
+                            show_scalar_bar=False, specular=0.05,
+                            reset_camera=False, render=False)
+        chunks.append({
+            "global_ids": global_ids,
+            "mesh": local,
+            "points": local.points,
+            "sinkage": local["sinkage"],
+            "actor": actor,
+        })
+    return chunks
+
+
+def build_rut_layers(pl, sources, cells, gx, gy, sample_base, ground, clim,
+                     coarse_m=0.16, fine_m=0.04, budget=2_000_000):
+    """Build the exact original rut surface, then spatially batch its GPU uploads.
+
+    The original uses two enormous mutable meshes.  A single changed SCM node marks both
+    datasets modified, making VTK rebuild buffers for 5.35 million points.  This backend
+    keeps the same CPU-side topology and point mapping but renders face chunks, so an SCM
+    sample invalidates only chunks containing points which actually changed.
+    """
+    patches, layers = _ORIGINAL_BUILD_RUT_LAYERS(
+        pl, sources, cells, gx, gy, sample_base, ground, clim, coarse_m, fine_m,
+        budget)
+    if layers is None:
+        return patches, layers
+
+    coarse, fine = layers["coarse"], layers["fine"]
+    removed = _remove_dataset_actor(pl, coarse) + _remove_dataset_actor(pl, fine)
+    if removed != 2:
+        print(f"  ! expected to replace 2 monolithic rut actors, found {removed}",
+              file=sys.stderr)
+
+    target_faces = max(4096, int(os.environ.get("REPLAY_SCM_CHUNK_FACES", "32768")))
+    cmap = base.rut_colormap(ground)
+    fine_chunks = _chunk_mesh(pl, fine, cmap, (0.0, max(1e-3, clim)), target_faces)
+    coarse_chunks = _chunk_mesh(pl, coarse, cmap, (0.0, max(1e-3, clim)), target_faces)
+
+    # CPU-authoritative dynamic fields.  The large original PolyData objects retain the
+    # topology used to create chunks, but are no longer connected to a renderer.
+    layers.update({
+        "fine_z": np.asarray(fine.points[:, 2], dtype=np.float32).copy(),
+        "fine_sinkage": np.asarray(fine["sinkage"], dtype=np.float32).copy(),
+        "coarse_z": np.asarray(coarse.points[:, 2], dtype=np.float32).copy(),
+        "coarse_sinkage": np.asarray(coarse["sinkage"], dtype=np.float32).copy(),
+        "fine_chunks": fine_chunks,
+        "coarse_chunks": coarse_chunks,
+        "scm_pool": concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(1, min(len(patches), os.cpu_count() or 4)),
+            thread_name_prefix="scm-decode"),
+        "dirty_chunks": collections.OrderedDict(),
+        "upload_chunks_per_frame": max(
+            1, int(os.environ.get("REPLAY_SCM_UPLOAD_CHUNKS", "8"))),
+    })
+    print(f"scm chunks  {len(fine_chunks)} fine + {len(coarse_chunks)} coarse "
+          f"(up to {target_faces} faces each)")
+    return patches, layers
+
+
+def _consume_patch_until(item):
+    """Worker-thread side of SCM playback: read, filter, and sort one rank."""
+    patch, t = item
+    stream = patch["stream"]
+    frames = []
+    while stream.has_next() and stream.peek_time() <= t:
+        _frame_time, node_ids, z = stream.next()
+        if not len(node_ids):
+            continue
+        order = np.argsort(-z, kind="stable")
+        frames.append((node_ids[order], z[order]))
+    return frames
+
+
+def _queue_chunks(layers, kind, changed, all_points=False):
+    """Put touched chunks in a deduplicating FIFO; data is copied when they drain."""
+    chunks = layers[f"{kind}_chunks"]
+    changed = None if all_points else np.unique(np.concatenate(changed))
+    for chunk_id, chunk in enumerate(chunks):
+        global_ids = chunk["global_ids"]
+        touched = changed is None
+        if changed is not None:
+            pos = np.searchsorted(global_ids, changed)
+            valid = pos < len(global_ids)
+            pos = pos[valid]
+            selected = changed[valid]
+            touched = bool(len(pos) and np.any(global_ids[pos] == selected))
+        if touched:
+            layers["dirty_chunks"].setdefault((kind, chunk_id), chunk)
+
+
+def _drain_chunks(layers, limit=None):
+    """Upload complete dirty chunks, each from the newest CPU-authoritative values."""
+    queue = layers["dirty_chunks"]
+    count = len(queue) if limit is None else min(limit, len(queue))
+    for _ in range(count):
+        (kind, _chunk_id), chunk = queue.popitem(last=False)
+        global_ids = chunk["global_ids"]
+        chunk["points"][:, 2] = layers[f"{kind}_z"][global_ids]
+        chunk["sinkage"][:] = layers[f"{kind}_sinkage"][global_ids]
+        chunk["mesh"].GetPoints().GetData().Modified()
+        chunk["mesh"].GetPointData().GetArray("sinkage").Modified()
+    return count
+
+
+def apply_scm(patches, layers, t):
+    """Parallel SCM decode plus dirty-chunk uploads, preserving original semantics."""
+    if layers is None:
+        return
+
+    previous = max((patch["time"] for patch in patches), default=-1.0)
+    first = previous < 0.0
+    rewound = any(t < patch["time"] for patch in patches)
+    if rewound:
+        layers["coarse_z"][:] = layers["coarse_base"]
+        layers["fine_z"][:] = layers["fine_base"]
+        layers["coarse_sinkage"][:] = 0.0
+        layers["fine_sinkage"][:] = 0.0
+        for patch in patches:
+            patch["stream"].reset()
+            patch["time"] = -1.0
+
+    due = [patch for patch in patches
+           if patch["stream"].has_next() and patch["stream"].peek_time() <= t]
+    decoded = layers["scm_pool"].map(
+        _consume_patch_until, ((patch, t) for patch in due))
+
+    fine_changed = []
+    coarse_changed = []
+    for patch, frames in zip(due, decoded):
+        for node_ids, z in frames:
+            fine_ids = patch["fp"][node_ids]
+            layers["fine_z"][fine_ids] = z
+            layers["fine_sinkage"][fine_ids] = patch["fb"][node_ids] - z
+            fine_changed.append(fine_ids)
+
+            hit = patch["hit"][node_ids]
+            if hit.any():
+                coarse_nodes = node_ids[hit]
+                coarse_ids = patch["cp"][coarse_nodes]
+                layers["coarse_z"][coarse_ids] = z[hit]
+                layers["coarse_sinkage"][coarse_ids] = patch["cb"][coarse_nodes] - z[hit]
+                coarse_changed.append(coarse_ids)
+
+    for patch in patches:
+        patch["time"] = t
+
+    if rewound or fine_changed:
+        _queue_chunks(layers, "fine", fine_changed, all_points=rewound)
+    if rewound or coarse_changed:
+        _queue_chunks(layers, "coarse", coarse_changed, all_points=rewound)
+
+    # An interactive 30 Hz replay has three display frames between 10 Hz SCM samples.
+    # Spread buffer uploads across those frames so one terrain sample cannot monopolise
+    # the render thread.  Explicit seeks and offline output are flushed immediately for
+    # exact single-frame/movie results.
+    offline = "--shot" in sys.argv or "--movie" in sys.argv
+    jumped = previous >= 0.0 and abs(t - previous) > 0.5
+    limit = None if first or rewound or jumped or offline else layers["upload_chunks_per_frame"]
+    _drain_chunks(layers, limit)
+
+
+# Replace the baseline implementations in this standalone module before entering its
+# original CLI.  Loading, controls, cameras, and movie output remain shared code above.
+base.build_scene = build_scene
+base.frame_matrices = frame_matrices
+base.apply_frame = apply_frame
+base.build_rut_layers = build_rut_layers
+base.apply_scm = apply_scm
+
+
+def _fast_main():
+    """Run the standalone CLI without VTK's conflicting built-in `r` shortcut."""
+    import pyvista as pv
+
+    original_show = pv.Plotter.show
+
+    def show_without_vtk_char_shortcuts(plotter, *args, **kwargs):
+        # The replay handles its documented keyboard controls through PyVista's explicit
+        # KeyPressEvent callbacks.  VTK's lower-level CharEvent handler also interprets
+        # `r` as reset-camera-to-all-bounds; with the kilometre-wide terrain that fires
+        # after show(0) and zooms far out.  Follow mode hid it by continuously reasserting
+        # its own camera.  Removing the built-in character shortcuts leaves the replay's
+        # callbacks (including r, c, movement, zoom, and q) intact.
+        if plotter.iren is not None and plotter.iren.interactor is not None:
+            plotter.iren.interactor.RemoveObservers("CharEvent")
+        return original_show(plotter, *args, **kwargs)
+
+    pv.Plotter.show = show_without_vtk_char_shortcuts
+    try:
+        _ORIGINAL_MAIN()
+    finally:
+        pv.Plotter.show = original_show
+
+
 if __name__ == "__main__":
-    main()
+    _fast_main()
