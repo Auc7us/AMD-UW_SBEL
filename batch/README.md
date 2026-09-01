@@ -8,8 +8,8 @@ container (ROS 2 controllers up, sim, teardown). Paths assume the HPC Fund layou
       --export=ALL,DELTA=0.03,RANKS=5,ROCKS=2,SIM_END=1200 scm_run.sbatch
 
 `RANKS` is total MPI ranks: rank 0 orchestrates and owns no robot, so `RANKS=5`
-is four robots. Layout stays collision-free at any count because
-`BuilderWallSlotCount` caps each builder at 0.7 of its own `2*pi/N` sector.
+is four robots. Builders are kept apart by `min_builder_gap_m` in the orbit
+controller, not by geometry -- see DESIGN.md.
 
 Twenty robots on the 2 cm grid, for comparing cluster stability against the 64 GB
 workstation:
