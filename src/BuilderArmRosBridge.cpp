@@ -123,6 +123,12 @@ constexpr double collector_stall_timeout = 120.0;  // s without moving = not com
 constexpr double collector_stall_move_m = 1.0;     // m; under this is "has not moved"
 constexpr double starved_slot_backstop = 900.0;    // s
 
+// HULL DRIVEN PAST ITS OWN SLOT. Slot pitches of residual arc (i.e. after any deliberate
+// fetch slide is taken out) beyond which the slot is unreachable and must be written off.
+// 1.5 pitches is 0.8 m of arc here, well outside the 0.29 m arrival band, so normal
+// station keeping never reaches it.
+constexpr double station_overshoot_pitches = 1.5;
+
 // HULL THAT CANNOT LEAVE ITS SLOT = FAILED RUN.
 //
 // Skipping slots is normal and healthy; a builder that cannot physically drive is not.
@@ -898,6 +904,49 @@ void BuilderArmRosBridge::PublishBuildTopics(double time) {
                                 time, best_d, best_d - feedstock_reach_max, feedstock_reach_max,
                                 m_station_fetch_offset * 180.0 / chrono::CH_PI, arc);
                 }
+            }
+        }
+
+        // HULL IS PAST ITS SLOT. The builder only drives one way round, so it cannot back
+        // up, and the slot only advances when a rock is laid -- which needs that slot in
+        // reach. Left alone this is a permanent stall: rank 9 of run_20260901_223502 sat
+        // 12.68 m past slot 17 from t=877 until the job died at t=958.
+        //
+        // starved_slot_timeout does not rescue it. That advances ONE slot per timeout, so
+        // closing a 12.7 m gap costs ~26 timeouts and burns 26 slots on the way.
+        //
+        // So resync instead: write off every slot already driven past and resume from the
+        // first one still ahead of the hull. The wall keeps the gap, exactly as an
+        // abandoned slot leaves one. Forward only, so the monotonic station invariant in
+        // BuilderRig::SetStationAngle still holds.
+        //
+        // The fetch slide is subtracted first: a slide deliberately parks the hull up to
+        // station_fetch_max_arc_m (6+ pitches) past the slot bearing, and that is the
+        // builder working as intended, not an overshoot.
+        if (!BuildComplete() && !m_arm.IsBusy() && wall_slot_pitch_rad > 1e-9) {
+            const auto arm_base = m_arm.GetIkFramePos();
+            const auto& slot = m_wall_slots[m_placed_count];
+            double past = std::atan2(arm_base.y() - site_center_y, arm_base.x() - site_center_x)
+                          - std::atan2(slot.y() - site_center_y, slot.x() - site_center_x);
+            while (past > chrono::CH_PI)
+                past -= chrono::CH_2PI;
+            while (past < -chrono::CH_PI)
+                past += chrono::CH_2PI;
+            past -= m_station_fetch_offset;
+            if (past > station_overshoot_pitches * wall_slot_pitch_rad) {
+                const int from = m_placed_count;
+                const int to = std::min(from + static_cast<int>(past / wall_slot_pitch_rad),
+                                        static_cast<int>(m_wall_slots.size()));
+                const double base_radius = std::hypot(arm_base.x() - site_center_x,
+                                                      arm_base.y() - site_center_y);
+                RCLCPP_WARN(m_node->get_logger(),
+                            "t=%.2f hull is %.2f m of arc past slot %d and cannot drive back; "
+                            "writing off slots %d-%d and resuming from %d. The wall keeps the gap.",
+                            time, past * base_radius, from, from, to - 1, to);
+                m_placed_count = to;
+                m_starved_since = -1.0;
+                m_fetch_offset_slot = -1;
+                m_station_fetch_offset = 0.0;
             }
         }
 
