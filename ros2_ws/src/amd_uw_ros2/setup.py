@@ -21,18 +21,15 @@ setup(
     zip_safe=True,
     maintainer="AMD-UW",
     maintainer_email="todo@example.com",
-    description="ROS2 POC controllers and bridge-side helpers for the AMD-UW Chrono demo.",
+    description="ROS 2 controllers for the AMD-UW Chrono construction demo.",
     license="BSD-3-Clause",
     tests_require=["pytest"],
     entry_points={
         "console_scripts": [
             "builder_arm_controller = amd_uw_ros2.builder_arm_controller:main",
-            "builder_drive_controller = amd_uw_ros2.builder_drive_controller:main",
             "builder_orbit_controller = amd_uw_ros2.builder_orbit_controller:main",
-            "constant_speed_controller = amd_uw_ros2.constant_speed_controller:main",
             "manipulator_controller = amd_uw_ros2.manipulator_controller:main",
             "pure_pursuit_controller = amd_uw_ros2.pure_pursuit_controller:main",
-            "simple_goal_controller = amd_uw_ros2.simple_goal_controller:main",
         ],
     },
 )

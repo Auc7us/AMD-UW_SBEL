@@ -16,10 +16,7 @@ ARM_STATE_FAILED = 3
 
 GRAB_HEIGHT_M = 0.22
 
-try:
-    from .inverse_kinematics import RobotArmInverseKinematicsSolver
-except Exception:
-    RobotArmInverseKinematicsSolver = None
+from amd_uw_ros2.inverse_kinematics import RobotArmInverseKinematicsSolver
 
 
 @dataclass
@@ -120,11 +117,7 @@ class ManipulatorController(Node):
         self.dump_requested = False
         self.dump_finished = False
         self.arm_scale = float(self.get_parameter("arm_scale").value)
-        self.ik_solver = (
-            RobotArmInverseKinematicsSolver(scale=self.arm_scale)
-            if RobotArmInverseKinematicsSolver is not None
-            else None
-        )
+        self.ik_solver = RobotArmInverseKinematicsSolver(scale=self.arm_scale)
 
         self.arm_cmd_pub = self.create_publisher(Float64MultiArray, self.arm_cmd_topic, 10)
         self.target_done_pub = self.create_publisher(Bool, self.target_done_topic, 10)
@@ -447,9 +440,6 @@ class ManipulatorController(Node):
         )
 
     def compute_grab_theta(self, request: PickupRequest) -> Optional[Tuple[float, float, float, float]]:
-        if self.ik_solver is None:
-            self.get_logger().warn("Cannot compute arm IK; RobotArmInverseKinematicsSolver is unavailable.")
-            return None
         if self.arm_base_pose is None:
             self.get_logger().warn("Cannot compute arm IK yet; no arm_base_pose has been received.")
             return None
@@ -503,7 +493,7 @@ class ManipulatorController(Node):
         """Solve the drop pose with the same IK/frame as the grab, from the C++
         place target. Returns None (arm falls back to its own place IK) if the
         target or arm base pose is unavailable, or the point is unreachable."""
-        if self.ik_solver is None or self.arm_base_pose is None or self.place_target is None:
+        if self.arm_base_pose is None or self.place_target is None:
             return None
         px, py, pz = self.place_target
         local_target = self.world_to_arm_base_local(px, py, pz)

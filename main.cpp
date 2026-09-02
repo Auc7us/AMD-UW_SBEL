@@ -96,55 +96,41 @@ double record_rate_hz = 60.0;
 // only nodes whose height CHANGED since the previous sample, so a higher rate refines when
 // a rut appeared, never whether it appeared.
 double scm_record_rate_hz = 10.0;
-// How often the SCM file re-states every deformed node instead of only the changes. Needs
-// no flag in the format: heights are absolute and a consumer accumulates by overwrite, so
-// a full re-statement is idempotent with the diffs around it -- it just lets a consumer
-// seek, or survive a dropped frame, without replaying from t=0.
+// How often the SCM file re-states every deformed node instead of only the changes. Heights
+// are absolute and consumers accumulate by overwrite, so a keyframe is idempotent with the
+// diffs around it; it just lets a consumer seek or survive a dropped frame.
 //
-// THIS, NOT scm_record_rate_hz, IS WHAT THE FILE SIZE IS MADE OF. A keyframe re-states
-// every node touched since the run began, so each one is bigger than the last, and the
-// file grows with the SQUARE of run length. Measured on rank 12 of a 1500 s 15-robot run:
-// 300 keyframes carried 666.4 M of the 670.5 M node rows -- 99.4% -- while all 1200 delta
-// frames together came to 4.0 M rows, about 48 MB. The last keyframe alone was 50 MB.
-// Turning the sample rate down does nothing; it shrinks the 0.6%.
-//
-// At 5 s that projected to ~520 GiB site-wide for a 6000 s run, against 306 GB of disk.
-// 60 s keeps a recovery point every minute -- ample for a consumer that seeks or drops a
-// sample -- and costs a twelfth of the bytes. A consumer accumulating from t=0, which is
-// what the replay tools do, discards these rows as redundant anyway.
+// THIS, NOT scm_record_rate_hz, IS WHAT THE FILE SIZE IS MADE OF. Each keyframe re-states
+// every node touched since t=0, so the file grows with the SQUARE of run length. Measured on
+// rank 12 of a 1500 s 15-robot run: 300 keyframes carried 666.4 M of 670.5 M node rows (99.4%)
+// against 4.0 M rows for all 1200 delta frames. Turning the sample rate down shrinks the 0.6%.
+// At 5 s this projected ~520 GiB site-wide for a 6000 s run; 60 s costs a twelfth of that.
 const double scm_keyframe_period = 60.0;
 
 const double terrain_resolution_scale = 4.0;
 const double terrain_pixels_x = 256.0;
 const double terrain_pixels_y = 256.0;
-// Graded work pad. terrain2.bmp puts the site rings on a 5% hillside -- the builder orbit
-// swung 3.96 m with a 17% peak along-path grade, more than the single-pin tracks want to
-// climb under load. tools/make_graded_pad.py blends r<=45 m toward a level plane (keeping
-// 15% of the local relief so it still reads as ground), cosine-tapers out to 130 m, and
-// leaves everything past that bit-identical. The orbit now swings 0.57 m at ~2%.
+// Graded work pad, from tools/make_graded_pad.py. Ungraded, terrain2.bmp puts the site rings
+// on a 5% hillside: the builder orbit swung 3.96 m at a 17% peak along-path grade, more than
+// the single-pin tracks want to climb under load. Graded it swings 0.57 m at ~2%.
 //
-// 16-bit PNG, not BMP: SCMTerrain spreads gray over [min,max] using the image's full
-// range and Chrono's STB wrapper always loads 16-bit, so 8 bits would quantize this
-// 50 m range into 0.196 m steps -- invisible on a hillside, but it would terrace a flat
-// pad into 20 cm stairs. Set this back to "terrain/terrain2.bmp" for the ungraded site.
+// Must be 16-bit PNG, not BMP: 8 bits quantizes this 50 m range into 0.196 m steps, which
+// would terrace the flat pad into 20 cm stairs. Set to "terrain/terrain2.bmp" for the
+// ungraded site.
 const std::string terrain_heightmap_file = "terrain/terrain2_graded.png";
 const double terrain_height_offset = 0.0;
 const double terrain_min_height = -25.0;
 const double terrain_max_height = 25.0;
 const double terrain_height_probe_clearance = 10.0;
 
-// SCM grid spacing over the whole 1024 x 1024 m patch.
+// SCM grid spacing over the whole 1024 x 1024 m patch. Read the cost before changing it.
+// At 0.10 m that is 10241^2 = 104.9 M nodes, whose undeformed heights SCMLoader holds in ONE
+// DENSE double matrix: 839 MB per rank, allocated whether or not a node is touched. Memory
+// scales as 1/delta^2.
 //
-// Read the cost before changing it. SCM rounds the half-extent up, so 0.10 m is 5120
-// divisions each way: 10241 x 10241 = 104.9 M grid nodes, and SCMLoader stores their
-// undeformed heights in ONE DENSE double matrix -- 839 MB PER RANK, allocated whether
-// or not a node is ever touched. Halving delta quadruples that.
-//
-// The visualization mesh is the part that does not fit at this size: one vertex and two
-// faces per node, carrying position, normal, UV and colour per vertex plus vertex and
-// normal index triples per face, which is ~13.5 GB per rank on top of the heights. It is
-// therefore built only on ranks that actually render (see scm_visualization_mesh below);
-// a headless rank pays the 839 MB and nothing more.
+// The visualization mesh (~13.5 GB per rank at this delta) is what does not fit, so it is
+// built only on ranks that render -- see scm_visualization_mesh. A headless rank pays the
+// 839 MB and nothing more.
 const double terrain_scm_delta_default = 0.10;
 
 // Bekker-Wong soil parameters for the lunar regolith analogue, carried over from the
@@ -222,17 +208,12 @@ ChQuaternion<> SensorLookAtRotation(const ChVector3d& camera_pos, const ChVector
 
 // Seat the builder on a FITTED TERRAIN PLANE rather than a single height probe.
 //
-// The old placement probed the terrain at the chassis centre only and set the hull level
-// (yaw only) at that height + builder_ride_height. Measured off terrain2.bmp, the ground
-// under the builder's 5.4 x 2.7 m footprint tilts 2.4-9.5 degrees depending on where the
-// lane puts it, so a level hull is out by 0.23-0.82 m across the footprint: the shoes at
-// the high end start buried and the ones at the low end start in the air. Under SMC a
-// buried shoe is a penalty force with nowhere to go, which is the same trap the pinned
-// hull hits (see BuilderRig's constructor) reached by a different route.
-//
-// Fitting a plane and matching pitch and roll to it cuts the worst-case seating error to
-// 0.019-0.077 m -- 6x to 20x better -- at every radius, which is the point: this is a fix
-// for the seating, not for one lucky lane radius.
+// The ground under the builder's 5.4 x 2.7 m footprint tilts 2.4-9.5 degrees depending on
+// lane position, so a level hull seated off one centre probe is out by 0.23-0.82 m across the
+// footprint -- shoes buried at the high end, in the air at the low end. Under SMC a buried
+// shoe is a penalty force with nowhere to go (the same trap the pinned hull hits, see
+// BuilderRig's constructor). Fitting a plane and matching pitch and roll cuts worst-case
+// seating error to 0.019-0.077 m at every radius.
 //
 // Those figures are for the ungraded map. On terrain2_graded.png the pad holds the lane to
 // 1.1 deg of tilt and 0.102 m of level-hull error, so the fit is mostly insurance now -- it
@@ -418,26 +399,17 @@ void AddCenterPad(ChSystem* system, ChTerrain& terrain, double height_probe_z) {
     system->AddBody(pad);
 }
 
-// Scenery rock clumps inside each rank's BUILDER REACH -- pyramid piles and scattered
-// clusters, so a rank's work area reads as a real site rather than bare ground.
+// Scenery rock clumps inside each rank's builder reach, so a work area reads as a real site.
 //
-// VISUAL ONLY, and deliberately so. Everything goes on ONE fixed, collision-disabled body
-// per rank, exactly as AddCenterPad does: a fixed body with collision off contributes no
-// DOF to the solver and generates no contact pairs, so a few hundred rocks cost nothing
-// but render time.
+// VISUAL ONLY: everything goes on ONE fixed, collision-disabled body per rank (as AddCenterPad
+// does), so a few hundred rocks cost render time and nothing in the solver.
 //
-// Placed by the ARM's reach, not by an offset from something else. The builder parks
-// tangentially at builder_path_radius with its arm base 2.5 m back along the hull, and the
-// band proven in service is 2.78-4.44 m from that base (see RobotLayout). Clumps are put
-// at 3.0-4.2 m from the base, fanned about the outward radial so they sit outboard of the
-// hull rather than under it. Two useful consequences fall out: they clear the builder's
-// tracks (which occupy builder_path_radius +/- 1.343 m), and because the arm base is
-// already 2.5 m off the rank's ray, they land off the collector's radial approach path
-// instead of in it.
+// Placed by the ARM's reach -- 3.0-4.2 m from the arm base, fanned about the outward radial.
+// That puts them outboard of the hull, clear of the tracks (builder_path_radius +/- 1.343 m),
+// and off the collector's radial approach, since the arm base already sits 2.5 m off the ray.
 //
-// Every rank builds EVERY rank's clumps, like the rings, because the sensor rank has to
-// see all of them. Placement is seeded per rank rather than randomly, so a robot rank's
-// VSG and the global camera put the same rock in the same place.
+// Every rank builds every rank's clumps, like the rings, because the sensor rank must see them
+// all; placement is seeded per rank so each rank's VSG agrees with the global camera.
 void AddSpawnRockClumps(ChSystem* system,
                         ChTerrain& terrain,
                         const std::string& chrono_data_path,
@@ -730,35 +702,22 @@ struct PerfAccum {
     }
 };
 
-// ONE SCM active domain for a tracked vehicle's running gear, sized from where the shoes
-// actually are instead of from a box drawn round the whole hull.
+// ONE SCM active domain covering a tracked vehicle's running gear. A domain only selects which
+// grid nodes fire rays, and rays hit whatever shape is above them, so one box over the footprint
+// serves all ~130 shoes for a single ray-OBB test instead of 130 domains.
 //
-// This replaces a hand-set 7.5 x 4.5 x 3.0 m box centred at x = -2.2. That box had the right
-// idea: a domain only selects which grid nodes fire rays, and the rays then hit whatever shape
-// is above them, so ONE box covering the footprint serves all ~130 shoes for a single ray-OBB
-// test instead of 130 separate domains. What it got wrong was its size. 33.75 m^2 is more than
-// twice the running gear's envelope, and at 0.02 m spacing every surplus square metre is 2500
-// grid nodes ray-cast on all 2000 steps of every simulated second, for the whole run. Measured
-// at 0.1 m spacing: 4049 nodes per step with the hull box, against 1478 with this one.
+// Sized from the shoe body positions, not constants, so it follows whatever track assembly is
+// fitted: the shoes trace the whole loop, so their x extent is the true contact span and their
+// y extent the two track centre lines. Measured at 0.1 m spacing, 1478 nodes/step against 4049
+// for the old hand-set 7.5 x 4.5 m hull box.
 //
-// WHY ONE ENVELOPE BOX AND NOT TWO NARROW ONES PER TRACK. Two boxes hugging the tracks are
-// cheaper still -- 1267 nodes per step, a 3.2x cut rather than 2.3x -- and they were tried. They
-// also uncover the soil BETWEEN the tracks, and that turns out to matter: rays from those nodes
-// were reaching the hull underside and returning reaction to the chassis. Removing them
-// destabilised the single-pin track, reproducing the exact failure this project already has on
-// record in RobotLayout.h -- an idler carrier rotating about the vertical, which its prismatic
-// joint forbids. It killed rank 2 at t=18.43 and t=22.57 in two 45 s A/B runs whose only
-// difference from a clean legacy run was this box. So the belly stays covered. The saving comes
-// from the 19 m^2 of bare ground OUTBOARD of the tracks, which nothing ever touches: the
-// vehicle's widest shape measures 2.686 m against the old box's 4.5 m.
+// Do NOT narrow this to two boxes hugging the tracks. That is cheaper still (1267 nodes/step)
+// but uncovers the soil BETWEEN them; rays from those nodes reach the hull underside and return
+// reaction to the chassis. Removing them destabilised the single-pin track and killed rank 2 at
+// t=18.43 and t=22.57 in two 45 s A/B runs. The belly stays covered.
 //
-// Sized from the shoe bodies rather than from constants so it cannot drift from whatever track
-// assembly is fitted. Shoe positions trace the whole loop -- bottom run, sprocket, idler, top
-// run -- so their x extent is the true ground contact span and their y extent is the two track
-// centre lines; scm_track_domain_margin covers half a shoe's width on top of that, and the
-// y span between the centre lines carries the belly for free. Attitude is not a concern:
-// UpdateActiveDomain projects the eight corners of the ROTATED OOBB and takes their axis-aligned
-// hull, so pitch and roll can only ever widen the covered region, never narrow it.
+// Attitude is safe: UpdateActiveDomain takes the axis-aligned hull of the rotated OOBB's corners,
+// so pitch and roll only ever widen the region.
 //
 // Returns the number of domains registered (1, or 0 if the vehicle has no track shoes).
 int AddTrackActiveDomains(SCMTerrain& terrain, ChTrackedVehicle* vehicle, int rank) {
@@ -800,31 +759,20 @@ int AddTrackActiveDomains(SCMTerrain& terrain, ChTrackedVehicle* vehicle, int ra
     return 1;
 }
 
-// Keep one invariant: a rock carries an SCM active domain IFF it can still move.
+// Invariant: a rock carries an SCM active domain IFF it can still move.
 //
-// WHY THIS EXISTS. A domain's job is to make SCM compute soil where a body can move through it.
-// A rock that has been laid in the wall, or frozen at a drop point as feedstock, is
-// SetFixed(true) -- it cannot move, so it needs no soil reaction. Its domain nonetheless keeps
-// selecting every grid node under it for a height lookup on every step for the rest of the run.
-// A construction run only ever lays more wall, so that cost accumulates monotonically, which is
-// exactly the shape of growth this is here to remove. Frozen rocks are dead weight in the
-// per-step budget and nothing else.
+// A laid or frozen rock is SetFixed(true) and needs no soil reaction, but its domain would keep
+// selecting every grid node under it every step for the rest of the run. A construction run only
+// lays more wall, so that cost grows monotonically. (This also drops the builder's six seed-pile
+// rocks, fixed from placement, at t=0.)
 //
-// It caught more than it was written for: the builder's six seed-pile rocks are SetFixed(true)
-// from the moment they are placed, so their six domains were surplus from t=0 in every run this
-// project has ever done. They now come off at t=0.
+// Reconciled every step rather than hooked onto SetFixed: the fixed/dynamic flag is flipped from
+// five places across four files (RobotRig dump and settle-freeze, LrvArm pick and place,
+// BuilderArmRosBridge), and a missed hook fails silently and badly -- a dynamic rock with no
+// domain gets no soil support and falls through the terrain. Re-asserting cannot drift.
 //
-// WHY RECONCILE RATHER THAN HOOK SetFixed. A rock's fixed/dynamic state is flipped from five
-// places across four files -- the collector's dump and its settle-and-freeze (RobotRig), the
-// gripper's pick and its place (LrvArm), and the wall bridge (BuilderArmRosBridge) -- each
-// inside its own state machine. Hooking all five means the invariant holds only while all five
-// stay hooked, and the failure mode is silent and severe: a rock that goes dynamic without a
-// domain gets no soil support and falls through the terrain. Stating the invariant once and
-// re-asserting it every step cannot drift, and it self-heals if a new path appears.
-//
-// A rock is assumed to already hold a domain the first time it is seen, because every creation
-// path registers one (RobotRig::InitializeOnTerrain, RobotRig::AddCycleRocks, and the seed pile
-// in main). So this only ever acts on transitions, never on the initial state.
+// Every creation path registers a domain, so a rock first seen here is assumed to hold one; this
+// only acts on transitions.
 struct ScmRockDomains {
     std::unordered_set<const ChBody*> seen;   // rocks this has looked at at least once
     std::unordered_set<const ChBody*> holds;  // rocks believed to hold a domain right now
@@ -1836,47 +1784,19 @@ int main(int argc, char* argv[]) {
             }
             {
                 ScopedTimer timer(perf_accum.bldr_sync);
-                // The builder's station is its OWN, driven by how much wall it has laid
-                // and by nothing else.
+                // The builder's station is the SLOT's station: a function of how much wall
+                // it has laid and nothing else. Being a monotonically increasing integer, it
+                // can only advance -- the invariant the drive law depends on, since the
+                // builder orbits one way and any retreat costs it a full lap (207 m at
+                // 0.9 m/s, ~230 s of sim) to reach a point it was already standing on.
                 //
-                // It used to be RankRayAngleRad(..., robot->GetHarvestCycle()) -- the
-                // builder was parked on whatever bearing its collector's lane happened to
-                // be on, and it only ever moved when that collector finished a load and
-                // dumped. So a builder was idle for an entire harvest (minutes of sim),
-                // then teleported 30 degrees round the site in one step of the station
-                // angle, and its arm had nothing to do at either end. Now it steps one
-                // wall slot -- 0.9 m of course, 0.99 m of lane -- each time it lays a
-                // rock, which is a thing it does entirely on its own.
-                //
-                // One refinement on top of that: the station is pulled HALF WAY toward the
-                // rock actually on offer. Nominally the two agree -- HarvestDropSlot puts
-                // each load on the slot the builder will be at -- but a load is tipped out
-                // of a moving trailer, so where it lands has a metre or two of scatter in
-                // it. Splitting the difference keeps the wall slot (3.1 m inboard) and the
-                // rock (~3.9 m outboard) both inside the arm's 5.2 m envelope for an
-                // offset either way, instead of the builder parking exactly on its slot and
-                // staring at a pile it cannot quite reach. Clamped, so a stray rock across
-                // the site can never drag a builder off its course.
-                //
-                // The station is the SLOT's station and nothing else. It is a function of
-                // one monotonically increasing integer, so it can only ever advance --
-                // which is the invariant the drive law depends on, because the builder
-                // orbits one way and a station that retreats by any amount costs it a full
-                // lap (207 m at 0.9 m/s, ~230 s of sim) to reach a point it was already
-                // standing on.
-                //
-                // It briefly also carried a term pulling it half way toward whichever rock
-                // was on offer, as insurance against a tipped load landing off its nominal
-                // slot. That was unnecessary and it was harmful. Unnecessary: the audit
-                // puts a delivered pile 3.91-4.04 m from the arm base against a 5.0 m
-                // limit, so the envelope already absorbs sqrt(5.0^2 - 3.9^2) = 3.1 m of
-                // arc, about three slots of scatter, with the hull parked exactly on its
-                // slot. Harmful: the pull collapses to zero the moment that rock leaves
-                // reach, and a collapsing pull is a retreating station -- measured on
-                // builder 3, which held at 186.1 deg and then stepped back to 184.3 deg,
-                // buying itself a lap. Latching the maximum fixed the retreat but left the
-                // station ratcheted up to a slot ahead of its own wall slot, which is the
-                // wrong pose to place from. Simplest correct answer: no pull.
+                // Do NOT add a term pulling the station toward whichever rock is on offer.
+                // It is unnecessary -- a delivered pile audits at 3.91-4.04 m from the arm
+                // base against a 5.0 m limit, so the envelope already absorbs ~3.1 m of arc
+                // (three slots) of tipping scatter -- and harmful: the pull collapses to
+                // zero the moment that rock leaves reach, and a collapsing pull is a
+                // retreating station. Measured on builder 3, which held at 186.1 deg, stepped
+                // back to 184.3 deg and bought itself a lap.
                 if (builder) {
                     const int idx = robot->GetRobotIndex();
                     const double slot_angle = RankRayAngleRad(idx, num_robot_ranks) +

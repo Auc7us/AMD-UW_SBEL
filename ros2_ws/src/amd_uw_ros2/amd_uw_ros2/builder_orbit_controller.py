@@ -242,12 +242,6 @@ class BuilderOrbitController(Node):
         # what every launch file should use. A positive value pins the band and is reported
         # at startup, because pinning it is how the failure above happened.
         self.declare_parameter("station_tolerance_rad", 0.0)
-        # Widened from 0.20 rad. With active station keeping (see on_timer) the
-        # builder now corrects creep continuously instead of waiting to fall out of
-        # this band, so the band's only remaining job is to catch a builder that has
-        # been shoved so far it is genuinely quicker to drive round than to creep
-        # back. 0.6 rad is ~20 m of arc at the 33 m path radius.
-        self.declare_parameter("station_release_rad", 0.60)
         # Arrival is NOT an angle-only test. station_error is an orbit angle, so it is
         # satisfied anywhere along the radius -- a builder 3 m inside the lane, at the
         # right bearing, reads as "on station". It then stops driving, and because it is
@@ -835,10 +829,8 @@ class BuilderOrbitController(Node):
                 )
             # NO RELEASE BRANCH. Station is given up in exactly one place -- on_station_angle,
             # when the sim advances the slot -- and the new station is always AHEAD. Anything
-            # else releasing it hands the builder a lap, and station keeping already handles
-            # both ways of being off the mark without one: it creeps forward if it is short,
-            # and stands on the brake if it has crept past. station_release_rad is now
-            # unused; it is left declared so an existing launch file does not fail on it.
+            # else releasing it hands the builder a lap. Station keeping covers both ways of
+            # being off the mark: creep forward if short, brake if crept past.
 
         if self.holding_station:
             # Station keeping is ACTIVE, not just the brake.
