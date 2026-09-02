@@ -1,6 +1,8 @@
 # AMD-UW SynChrono Demo
-<p align="left">
-<img src="./demo.gif" width="600px" alt="15 rank demo">
+
+
+<p align="center">
+<img src="./demo.gif" width="100%" alt="15 rank demo">
 </p>
 
 
