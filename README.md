@@ -1,4 +1,8 @@
 # AMD-UW SynChrono Demo
+<p align="left">
+<img src="./demo.gif" width="600px" alt="15 rank demo">
+</p>
+
 
 Running instructions. Why the site is laid out and tuned the way it is, and what the
 recording formats contain, is in [DESIGN.md](DESIGN.md); unattended long runs are in
